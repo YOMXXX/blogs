@@ -21,6 +21,7 @@ pnpm-debug.log*
 .vscode/
 .idea/
 .DS_Store
+.claude/
 
 # superpowers (specs / plans / brainstorm — local only, not tracked)
 .superpowers/
