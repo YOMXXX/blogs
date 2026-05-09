@@ -1,0 +1,77 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+---
+
+<BaseLayout
+  title="About · Nexus.AI"
+  description="About Nexus.AI — a personal engineering log on AI frontier, written weekly by an applied AI engineer."
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>nexus</span> / <span class="cur">about</span>
+    </div>
+    <h1><span class="prefix">▸</span>About</h1>
+    <p class="lead">Who I am · why this blog · how to reach me.</p>
+
+    <div class="prose">
+      <h2>Who I am</h2>
+      <p>
+        I'm an applied AI engineer with a focus on LLM-driven systems — agents, RAG, and the
+        production infrastructure that holds them up. I write here because I read and build a
+        lot, and I'd rather externalize my notes than let them rot in a markdown drawer.
+      </p>
+
+      <h2>Why this blog</h2>
+      <p>
+        AI is moving too fast for most blogs to keep up. I want to publish at a sustainable
+        cadence (~12 essays/month) but with depth — every essay aims to be one I'd want to
+        reference six months later.
+      </p>
+
+      <h2>What you'll get</h2>
+      <ul>
+        <li><strong>workshop</strong> · production lessons, code-first</li>
+        <li><strong>long-form</strong> · architecture & systems</li>
+        <li><strong>paper</strong> · arXiv distilled with engineering bias</li>
+        <li><strong>tools</strong> · honest reviews</li>
+        <li><strong>weekly</strong> · the AI week in 5 bullets</li>
+      </ul>
+
+      <h2>EEAT note</h2>
+      <p>
+        Every article carries author and timestamps. Code I publish has been run; opinions I
+        publish I've held for at least a week before writing them down.
+      </p>
+
+      <h2>How to reach me</h2>
+      <p>
+        See the <a href="/contact">contact</a> page.
+      </p>
+    </div>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 6px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    color: var(--color-text-primary);
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-text-muted);
+    margin: 0 0 24px;
+  }
+</style>
