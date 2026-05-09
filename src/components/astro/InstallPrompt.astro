@@ -1,0 +1,127 @@
+---
+// Install Prompt — shows after 3+ visits, dismissible
+// Uses beforeinstallprompt event (Chrome/Edge/Samsung)
+---
+
+<div id="install-prompt" class="install-prompt" role="alert" aria-live="polite" hidden>
+  <div class="install-inner">
+    <span class="install-icon">+</span>
+    <div class="install-text">
+      <strong>Install YOMXXX</strong>
+      <span>Read offline, launch from home screen</span>
+    </div>
+    <button id="install-btn" class="install-btn">Install</button>
+    <button id="install-dismiss" class="install-close" aria-label="Dismiss">&times;</button>
+  </div>
+</div>
+
+<script>
+  let deferredPrompt: Event | null = null;
+  const VISIT_KEY = 'yomxxx-visits';
+  const DISMISS_KEY = 'yomxxx-install-dismissed';
+  const MIN_VISITS = 3;
+
+  // Count visits
+  const visits = parseInt(localStorage.getItem(VISIT_KEY) || '0', 10) + 1;
+  localStorage.setItem(VISIT_KEY, String(visits));
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+
+    // Only show after MIN_VISITS and not previously dismissed
+    if (visits >= MIN_VISITS && !localStorage.getItem(DISMISS_KEY)) {
+      const el = document.getElementById('install-prompt');
+      if (el) el.hidden = false;
+    }
+  });
+
+  document.getElementById('install-btn')?.addEventListener('click', async () => {
+    if (!deferredPrompt) return;
+    (deferredPrompt as any).prompt();
+    const { outcome } = await (deferredPrompt as any).userChoice;
+    if (outcome === 'accepted') {
+      const el = document.getElementById('install-prompt');
+      if (el) el.hidden = true;
+    }
+    deferredPrompt = null;
+  });
+
+  document.getElementById('install-dismiss')?.addEventListener('click', () => {
+    const el = document.getElementById('install-prompt');
+    if (el) el.hidden = true;
+    localStorage.setItem(DISMISS_KEY, '1');
+  });
+</script>
+
+<style>
+  .install-prompt {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    max-width: 420px;
+    width: calc(100% - 32px);
+  }
+  .install-inner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--color-bg-elevated, #1a1a20);
+    border: 1px solid var(--color-border-strong, #2a2a30);
+    border-radius: 8px;
+    padding: 12px 16px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  }
+  .install-icon {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--color-accent-green, #10b981);
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(16, 185, 129, 0.1);
+    border-radius: 6px;
+  }
+  .install-text {
+    flex: 1;
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .install-text strong {
+    display: block;
+    color: var(--color-text-primary, #f0f6fc);
+    font-size: 13px;
+  }
+  .install-text span {
+    color: var(--color-text-muted, #8b949e);
+  }
+  .install-btn {
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-bg-primary, #0a0a0a);
+    background: var(--color-accent-green, #10b981);
+    border: none;
+    padding: 6px 14px;
+    border-radius: 5px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .install-btn:hover { opacity: 0.9; }
+  .install-close {
+    font-size: 18px;
+    color: var(--color-text-faint, #5c6370);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    line-height: 1;
+  }
+  .install-close:hover { color: var(--color-text-secondary, #c9d1d9); }
+</style>

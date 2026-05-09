@@ -2,6 +2,7 @@
 import '../styles/global.css';
 import WebVitalsReporter from '../components/react/WebVitalsReporter.tsx';
 import JsonLd from '../components/astro/JsonLd.astro';
+import InstallPrompt from '../components/astro/InstallPrompt.astro';
 import { buildOrganizationSchema, buildWebSiteSchema } from '../lib/seo';
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? '';
@@ -61,5 +62,6 @@ const fullTitle = title.endsWith('YOMXXX') ? title : `${title} · YOMXXX`;
   <body>
     <WebVitalsReporter client:idle />
     <slot />
+    <InstallPrompt />
   </body>
 </html>
