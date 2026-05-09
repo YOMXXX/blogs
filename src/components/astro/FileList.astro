@@ -1,0 +1,85 @@
+---
+import { COLUMN_LABELS, COLUMN_TAG_COLOR } from '../../content/config';
+
+interface ItemRow {
+  slug: string;
+  title: string;
+  column: keyof typeof COLUMN_LABELS;
+  pubDate: Date;
+  index: number;
+}
+
+interface Props {
+  items: ItemRow[];
+}
+
+const { items } = Astro.props;
+
+function formatDate(d: Date): string {
+  return d.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit' });
+}
+---
+
+<div class="list">
+  {
+    items.map((it) => (
+      <a class="row" href={`/posts/${it.slug}`}>
+        <span class="ln">{it.index.toString().padStart(3, '0')}</span>
+        <span class="title">
+          <span class="filename">{it.slug}</span>
+          <span class="ext">.md</span>
+          <span class="tag" style={`--tag-color: ${COLUMN_TAG_COLOR[it.column]}`}>
+            {COLUMN_LABELS[it.column].toLowerCase()}
+          </span>
+        </span>
+        <span class="date">{formatDate(it.pubDate)}</span>
+      </a>
+    ))
+  }
+</div>
+
+<style>
+  .list { display: flex; flex-direction: column; }
+  .row {
+    display: grid;
+    grid-template-columns: 40px 1fr 50px;
+    gap: 12px;
+    padding: 8px 0;
+    text-decoration: none;
+    color: inherit;
+    border-bottom: 1px dashed var(--color-border-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    align-items: center;
+    transition: padding-left 0.12s, background 0.12s;
+  }
+  .row:hover {
+    padding-left: 6px;
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .ln {
+    color: var(--color-text-faint);
+    text-align: right;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .title { color: var(--color-text-secondary); }
+  .filename { color: var(--color-text-primary); }
+  .ext { color: var(--color-text-faint); margin-right: 6px; }
+  .tag {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    color: var(--tag-color);
+    background: color-mix(in srgb, var(--tag-color) 12%, transparent);
+  }
+  .date {
+    color: var(--color-text-faint);
+    text-align: right;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+</style>
