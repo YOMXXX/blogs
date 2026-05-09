@@ -5,10 +5,11 @@ import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
+  // TODO: replace with real domain before deploy (used by sitemap and OG canonical URLs)
   site: 'https://nexus-ai.example.com',
   trailingSlash: 'never',
   build: {
-    format: 'directory',
+    format: 'file',
   },
   integrations: [
     mdx(),
