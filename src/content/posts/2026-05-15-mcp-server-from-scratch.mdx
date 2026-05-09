@@ -1,0 +1,404 @@
+---
+title: "MCP 实战：从零搭建一个 Model Context Protocol Server"
+description: "手把手用 TypeScript 搭建 MCP Server，从协议原理到完整代码到 Claude Code 集成，覆盖 Tool、Resource、Prompt 三大核心概念和 2026 路线图展望。"
+column: "workshop"
+tags: ["mcp", "protocol", "agent", "tutorial"]
+pubDate: 2026-05-15
+featured: false
+tldr: "MCP 是 AI Agent 的 USB-C 接口——统一了 LLM 与外部工具的通信协议。用 @modelcontextprotocol/sdk 只需 50 行 TypeScript 就能搭建一个可用的 MCP Server，连接 Claude Code 或 Cursor 只需一个 JSON 配置。"
+faq:
+  - q: "MCP 和 Function Calling 有什么区别？"
+    a: "Function Calling 是各 LLM 厂商私有的格式（OpenAI、Anthropic、Google 各不相同），MCP 是一个开放协议标准。类比：Function Calling 像各品牌的充电线，MCP 像 USB-C——一个协议适配所有模型。"
+  - q: "MCP Server 支持哪些编程语言？"
+    a: "官方 SDK 支持 TypeScript 和 Python。社区还有 Go、Rust、Java、C# 等实现。TypeScript SDK 最成熟，推荐入门使用。"
+  - q: "MCP 的 Tool 和 Resource 有什么区别？"
+    a: "Tool 是可执行的动作（如搜索、写文件、调 API），会产生副作用；Resource 是只读数据源（如数据库查询结果、配置文件内容），不会修改任何状态。区分两者是安全设计的关键。"
+  - q: "MCP Server 部署在哪里？"
+    a: "目前主流方式是 stdio 模式（本地进程通信）和 SSE 模式（HTTP 远程通信）。生产环境推荐 SSE + 容器化部署，开发环境用 stdio 最简单。"
+  - q: "2026 年 MCP 生态成熟度如何？"
+    a: "截至 2026 年 5 月，npm 月下载量超过 9700 万，社区贡献超过 5800 个 MCP Server。Anthropic、OpenAI、Google 都已支持或兼容 MCP 协议，生态已进入快速成长期。"
+author: "YOMXXX"
+---
+
+## 当我第一次听说 MCP 时，我觉得它是多余的
+
+2024 年底，Anthropic 发布 Model Context Protocol 的时候，我的第一反应是：**又一个协议？** Function Calling 不够用吗？每家 LLM 厂商都在推自己的工具调用接口，我已经写了三套不同格式的 adapter 了——OpenAI 的 `tools` 参数、Anthropic 的 `tool_use`、Google 的 `function_declarations`。再来一个协议只会让事情更复杂。
+
+但到了 2026 年 5 月，MCP 的 npm 月下载量超过 9700 万，社区贡献了 5800+ 个 MCP Server，Anthropic、OpenAI、Google 都已支持或兼容这个协议。我不得不承认：**MCP 做对了 Function Calling 做不到的事情——它不是又一个调用格式，而是一个真正的通信协议。**
+
+这篇文章我会从零搭建一个 MCP Server，让你在 30 分钟内跑通完整流程：理解协议、写代码、连接到 Claude Code。不是概念科普，是 workshop——你跟着做完就有一个可用的 MCP Server。
+
+## 为什么 Function Calling 不够
+
+在写代码之前，先搞清楚 MCP 解决了什么问题。
+
+Function Calling 的核心局限不是功能不够，是**架构层级不对**。它是一个"请求-响应"的调用接口，由 LLM 决定什么时候调用什么函数。但在 Agent 的真实工作流中，工具和模型的关系比这复杂得多：
+
+**问题一：每家格式不同。** OpenAI 的 function calling schema 和 Anthropic 的 tool_use schema 长得不一样。如果你的工具要同时被 Claude 和 GPT 调用，你得维护两套格式。MCP 用一个协议统一了这层——你写一次 MCP Server，所有支持 MCP 的客户端都能用。
+
+**问题二：缺少发现机制。** Function Calling 要求你在每次 API 调用时把所有可用函数的 schema 塞进 prompt。函数多了（比如 50 个工具），prompt 就会很长，token 浪费严重。MCP 有内置的 `tools/list` 发现协议——客户端先问 Server "你有哪些工具"，再按需调用，不需要每次都带上完整列表。
+
+**问题三：没有上下文管理。** Function Calling 是无状态的单次调用。但现实中，Agent 经常需要"先读一个文件，再基于内容决定下一步操作"——这需要在多次调用之间维护上下文。MCP 通过 Resource 和 Prompt 机制解决了这个问题。
+
+一句话总结：**Function Calling 是"工具调用接口"，MCP 是"工具通信协议"。** 接口解决的是"怎么调"，协议解决的是"怎么发现、怎么连接、怎么交互"。
+
+## MCP 三大核心概念
+
+MCP 定义了三种能力原语（primitive），理解这三个就够了：
+
+### Tool — 可执行动作
+
+Tool 是 Agent 可以调用的操作。每个 Tool 有名字、描述、输入 schema 和执行逻辑。**Tool 会产生副作用**——它可能写文件、调 API、修改数据库。
+
+```typescript
+// Tool 的定义结构
+{
+  name: "search-docs",
+  description: "搜索文档库，返回相关结果",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "搜索关键词" }
+    },
+    required: ["query"]
+  }
+}
+```
+
+### Resource — 只读数据
+
+Resource 是 Server 暴露的只读数据源。它不执行任何操作，只提供信息。URI 格式标识每个资源。
+
+```typescript
+// Resource 的定义结构
+{
+  uri: "docs://knowledge-base/latest",
+  name: "Knowledge Base",
+  description: "最新的文档库内容",
+  mimeType: "application/json"
+}
+```
+
+**Tool vs Resource 的区分至关重要。** 把只读操作定义成 Resource 而不是 Tool，意味着客户端可以放心地预加载它——不会触发任何副作用。这是 MCP 的安全设计原则之一。
+
+### Prompt — 可复用模板
+
+Prompt 是预定义的交互模板，可以带参数。它让用户可以通过 slash command 快速触发特定的工作流。
+
+```typescript
+// Prompt 的定义结构
+{
+  name: "summarize-doc",
+  description: "总结指定文档的核心内容",
+  arguments: [
+    { name: "docId", description: "文档 ID", required: true }
+  ]
+}
+```
+
+三者的关系可以这样理解：**Resource 提供数据，Tool 执行操作，Prompt 编排交互流程。**
+
+## 手把手：用 TypeScript 搭建 MCP Server
+
+以下是完整的实现步骤。我们要构建一个 `search-docs` MCP Server，它接受搜索查询，返回文档检索结果。
+
+### Step 1: 初始化项目
+
+```bash
+mkdir mcp-docs-server && cd mcp-docs-server
+npm init -y
+npm install @modelcontextprotocol/sdk zod
+npm install -D typescript @types/node
+npx tsc --init --target ES2022 --module Node16 --outDir dist
+```
+
+### Step 2: 编写 Server 代码
+
+创建 `src/index.ts`，以下是完整代码：
+
+```typescript
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+// 模拟文档数据库
+const DOCS: Array<{ id: string; title: string; content: string }> = [
+  {
+    id: "doc-001",
+    title: "MCP 协议概览",
+    content: "Model Context Protocol 是一个开放协议，标准化了 AI 模型与外部工具的通信方式...",
+  },
+  {
+    id: "doc-002",
+    title: "Agent 架构设计",
+    content: "现代 AI Agent 通常采用 ReAct 或 Plan-and-Execute 模式，核心是让 LLM 自主决策工具调用...",
+  },
+  {
+    id: "doc-003",
+    title: "RAG 系统优化",
+    content: "检索增强生成的关键瓶颈在于 chunk 策略和 reranker 的选择，而不是 LLM 本身...",
+  },
+];
+
+// 创建 MCP Server 实例
+const server = new McpServer({
+  name: "docs-search-server",
+  version: "1.0.0",
+});
+
+// 注册 Tool: search-docs
+server.tool(
+  "search-docs",
+  "搜索文档库，根据关键词返回匹配的文档列表",
+  { query: z.string().describe("搜索关键词") },
+  async ({ query }) => {
+    const lowerQuery = query.toLowerCase();
+    const results = DOCS.filter(
+      (doc) =>
+        doc.title.toLowerCase().includes(lowerQuery) ||
+        doc.content.toLowerCase().includes(lowerQuery)
+    );
+
+    if (results.length === 0) {
+      return {
+        content: [
+          { type: "text" as const, text: `未找到与 "${query}" 相关的文档。` },
+        ],
+      };
+    }
+
+    const formatted = results
+      .map((doc) => `## ${doc.title}\nID: ${doc.id}\n${doc.content}`)
+      .join("\n\n---\n\n");
+
+    return {
+      content: [{ type: "text" as const, text: formatted }],
+    };
+  }
+);
+
+// 注册 Resource: 文档列表
+server.resource("docs://list", "所有可用文档的列表", async (uri) => ({
+  contents: [
+    {
+      uri: uri.href,
+      mimeType: "application/json",
+      text: JSON.stringify(DOCS.map((d) => ({ id: d.id, title: d.title }))),
+    },
+  ],
+}));
+
+// 注册 Prompt: 文档总结模板
+server.prompt(
+  "summarize-doc",
+  "总结指定文档的核心内容",
+  { docId: z.string().describe("文档 ID") },
+  async ({ docId }) => {
+    const doc = DOCS.find((d) => d.id === docId);
+    if (!doc) {
+      return {
+        messages: [
+          {
+            role: "user" as const,
+            content: { type: "text" as const, text: `文档 ${docId} 不存在。` },
+          },
+        ],
+      };
+    }
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: `请总结以下文档的核心要点，用 3-5 个 bullet point 概括：\n\n标题: ${doc.title}\n内容: ${doc.content}`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+// 启动 Server
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("MCP Docs Search Server is running on stdio");
+}
+
+main().catch(console.error);
+```
+
+这段代码做了三件事：
+
+1. **注册了一个 Tool**（`search-docs`）：接受 `query` 参数，在文档库中做关键词匹配，返回结果。
+2. **注册了一个 Resource**（`docs://list`）：暴露所有文档的 ID 和标题列表，只读。
+3. **注册了一个 Prompt**（`summarize-doc`）：提供一个文档总结模板，接受 `docId` 参数。
+
+注意 `McpServer` 的 API 设计非常声明式——`.tool()`, `.resource()`, `.prompt()` 分别对应三个核心概念，输入 schema 用 Zod 定义，类型安全开箱即用。
+
+### Step 3: 编译和测试
+
+```bash
+npx tsc
+node dist/index.js
+```
+
+Server 启动后会监听 stdio。在生产环境中，你通常不会直接运行它——而是通过 MCP 客户端（Claude Code、Cursor 等）来调用。
+
+## 连接到 Claude Code
+
+把你的 MCP Server 连接到 Claude Code 只需要一个配置文件。
+
+在你的项目根目录创建 `.mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "docs-search": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-docs-server/dist/index.js"],
+      "env": {}
+    }
+  }
+}
+```
+
+重启 Claude Code 后，它会自动发现并连接你的 MCP Server。你可以直接在对话中说 "搜索文档库中关于 RAG 的内容"，Claude Code 会自动调用 `search-docs` tool。
+
+### 连接到 Cursor
+
+如果你用 Cursor，配置在 `.cursor/mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "docs-search": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-docs-server/dist/index.js"]
+    }
+  }
+}
+```
+
+### 连接到 VS Code
+
+VS Code 的 MCP 支持在 `settings.json` 中配置：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "docs-search": {
+        "command": "node",
+        "args": ["/absolute/path/to/mcp-docs-server/dist/index.js"]
+      }
+    }
+  }
+}
+```
+
+不同客户端的配置格式略有差异，但核心信息是一样的：**指定启动命令和参数**。MCP 协议的价值在这里体现得很清楚——同一个 Server，零修改适配多个客户端。
+
+## 协议通信细节：JSON-RPC 2.0
+
+如果你想理解底层发生了什么，MCP 的通信协议基于 JSON-RPC 2.0。当客户端调用 `search-docs` 时，实际的消息流是这样的：
+
+**客户端 → Server（请求）:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search-docs",
+    "arguments": { "query": "RAG" }
+  }
+}
+```
+
+**Server → 客户端（响应）:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      { "type": "text", "text": "## RAG 系统优化\n..." }
+    ]
+  }
+}
+```
+
+在这之前还有一个 **握手过程**：客户端先发 `initialize` 请求，Server 返回自己的 capabilities（支持哪些原语），然后客户端发 `initialized` 确认。这个握手机制是 MCP 和简单的 HTTP API 的核心区别之一——它让双方在通信开始前就对齐了能力。
+
+## 从 stdio 到 SSE：传输层的选择
+
+上面的代码用的是 `StdioServerTransport`——Server 作为子进程启动，通过 stdin/stdout 和客户端通信。这是最简单的方式，适合本地开发。
+
+但如果你要远程部署 MCP Server（比如部署到 Kubernetes 上让团队共用），就需要用 **Streamable HTTP** 传输层：
+
+```typescript
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from "express";
+
+const app = express();
+app.use(express.json());
+
+app.post("/mcp", async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  res.on("close", () => transport.close());
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+});
+
+app.listen(3001, () => {
+  console.log("MCP Server listening on http://localhost:3001/mcp");
+});
+```
+
+客户端配置改为：
+
+```json
+{
+  "mcpServers": {
+    "docs-search": {
+      "url": "http://localhost:3001/mcp"
+    }
+  }
+}
+```
+
+**选择建议：**
+- **stdio**：本地开发、个人工具、CI/CD 集成。最简单，零网络配置。
+- **Streamable HTTP**：团队共享、生产部署、需要认证和监控的场景。2026 年推荐的远程传输方式。
+
+## 2026 路线图展望
+
+MCP 在 2026 年还在快速演进。几个值得关注的方向：
+
+**原生流式传输。** 当前 MCP 的 Tool 调用是请求-响应模式——Server 处理完才返回结果。2026 年下半年的规划中包含了原生流式传输支持，允许 Tool 返回 streaming response。这对长时间运行的任务（如代码编译、数据处理）非常关键。
+
+**服务器推送通知。** 目前 Server 是被动的——只有客户端主动调用时才会响应。规划中的 Server-Sent Events 扩展允许 Server 主动推送状态变更，比如"你关注的文档有更新了"。
+
+**安全认证层。** 这是 MCP 生态最大的缺口之一。当前的 MCP 协议没有内置认证机制——任何能连接 Server 的客户端都能调用所有 Tool。OAuth 2.1 集成和基于 scope 的权限控制正在标准化过程中。
+
+**Agent-to-Agent 协议。** 更远期的方向是让 MCP Server 之间也能互相通信，形成 Agent 协作网络。这会把 MCP 从 "Model-to-Tool" 扩展到 "Agent-to-Agent" 层面。
+
+## 我的建议：现在就开始写 MCP Server
+
+如果你还在用 Function Calling 的 adapter 模式给不同 LLM 封装工具调用，是时候切换到 MCP 了。原因很简单：
+
+1. **一次编写，到处使用。** 写一个 MCP Server，Claude Code、Cursor、VS Code、Windsurf 都能直接用。
+2. **生态正在爆发。** 5800+ 个社区 MCP Server 意味着你想要的工具很可能已经有人写好了。
+3. **协议已稳定。** 经过一年多的迭代，核心 API 已经稳定，不用担心 breaking change。
+4. **调试体验好。** `@modelcontextprotocol/inspector` 提供了 GUI 调试工具，可以直接测试 Tool 调用和查看协议消息。
+
+从一个简单的 Tool 开始——把你最常用的脚本或 API 封装成 MCP Server。50 行代码就能搞定。当你发现团队里其他人也能直接调用你的工具时，你会明白这个协议的价值。
+
+```typescript
+// 最后一个建议：用这个命令快速检查你的 MCP Server 是否正常工作
+// npx @modelcontextprotocol/inspector node dist/index.js
+```
