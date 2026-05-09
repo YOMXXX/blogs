@@ -1,0 +1,413 @@
+---
+title: "Agentic AI 第二年：从 PoC 到生产系统的五个认知跃迁"
+description: "回顾 18 个月 Agentic AI 生产实践中的五次认知转变——从 Chain 到状态机、从 API 调用到契约、从向量搜索到三层记忆、从通信到信任链、从准确率到多维评估体系。"
+column: "long-form"
+tags: ["agent", "architecture", "production", "llm"]
+pubDate: 2026-05-11
+featured: false
+tldr: "生产级 Agent 系统的五个核心教训：Agent 是状态机而非 Chain；工具调用是契约而非 API；Memory 是三层操作系统；多 Agent 瓶颈在信任而非通信；评估维度需要 task completion rate + error recovery rate + cost per task。"
+faq:
+  - q: "Agent 和传统 Chain 的本质区别是什么？"
+    a: "Chain 是线性的 step1 → step2 → step3 管道，无法处理条件分支和错误回退。Agent 是有限状态机，每个状态有明确的转移条件和失败处理，能根据中间结果动态决定下一步。"
+  - q: "为什么工具调用需要 runtime validation？"
+    a: "JSON Schema 只能验证类型和格式，无法捕获语义错误（如负数的订单数量、不存在的用户 ID）。Runtime validation 加上语义约束能把工具调用的错误率从约 15% 降到 3% 以下。"
+  - q: "Agent 的三层记忆架构怎么设计？"
+    a: "短期记忆是当前对话上下文（context window）；工作记忆是当前任务的中间状态（scratchpad）；长期记忆是跨会话的向量存储 + 摘要。关键是工作记忆的 flush 策略和长期记忆的衰减机制。"
+  - q: "多 Agent 系统中如何解决信任问题？"
+    a: "两种模式：Supervisor 模式（中央验证者审核每个 Agent 的输出）和 Consensus 模式（多个 Agent 交叉验证）。生产中推荐 Supervisor 模式，因为延迟更低、成本更可控，信任链更容易追踪。"
+  - q: "评估 Agent 系统需要关注哪些指标？"
+    a: "五个核心指标：task completion rate（任务完成率）、error recovery rate（错误恢复率）、cost per task（单任务成本）、average steps to completion（平均步骤数）、P95 latency（尾延迟）。单看 accuracy 远远不够。"
+author: "YOMXXX"
+---
+
+## 从一个 ReAct 循环到 14 个 Agent 的旅程
+
+2024 年底，我写了第一个 Agent。一个 ReAct 循环，调三个工具，跑起来了。那时候我觉得 Agent 就是这么回事：给 LLM 几个工具，让它自己决定调哪个，循环直到任务完成。
+
+2026 年 5 月，我的生产 Agent 系统有 14 个专业化 Agent，共享记忆池，分层调度。但让我回头看，最大的进步不是系统变复杂了——而是我对"Agent 该怎么设计"的认知变了五次。
+
+每一次认知跃迁都伴随着一次痛苦的生产事故或者一个怎么都修不好的 bug。我把这五次转变写下来，不是因为我觉得我的方案是最优的，而是因为我相信每个正在搭 Agent 系统的人都会走类似的路。希望这篇文章能让你少走几步弯路。
+
+## 认知跃迁 1：Agent 不是 Chain，是状态机
+
+### LangChain 给我的错觉
+
+2024 年初，LangChain 是事实标准。我跟着教程写了第一个 Agent：一个 sequential chain，query → retrieval → analysis → response。上线后第一天就出问题了：retrieval 返回空结果时，analysis 步骤还是照常跑，然后生成一个自信满满的错误答案。
+
+问题的根源是：**Chain 是线性的，它假设每一步都会成功。** 但真实世界不是这样的。工具调用会失败，LLM 会产生格式错误的输出，外部 API 会超时。线性 Chain 对这些异常情况没有原生的处理能力。
+
+### 状态机的转变
+
+后来我改用了有限状态机（FSM）的方式来建模 Agent。每个 Agent 在任意时刻都处于一个明确的状态，每个状态有明确的转移条件——包括成功转移和失败转移。
+
+这不是一个新概念，但对于 Agent 设计来说，它解决了三个关键问题：
+
+1. **可观测性**：你随时知道 Agent 在做什么，卡在哪个状态
+2. **错误恢复**：每个状态都有失败路径，不会默默吞掉错误
+3. **可测试性**：你可以针对每个状态转移写单元测试
+
+来看一个具体的对比。假设我们要建一个"分析客户反馈并生成报告"的 Agent：
+
+```typescript
+// ❌ Chain 模式：线性、脆弱、不可观测
+async function feedbackChain(input: string): Promise<string> {
+  const classified = await classifyFeedback(input);     // 如果分类失败呢？
+  const sentiment = await analyzeSentiment(classified);  // 如果上一步输出格式不对呢？
+  const report = await generateReport(sentiment);        // 如果前面都有问题呢？
+  return report;  // 你根本不知道中间发生了什么
+}
+
+// ✅ 状态机模式：显式状态、可恢复、可观测
+type AgentState =
+  | "idle"
+  | "classifying"
+  | "analyzing_sentiment"
+  | "generating_report"
+  | "error_recovery"
+  | "completed"
+  | "failed";
+
+interface AgentContext {
+  state: AgentState;
+  input: string;
+  classification?: string;
+  sentiment?: { score: number; label: string };
+  report?: string;
+  errorCount: number;
+  maxRetries: number;
+  history: Array<{ state: AgentState; timestamp: number; detail: string }>;
+}
+
+async function transition(ctx: AgentContext): Promise<AgentContext> {
+  const log = (detail: string) => {
+    ctx.history.push({ state: ctx.state, timestamp: Date.now(), detail });
+  };
+
+  switch (ctx.state) {
+    case "idle": {
+      log("Starting classification");
+      return { ...ctx, state: "classifying" };
+    }
+
+    case "classifying": {
+      try {
+        const result = await classifyFeedback(ctx.input);
+        log(`Classified as: ${result}`);
+        return { ...ctx, state: "analyzing_sentiment", classification: result };
+      } catch (e) {
+        log(`Classification failed: ${(e as Error).message}`);
+        return { ...ctx, state: "error_recovery", errorCount: ctx.errorCount + 1 };
+      }
+    }
+
+    case "analyzing_sentiment": {
+      try {
+        const result = await analyzeSentiment(ctx.classification!);
+        log(`Sentiment: ${result.label} (${result.score})`);
+        return { ...ctx, state: "generating_report", sentiment: result };
+      } catch (e) {
+        log(`Sentiment analysis failed: ${(e as Error).message}`);
+        return { ...ctx, state: "error_recovery", errorCount: ctx.errorCount + 1 };
+      }
+    }
+
+    case "generating_report": {
+      const report = await generateReport(ctx.sentiment!);
+      log("Report generated");
+      return { ...ctx, state: "completed", report };
+    }
+
+    case "error_recovery": {
+      if (ctx.errorCount >= ctx.maxRetries) {
+        log("Max retries exceeded, marking as failed");
+        return { ...ctx, state: "failed" };
+      }
+      // 回退到上一个安全状态重试
+      log("Retrying from last stable state");
+      return { ...ctx, state: "classifying" };
+    }
+
+    default:
+      return ctx;
+  }
+}
+
+// 主循环：驱动状态机直到终态
+async function runAgent(input: string): Promise<AgentContext> {
+  let ctx: AgentContext = {
+    state: "idle",
+    input,
+    errorCount: 0,
+    maxRetries: 3,
+    history: [],
+  };
+
+  const terminalStates: AgentState[] = ["completed", "failed"];
+
+  while (!terminalStates.includes(ctx.state)) {
+    ctx = await transition(ctx);
+  }
+
+  return ctx; // 完整的执行历史都在 ctx.history 里
+}
+```
+
+代码长了不少，但换来了三个关键能力：
+
+- **每一步都有 try/catch**，失败不会被静默吞掉
+- **完整的执行历史**（`ctx.history`），出了问题你可以回放整个流程
+- **显式的错误恢复策略**，不是简单的重试，而是回退到安全状态
+
+### 状态机在生产中的表现
+
+切换到状态机模式后，我的 Agent 系统的 unhandled error rate 从 12% 降到了 2.3%。更重要的是，当错误发生时，我能在 30 秒内定位到是哪个状态转移出了问题——以前在 Chain 模式下，排查一个 bug 经常要花半个小时翻日志。
+
+一条实用建议：**不要自己从头写状态机框架。** 用 XState（TypeScript）或者 transitions（Python）。自己写的框架缺乏边界条件处理，最终会变成另一个需要维护的基础设施。
+
+## 认知跃迁 2：工具调用不是 API 调用，是契约
+
+### JSON Schema 的幻觉
+
+刚开始做 Agent 的时候，我以为工具定义就是写个 JSON Schema，描述清楚参数类型就行了。LLM 会按照 schema 生成正确的参数，工具会正常执行，皆大欢喜。
+
+然后现实打脸了。
+
+一个月内我收集到了这些奇葩的工具调用参数：
+
+- 订单数量：`-3`（JSON Schema 说是 number，确实是 number）
+- 用户 ID：`user_test_123`（格式正确，但这个用户不存在）
+- 日期范围：`2026-01-01` 到 `2025-06-01`（开始日期比结束日期晚）
+- 搜索关键词：`"请帮我搜索所有相关的文档并整理成表格"`（这不是关键词，这是一句指令）
+
+所有这些都能通过 JSON Schema 验证。但执行起来要么报错，要么返回垃圾结果。
+
+### 契约 = 类型 + 语义 + 运行时
+
+我现在对每个工具都定义三层验证：
+
+1. **Type validation**（JSON Schema）：参数的类型和格式
+2. **Semantic validation**：参数的语义约束（正数、存在性检查、逻辑一致性）
+3. **Runtime validation**：执行前的环境检查（权限、资源可用性）
+
+这三层加起来，才构成一个完整的"契约"。工具不只是告诉 LLM "你可以调我"，而是告诉 LLM "你必须这样调我，否则我会拒绝"。
+
+一个实际效果：加了三层验证后，工具调用的有效执行率从 85% 提升到了 97%。那 12 个百分点的差距，之前全是静默失败——工具执行了，但返回了垃圾结果，LLM 又基于垃圾结果继续推理。
+
+还有一个被忽视的点：**工具的错误信息本身就是给 LLM 的 feedback。** 如果你的工具只返回 `Error: invalid parameter`，LLM 很难学会怎么修正。但如果你返回 `Error: order_quantity must be positive integer, got -3. Retry with a valid quantity.`，LLM 在下一轮调用中通常就能修正。
+
+## 认知跃迁 3：Memory 是 Agent 的操作系统
+
+### 为什么向量数据库不是记忆
+
+很多人把"Agent 记忆"等同于"把对话历史扔进向量数据库"。我也这么干过。结果是：
+
+- Agent 记住了三个月前的一次闲聊，但忘了两分钟前用户说的关键约束
+- 检索出的"相关记忆"在语义上确实相关，但在时间上已经过时
+- 记忆越积越多，检索噪声越来越大，Agent 的表现反而下降
+
+向量数据库是存储，不是记忆系统。记忆系统需要**选择性遗忘、主动整理、分层组织**。
+
+### 三层记忆架构
+
+经过几轮迭代，我最终落地的是一个三层架构：
+
+**第一层：短期记忆（Short-term Memory）**
+
+就是当前对话的 context window。这没什么花哨的，但有一个关键设计：**不要把整个对话历史都塞进去。** 我会在对话超过 8 轮后启动 compaction——用一个小模型把前面的对话总结成 3-5 个要点，替换掉原始的对话历史。这样既保留了关键信息，又控制了 token 消耗。
+
+**第二层：工作记忆（Working Memory）**
+
+这是最容易被忽略、但对 Agent 效果影响最大的一层。工作记忆存储的是当前任务的中间状态——比如"已经查到了 A，正在查 B，还需要查 C"。
+
+我用一个简单的 key-value store 实现工作记忆，每个任务一个 namespace。任务完成后，工作记忆被 flush：有价值的部分（比如发现的新知识）被提取到长期记忆，其余丢弃。
+
+**第三层：长期记忆（Long-term Memory）**
+
+长期记忆用向量数据库存储，但有两个关键机制：
+
+1. **时间衰减**：每条记忆有一个 `relevance_score`，随时间指数衰减。检索时的最终得分 = 向量相似度 × 时间衰减因子。这样三个月前的记忆自然会被降权。
+
+2. **定期摘要合并**：每周跑一次 batch job，把同主题的碎片记忆合并成摘要。比如关于"用户 A 的偏好"的 30 条碎片记忆，合并成一条 300 字的综合摘要。这大幅降低了检索噪声。
+
+### Memory flush 的实战细节
+
+工作记忆到长期记忆的 flush 是整个系统最微妙的部分。我的策略是：
+
+1. 任务完成时，用 LLM 判断工作记忆中哪些信息值得长期保存
+2. 值得保存的信息被改写成"事实陈述"格式（去掉对话语境，只保留核心知识）
+3. 检查是否与已有的长期记忆冲突——如果冲突，更新而不是追加
+4. 写入向量数据库，初始 `relevance_score` 设为 1.0
+
+这套流程让长期记忆的质量一直保持在可控水平。没有它的话，记忆池会在 2-3 个月后变成噪声池。
+
+## 认知跃迁 4：多 Agent 协作的瓶颈不是通信，是信任
+
+### 从单 Agent 到多 Agent
+
+当你的系统从一个 Agent 变成多个 Agent 协作时，第一个直觉是"怎么让它们通信"。消息队列？共享状态？事件总线？
+
+这些都重要，但都不是最难的部分。最难的部分是：**当 Agent A 把任务委托给 Agent B，谁来验证 B 的输出是正确的？**
+
+我在一个真实项目中遇到过这个问题：一个 Research Agent 负责搜索资料，一个 Analysis Agent 负责分析数据，一个 Report Agent 负责生成报告。Research Agent 返回了一条过时的数据，Analysis Agent 基于错误数据做了分析，Report Agent 写了一份看起来很专业但结论完全错误的报告。
+
+整个链条上没有一个节点发现问题。每个 Agent 都"信任"了上游的输出。
+
+### 信任链设计
+
+我现在用两种模式来解决信任问题：
+
+**Supervisor 模式**
+
+在 Agent 协作链路中加入一个 Supervisor Agent。它不做具体任务，只做验证。每个 Agent 完成子任务后，结果先经过 Supervisor 审核：
+
+- 结果是否符合预期格式？
+- 关键数据是否合理（范围检查、一致性检查）？
+- 与已知事实是否矛盾？
+
+Supervisor 通过后，结果才会传递给下游 Agent。这增加了一轮 LLM 调用的成本和延迟，但大幅降低了错误传播的风险。
+
+**Consensus 模式**
+
+对于关键决策，让多个 Agent 独立处理同一个任务，然后比较结果。如果结果一致，采纳；如果不一致，触发 escalation（交给人类审核或者用更强的模型重新处理）。
+
+实际上我在生产中主要用 Supervisor 模式，因为 Consensus 模式的成本是 N 倍（N 个 Agent 处理同一个任务）。但在高风险决策（比如生成对外发布的内容）上，Consensus 模式值得投入。
+
+### 信任的量化
+
+| 协作模式 | 错误传播率 | 额外延迟 | 额外成本 | 适合场景 |
+|---|---|---|---|---|
+| 无验证（直接传递） | ~18% | 0 | 0 | 内部原型、低风险任务 |
+| Supervisor 模式 | ~4% | +1-2s | +30% | 生产系统、大部分场景 |
+| Consensus 模式 | ~1% | +3-5x | +200-300% | 高风险决策、对外发布 |
+
+这个表是我从三个项目的数据中汇总出来的。结论很清楚：**如果你在跑多 Agent 系统但没有验证层，你大概有 18% 的任务输出是有问题的。** 只是你可能还没发现。
+
+## 认知跃迁 5：评估 Agent 比评估 LLM 难 10 倍
+
+### 为什么传统指标不够
+
+评估一个 LLM，你看 accuracy、latency、cost per token，基本就够了。但评估一个 Agent 系统，这些指标远远不够。
+
+举个例子：我的 Agent 在一个任务上的"accuracy"是 90%——最终回答的准确率。听起来不错。但深挖一下：
+
+- 有 30% 的任务需要 5 次以上工具调用才完成（效率低）
+- 有 15% 的任务中途出错但 Agent 成功自我恢复了（恢复率）
+- 平均每个任务花费 $0.08，但 P95 的任务花费 $0.45（成本长尾）
+- 有 5% 的任务最终超时失败，用户体验极差
+
+90% 的 accuracy 掩盖了这些问题。
+
+### 我的评估框架
+
+经过不断迭代，我现在用五个维度评估 Agent 系统：
+
+1. **Task Completion Rate (TCR)**：任务完成率。不是"回答是否正确"，而是"任务是否被完成"。一个 Agent 如果回答正确但中间调了 20 次工具，那也不算好。
+
+2. **Error Recovery Rate (ERR)**：当 Agent 遇到错误时，成功恢复的比例。这个指标反映 Agent 的鲁棒性。我的目标是 ERR > 80%。
+
+3. **Cost per Task (CPT)**：单任务的平均成本。但更重要的是看 P95——长尾成本经常比平均值高 5-10 倍。
+
+4. **Average Steps to Completion (ASC)**：完成一个任务平均需要多少步。步骤越少越好，说明 Agent 的规划能力越强。
+
+5. **P95 Latency**：不看平均延迟，只看 P95。平均延迟会被大量简单任务拉低，P95 才反映真实的用户体验边界。
+
+### 评估管线的搭建
+
+```typescript
+interface TaskEvaluation {
+  taskId: string;
+  completed: boolean;
+  correct: boolean;
+  steps: number;
+  totalLatencyMs: number;
+  totalCostUsd: number;
+  errorsEncountered: number;
+  errorsRecovered: number;
+  toolCalls: Array<{
+    tool: string;
+    success: boolean;
+    latencyMs: number;
+    costUsd: number;
+  }>;
+}
+
+interface AgentMetrics {
+  tcr: number;  // Task Completion Rate
+  err: number;  // Error Recovery Rate
+  cptMean: number;  // Cost per Task (mean)
+  cptP95: number;   // Cost per Task (P95)
+  ascMean: number;  // Average Steps to Completion
+  latencyP95Ms: number;
+}
+
+function computeMetrics(evals: TaskEvaluation[]): AgentMetrics {
+  const completed = evals.filter((e) => e.completed);
+  const withErrors = evals.filter((e) => e.errorsEncountered > 0);
+  const recovered = withErrors.filter(
+    (e) => e.errorsRecovered === e.errorsEncountered
+  );
+
+  const costs = evals.map((e) => e.totalCostUsd).sort((a, b) => a - b);
+  const latencies = evals.map((e) => e.totalLatencyMs).sort((a, b) => a - b);
+
+  const percentile = (arr: number[], p: number) =>
+    arr[Math.ceil(arr.length * p) - 1] ?? 0;
+
+  return {
+    tcr: completed.length / evals.length,
+    err: withErrors.length > 0 ? recovered.length / withErrors.length : 1,
+    cptMean: costs.reduce((a, b) => a + b, 0) / costs.length,
+    cptP95: percentile(costs, 0.95),
+    ascMean:
+      completed.reduce((sum, e) => sum + e.steps, 0) / completed.length,
+    latencyP95Ms: percentile(latencies, 0.95),
+  };
+}
+
+// 使用示例
+function printReport(metrics: AgentMetrics): void {
+  console.log("=== Agent Evaluation Report ===");
+  console.log(`Task Completion Rate:  ${(metrics.tcr * 100).toFixed(1)}%`);
+  console.log(`Error Recovery Rate:   ${(metrics.err * 100).toFixed(1)}%`);
+  console.log(`Cost/Task (mean):      $${metrics.cptMean.toFixed(4)}`);
+  console.log(`Cost/Task (P95):       $${metrics.cptP95.toFixed(4)}`);
+  console.log(`Avg Steps:             ${metrics.ascMean.toFixed(1)}`);
+  console.log(`Latency P95:           ${metrics.latencyP95Ms.toFixed(0)}ms`);
+}
+```
+
+这段代码不复杂，但关键在于你要**持续跑它**。每次迭代 Agent 的 prompt、工具定义、或者模型版本后，都要重新跑一遍完整的评估 suite。不要靠手动测几个 case 就宣称"Agent 变好了"。
+
+### 一个容易忽略的评估陷阱
+
+Agent 评估有一个 LLM 评估没有的陷阱：**不确定性的传播。** 一个 Agent 的任务可能涉及 5-10 次 LLM 调用和工具调用，每次调用都有一定的失败概率。即使单次调用的成功率是 95%，10 次调用后的端到端成功率只有 95%^10 ≈ 60%。
+
+所以你的评估 test set 需要足够大（我用 500+ 个 test case），而且需要覆盖不同的任务复杂度等级。只测简单任务会给你一个虚假的高分。
+
+## 如果你今天要从零开始
+
+如果你今天要从零开始建一个 Agent 系统，我会给你这个建议清单：
+
+1. **先把状态机画出来，再写一行代码。** 用状态图明确每个状态、每个转移条件、每个失败路径。这个图就是你的架构设计文档。
+
+2. **工具先少后多。** 从 3-5 个核心工具开始，每个工具都有完整的三层验证。10 个验证松散的工具不如 5 个验证严格的工具。
+
+3. **记忆系统从第一天就搭，不要等到"需要的时候"。** 等你发现需要记忆的时候，已经丢失了三个月的有价值数据。
+
+4. **多 Agent 不是第一步。** 先把单 Agent 做到足够好（TCR > 90%），再考虑拆分成多个 Agent。过早拆分只会增加调试难度。
+
+5. **评估管线优先于功能开发。** 没有评估，你就是在猜。建好评估再写 Agent，是我能给的最值钱的一条建议。
+
+18 个月前我从一个 ReAct 循环起步。今天回看，系统的复杂度增长了 50 倍，但真正让我少走弯路的不是更复杂的架构，而是更清晰的认知。
+
+这五个跃迁，是我目前最好的认知框架。下一个跃迁是什么，我还不知道——但我知道它一定会来。
+
+```ts
+// 最后一条建议，用代码说
+const buildAgentSystem = (readiness: string) => {
+  if (readiness !== "state_machine_drawn") {
+    return "draw your state machine first";
+  }
+  return "now you can write code";
+};
+```
