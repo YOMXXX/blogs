@@ -1,6 +1,6 @@
 ---
 import '../styles/global.css';
-import WebVitalsReporter from '../components/react/WebVitalsReporter.tsx';
+
 import JsonLd from '../components/astro/JsonLd.astro';
 import InstallPrompt from '../components/astro/InstallPrompt.astro';
 import PwaUpdateToast from '../components/astro/PwaUpdateToast.astro';
@@ -70,7 +70,6 @@ const fullTitle = title.endsWith('YOMXXX') ? title : `${title} · YOMXXX`;
     <ClientRouter />
   </head>
   <body>
-    <WebVitalsReporter client:idle />
     <slot />
     <PwaUpdateToast />
     <InstallPrompt />
