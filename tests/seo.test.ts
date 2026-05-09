@@ -77,12 +77,12 @@ describe('buildBreadcrumbSchema', () => {
 describe('buildOrganizationSchema', () => {
   it('produces an Organization with name and url', () => {
     const schema = buildOrganizationSchema({
-      name: 'Nexus.AI',
+      name: 'YOMXXX',
       url: 'https://nexus-ai.example.com',
       logo: 'https://nexus-ai.example.com/favicon.svg',
     });
     expect(schema['@type']).toBe('Organization');
-    expect(schema.name).toBe('Nexus.AI');
+    expect(schema.name).toBe('YOMXXX');
     expect(schema.url).toBe('https://nexus-ai.example.com');
     expect(schema.logo).toBe('https://nexus-ai.example.com/favicon.svg');
   });
@@ -91,11 +91,11 @@ describe('buildOrganizationSchema', () => {
 describe('buildWebSiteSchema', () => {
   it('produces a WebSite with SearchAction potentialAction', () => {
     const schema = buildWebSiteSchema({
-      name: 'Nexus.AI',
+      name: 'YOMXXX',
       url: 'https://nexus-ai.example.com',
     });
     expect(schema['@type']).toBe('WebSite');
-    expect(schema.name).toBe('Nexus.AI');
+    expect(schema.name).toBe('YOMXXX');
     expect(schema.potentialAction['@type']).toBe('SearchAction');
     expect(schema.potentialAction.target).toBe('https://nexus-ai.example.com/posts?q={search_term_string}');
     expect(schema.potentialAction['query-input']).toBe('required name=search_term_string');

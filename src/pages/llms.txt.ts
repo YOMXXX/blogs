@@ -8,7 +8,7 @@ export const GET: APIRoute = async ({ site }) => {
   const items = collectFeedItems(all);
 
   const lines = [
-    '# Nexus.AI',
+    '# YOMXXX',
     '',
     '> Frontier ML, decoded. Production AI, dissected. Personal engineering blog on LLMs, Agents, RAG, and the systems beneath. Published weekly.',
     '',

@@ -9,7 +9,7 @@ export const GET: APIRoute = async ({ site }) => {
 
   const json = {
     version: 'https://jsonfeed.org/version/1.1',
-    title: 'Nexus.AI',
+    title: 'YOMXXX',
     home_page_url: `${baseUrl}/`,
     feed_url: `${baseUrl}/feed.json`,
     description: 'Frontier ML, decoded. Production AI, dissected.',

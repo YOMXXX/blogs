@@ -1,4 +1,4 @@
-# Nexus.AI — AI Frontier Blog
+# YOMXXX — AI Frontier Blog
 
 Personal engineering blog on AI frontier — LLMs, Agents, RAG, and the systems beneath.
 

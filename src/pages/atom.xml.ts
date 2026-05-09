@@ -31,7 +31,7 @@ export const GET: APIRoute = async ({ site }) => {
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <id>${baseUrl}/</id>
-  <title>Nexus.AI</title>
+  <title>YOMXXX</title>
   <subtitle>Frontier ML, decoded. Production AI, dissected.</subtitle>
   <link href="${baseUrl}/atom.xml" rel="self" />
   <link href="${baseUrl}/" />

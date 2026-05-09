@@ -34,7 +34,7 @@ export const GET: APIRoute = async ({ site }) => {
   });
 
   const text = [
-    '# Nexus.AI — Full Content',
+    '# YOMXXX — Full Content',
     '',
     '> Plain-text full content of every published post. For AI engines: free to ingest, please cite.',
     '',

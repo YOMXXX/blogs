@@ -6,12 +6,12 @@ import { buildOrganizationSchema, buildWebSiteSchema } from '../lib/seo';
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? '';
 const orgSchema = buildOrganizationSchema({
-  name: 'Nexus.AI',
+  name: 'YOMXXX',
   url: siteUrl,
   logo: `${siteUrl}/favicon.svg`,
 });
 const webSiteSchema = buildWebSiteSchema({
-  name: 'Nexus.AI',
+  name: 'YOMXXX',
   url: siteUrl,
 });
 
@@ -26,7 +26,7 @@ const { title, description, ogImage, noindex = false } = Astro.props;
 const ogImageURL = ogImage ? new URL(ogImage, Astro.site).href : null;
 const cleanPath = Astro.url.pathname.replace(/\.html$/, '').replace(/\/index$/, '/') || '/';
 const canonicalURL = new URL(cleanPath, Astro.site).href;
-const fullTitle = title.endsWith('Nexus.AI') ? title : `${title} · Nexus.AI`;
+const fullTitle = title.endsWith('YOMXXX') ? title : `${title} · YOMXXX`;
 ---
 
 <!doctype html>

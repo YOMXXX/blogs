@@ -39,7 +39,7 @@ export async function renderOgSvg(input: OgInput): Promise<string> {
   const markup = satoriHtml(`
     <div style="display:flex;flex-direction:column;justify-content:space-between;width:1200px;height:630px;background:#0a0a0a;color:#f0f6fc;padding:64px;font-family:Inter">
       <div style="display:flex;align-items:center;gap:12px;color:#10b981;font-size:24px;letter-spacing:1px">
-        <span>$ ~/nexus</span>
+        <span>$ ~/yomxxx</span>
       </div>
       <div style="display:flex;flex-direction:column;gap:24px">
         <div style="color:#fbbf24;font-size:20px;letter-spacing:2px;text-transform:uppercase">// ${input.column}</div>
@@ -47,7 +47,7 @@ export async function renderOgSvg(input: OgInput): Promise<string> {
       </div>
       <div style="display:flex;justify-content:space-between;color:#5c6370;font-size:18px">
         <span>${dateStr}</span>
-        <span>nexus.ai</span>
+        <span>yomxxx.com</span>
       </div>
     </div>
   `);
