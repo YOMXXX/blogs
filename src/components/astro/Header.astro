@@ -1,0 +1,56 @@
+---
+const path = Astro.url.pathname;
+const isActive = (prefix: string) => path === prefix || path.startsWith(prefix + '/');
+---
+
+<header class="header">
+  <div class="header-inner">
+    <a href="/" class="logo">
+      <span class="prompt">$</span>
+      <span class="logo-text">~/nexus</span>
+    </a>
+    <nav class="nav">
+      <a href="/" class:list={['nav-item', { active: path === '/' }]}>home</a>
+      <a href="/posts" class:list={['nav-item', { active: isActive('/posts') }]}>~/posts</a>
+      <a href="/about" class:list={['nav-item', { active: isActive('/about') }]}>~/about</a>
+    </nav>
+  </div>
+</header>
+
+<style>
+  .header {
+    border-bottom: 1px solid var(--color-border-subtle);
+    background: var(--color-bg-primary);
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  .header-inner {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 14px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--font-mono);
+  }
+  .logo {
+    color: var(--color-accent-green);
+    text-decoration: none;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .logo .prompt {
+    color: var(--color-accent-amber);
+    margin-right: 4px;
+  }
+  .nav { display: flex; gap: 18px; }
+  .nav-item {
+    color: var(--color-text-muted);
+    text-decoration: none;
+    font-size: 13px;
+    transition: color 0.15s;
+  }
+  .nav-item:hover { color: var(--color-text-primary); }
+  .nav-item.active { color: var(--color-accent-green); }
+</style>
