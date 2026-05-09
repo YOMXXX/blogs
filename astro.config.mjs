@@ -3,6 +3,7 @@ import mdx from '@astrojs/mdx';
 import react from '@astrojs/react';
 import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
+import AstroPWA from '@vite-pwa/astro';
 const SITE = 'https://yomxxx.com';
 
 export default defineConfig({
@@ -18,6 +19,43 @@ export default defineConfig({
   integrations: [
     mdx(),
     react(),
+    AstroPWA({
+      registerType: 'autoUpdate',
+      manifest: false,
+      workbox: {
+        // 只 precache 静态资源，绝不碰 HTML
+        globPatterns: ['**/*.{js,css,woff2}'],
+        // 不缓存 HTML — 始终走网络，杜绝页面闪动
+        navigateFallback: null,
+        runtimeCaching: [
+          {
+            urlPattern: /\/_astro\/.*\.(js|css)$/,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'static-assets',
+              expiration: { maxEntries: 200, maxAgeSeconds: 365 * 24 * 60 * 60 },
+            },
+          },
+          {
+            urlPattern: /\/fonts\/.*\.woff2$/,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'font-cache',
+              expiration: { maxEntries: 10, maxAgeSeconds: 365 * 24 * 60 * 60 },
+            },
+          },
+          {
+            urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp|avif|ico)$/,
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'image-cache',
+              expiration: { maxEntries: 100, maxAgeSeconds: 30 * 24 * 60 * 60 },
+            },
+          },
+        ],
+      },
+      devOptions: { enabled: false },
+    }),
     sitemap({
       changefreq: 'weekly',
       priority: 0.7,
