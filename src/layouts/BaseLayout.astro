@@ -4,7 +4,6 @@ import '../styles/global.css';
 import JsonLd from '../components/astro/JsonLd.astro';
 import InstallPrompt from '../components/astro/InstallPrompt.astro';
 import PwaUpdateToast from '../components/astro/PwaUpdateToast.astro';
-import { ClientRouter } from 'astro:transitions';
 import { buildOrganizationSchema, buildWebSiteSchema } from '../lib/seo';
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? '';
@@ -70,7 +69,6 @@ const fullTitle = title.endsWith('YOMXXX') ? title : `${title} · YOMXXX`;
 
     <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7299456929245815" crossorigin="anonymous"></script>
 
-    <ClientRouter />
   </head>
   <body>
     <slot />
