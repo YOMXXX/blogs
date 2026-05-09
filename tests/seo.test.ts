@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildArticleSchema } from '@lib/seo';
+import { buildArticleSchema, buildBreadcrumbSchema } from '@lib/seo';
 
 describe('buildArticleSchema', () => {
   it('produces a valid Article JSON-LD with required fields', () => {
@@ -47,5 +47,29 @@ describe('buildArticleSchema', () => {
       image: 'https://example.com/og.svg',
     });
     expect(schema.dateModified).toBeUndefined();
+  });
+});
+
+describe('buildBreadcrumbSchema', () => {
+  it('produces a valid BreadcrumbList with positions', () => {
+    const schema = buildBreadcrumbSchema([
+      { name: 'Home', url: 'https://example.com/' },
+      { name: 'Posts', url: 'https://example.com/posts' },
+      { name: 'Agentic RAG', url: 'https://example.com/posts/agentic-rag' },
+    ]);
+    expect(schema['@type']).toBe('BreadcrumbList');
+    expect(schema.itemListElement).toHaveLength(3);
+    expect(schema.itemListElement[0]).toEqual({
+      '@type': 'ListItem',
+      position: 1,
+      name: 'Home',
+      item: 'https://example.com/',
+    });
+    expect(schema.itemListElement[2].position).toBe(3);
+  });
+
+  it('returns an empty list for empty input', () => {
+    const schema = buildBreadcrumbSchema([]);
+    expect(schema.itemListElement).toEqual([]);
   });
 });

@@ -38,3 +38,32 @@ export function buildArticleSchema(input: ArticleSchemaInput): ArticleSchema {
   }
   return schema;
 }
+
+export interface BreadcrumbItem {
+  name: string;
+  url: string;
+}
+
+export interface BreadcrumbSchema {
+  '@context': 'https://schema.org';
+  '@type': 'BreadcrumbList';
+  itemListElement: Array<{
+    '@type': 'ListItem';
+    position: number;
+    name: string;
+    item: string;
+  }>;
+}
+
+export function buildBreadcrumbSchema(items: BreadcrumbItem[]): BreadcrumbSchema {
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
+    itemListElement: items.map((item, idx) => ({
+      '@type': 'ListItem',
+      position: idx + 1,
+      name: item.name,
+      item: item.url,
+    })),
+  };
+}
