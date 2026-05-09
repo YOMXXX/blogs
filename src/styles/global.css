@@ -136,6 +136,11 @@ body { min-height: 100vh; }
   font-weight: 600;
 }
 
+.prose img {
+  height: auto;
+  border-radius: 6px;
+}
+
 .prose mark {
   background: rgba(251, 191, 36, 0.2);
   color: var(--color-accent-yellow);
