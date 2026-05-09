@@ -8,12 +8,18 @@ interface Props {
 const { position, format = 'auto', minHeight = 90 } = Astro.props;
 ---
 
-<div
-  class="ad-slot"
-  data-ad-slot={position}
-  data-ad-format={format}
-  style={`min-height: ${minHeight}px`}
->
+<div class="ad-slot" style={`min-height: ${minHeight}px`}>
+  <ins
+    class="adsbygoogle"
+    style="display:block"
+    data-ad-client="ca-pub-7299456929245815"
+    data-ad-slot="7743694031"
+    data-ad-format={format}
+    data-full-width-responsive="true"
+  ></ins>
+  <script is:inline>
+    (adsbygoogle = window.adsbygoogle || []).push({});
+  </script>
 </div>
 
 <style>
