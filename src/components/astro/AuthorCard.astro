@@ -1,0 +1,52 @@
+---
+interface Props {
+  name: string;
+  pubDate: Date;
+  updatedDate?: Date;
+}
+
+const { name, pubDate, updatedDate } = Astro.props;
+const fmt = (d: Date) =>
+  d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+---
+
+<aside class="author">
+  <div class="line">
+    <span class="label">// author</span>
+    <span class="name">{name}</span>
+  </div>
+  <div class="line">
+    <span class="label">// published</span>
+    <time datetime={pubDate.toISOString()}>{fmt(pubDate)}</time>
+  </div>
+  {
+    updatedDate && (
+      <div class="line">
+        <span class="label">// updated</span>
+        <time datetime={updatedDate.toISOString()}>{fmt(updatedDate)}</time>
+      </div>
+    )
+  }
+</aside>
+
+<style>
+  .author {
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border-subtle);
+    border-left: 2px solid var(--color-accent-cyan);
+    border-radius: 0 6px 6px 0;
+    padding: 12px 16px;
+    margin: 32px 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .line {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 12px;
+    padding: 3px 0;
+  }
+  .label { color: var(--color-text-faint); }
+  .name { color: var(--color-accent-cyan); font-weight: 600; }
+  time { color: var(--color-text-secondary); }
+</style>
