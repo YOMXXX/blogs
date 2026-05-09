@@ -1,0 +1,3 @@
+# 旧路径重定向
+/post/*  /posts/:splat  301
+/blog/*  /posts/:splat  301
