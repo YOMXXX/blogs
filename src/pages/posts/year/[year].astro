@@ -1,0 +1,61 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../../layouts/BaseLayout.astro';
+import Header from '../../../components/astro/Header.astro';
+import Footer from '../../../components/astro/Footer.astro';
+import FileList from '../../../components/astro/FileList.astro';
+
+export async function getStaticPaths() {
+  const all = await getCollection('posts', ({ data }) => !data.draft);
+  const years = new Set<string>();
+  for (const p of all) years.add(String(p.data.pubDate.getUTCFullYear()));
+  return [...years].map((year) => ({
+    params: { year },
+    props: { year, all },
+  }));
+}
+
+const { year, all } = Astro.props;
+const filtered = (all as Awaited<ReturnType<typeof getCollection>>)
+  .filter((p) => String(p.data.pubDate.getUTCFullYear()) === year)
+  .sort((a, b) => b.data.pubDate.getTime() - a.data.pubDate.getTime());
+
+const items = filtered.map((p, i) => ({
+  slug: p.slug,
+  title: p.data.title,
+  column: p.data.column,
+  pubDate: p.data.pubDate,
+  index: filtered.length - i,
+}));
+---
+
+<BaseLayout
+  title={`${year} archive · Nexus.AI`}
+  description={`All essays from ${year} on Nexus.AI.`}
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>nexus</span> / <span>posts</span> / year / <span class="cur">{year}</span>
+    </div>
+    <h1><span class="prefix">▸</span>{year}</h1>
+    <p class="lead">{filtered.length} essays in {year}</p>
+
+    {items.length === 0
+      ? <p class="empty">// no essays here yet</p>
+      : <FileList items={items} />
+    }
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 880px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 6px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 { font-family: var(--font-mono); font-size: 22px; color: var(--color-text-primary); margin: 0 0 8px; font-weight: 700; }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead { font-family: var(--font-mono); font-size: 12px; color: var(--color-text-muted); margin: 0 0 18px; }
+  .empty { font-family: var(--font-mono); font-size: 12px; color: var(--color-text-faint); padding: 24px 0; }
+</style>
