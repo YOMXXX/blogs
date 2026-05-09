@@ -8,6 +8,7 @@ import AuthorCard from '../components/astro/AuthorCard.astro';
 import FaqSchema from '../components/astro/FaqSchema.astro';
 import ArticleCard from '../components/astro/ArticleCard.astro';
 import ProgressBar from '../components/react/ProgressBar.tsx';
+import GiscusComments from '../components/react/GiscusComments.tsx';
 import { COLUMN_LABELS, COLUMN_TAG_COLOR } from '../content/config';
 import { readingTime } from '../lib/readingTime';
 import JsonLd from '../components/astro/JsonLd.astro';
@@ -118,6 +119,7 @@ const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month:
         </section>
       )
     }
+    <GiscusComments slug={slug} client:visible />
   </main>
   <Footer />
 </BaseLayout>
