@@ -72,8 +72,16 @@ const fullTitle = title.includes('YOMXXX') ? title : `${title} · YOMXXX`;
   </head>
   <body>
     <slot />
-    <PwaUpdateToast />
-    <InstallPrompt />
+    <script is:inline>
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function(registrations) {
+          for (var r of registrations) { r.unregister(); }
+        });
+        caches.keys().then(function(names) {
+          for (var name of names) { caches.delete(name); }
+        });
+      }
+    </script>
     <script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "f0d2577c827b4596a158ee752d68a709"}'></script>
   </body>
 </html>
