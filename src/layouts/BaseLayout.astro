@@ -10,7 +10,8 @@ interface Props {
 
 const { title, description, ogImage, noindex = false } = Astro.props;
 const ogImageURL = ogImage ? new URL(ogImage, Astro.site).href : null;
-const canonicalURL = new URL(Astro.url.pathname, Astro.site).href;
+const cleanPath = Astro.url.pathname.replace(/\.html$/, '').replace(/\/index$/, '/') || '/';
+const canonicalURL = new URL(cleanPath, Astro.site).href;
 const fullTitle = title.endsWith('Nexus.AI') ? title : `${title} · Nexus.AI`;
 ---
 
