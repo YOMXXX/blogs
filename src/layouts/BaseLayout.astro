@@ -72,6 +72,11 @@ const fullTitle = title.includes('YOMXXX') ? title : `${title} · YOMXXX`;
   </head>
   <body>
     <slot />
+    <script is:inline>
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js');
+      }
+    </script>
     <script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "f0d2577c827b4596a158ee752d68a709"}'></script>
   </body>
 </html>
