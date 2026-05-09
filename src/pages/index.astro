@@ -1,0 +1,111 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+import Hero from '../components/astro/Hero.astro';
+import EditorPicks from '../components/astro/EditorPicks.astro';
+import ColumnSection from '../components/astro/ColumnSection.astro';
+import Newsletter from '../components/astro/Newsletter.astro';
+import { readingTime } from '../lib/readingTime';
+
+const allPosts = (await getCollection('posts', ({ data }) => !data.draft))
+  .sort((a, b) => b.data.pubDate.getTime() - a.data.pubDate.getTime());
+
+const featured = allPosts.find((p) => p.data.featured) ?? allPosts[0];
+const editorPicks = allPosts
+  .filter((p) => p.slug !== featured?.slug)
+  .slice(0, 2)
+  .map((p) => ({
+    slug: p.slug,
+    title: p.data.title,
+    column: p.data.column,
+    readingTimeStr: readingTime(p.body),
+  }));
+
+const COLUMNS = ['workshop', 'long-form', 'paper', 'tools', 'weekly'] as const;
+const columnPostsMap = Object.fromEntries(
+  COLUMNS.map((col) => {
+    const list = allPosts.filter((p) => p.data.column === col);
+    return [
+      col,
+      {
+        count: list.length,
+        items: list.slice(0, 3).map((p) => ({ slug: p.slug, title: p.data.title })),
+      },
+    ];
+  }),
+);
+---
+
+<BaseLayout
+  title="Nexus.AI"
+  description="Frontier ML, decoded. Production AI, dissected. Deep technical writing on LLMs, Agents, and RAG."
+>
+  <Header />
+  <main class="container">
+    <div class="comment">// frontier ml. production ai. essays every Tuesday.</div>
+    <h1>
+      <span class="prefix">▸</span>Nexus.AI
+    </h1>
+    <p class="lead">
+      Deep technical writing on LLMs, Agents, RAG, and the systems beneath. New essay every Tuesday.
+    </p>
+
+    {
+      featured && (
+        <Hero
+          slug={featured.slug}
+          title={featured.data.title}
+          description={featured.data.description}
+          column={featured.data.column}
+          pubDate={featured.data.pubDate}
+          body={featured.body}
+        />
+      )
+    }
+
+    {editorPicks.length > 0 && <EditorPicks picks={editorPicks} />}
+
+    {
+      COLUMNS.map((col) => {
+        const m = columnPostsMap[col];
+        if (!m || m.count === 0) return null;
+        return <ColumnSection column={col} count={m.count} posts={m.items} />;
+      })
+    }
+
+    <Newsletter />
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 28px 24px 40px;
+  }
+  .comment {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-faint);
+    margin-bottom: 6px;
+  }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    color: var(--color-text-primary);
+    margin: 0 0 10px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-text-muted);
+    line-height: 1.6;
+    margin: 0 0 24px;
+  }
+</style>
