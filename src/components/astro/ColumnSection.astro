@@ -1,0 +1,80 @@
+---
+import { COLUMN_LABELS } from '../../content/config';
+
+interface PostRow {
+  slug: string;
+  title: string;
+}
+
+interface Props {
+  column: keyof typeof COLUMN_LABELS;
+  count: number;
+  posts: PostRow[];
+}
+
+const { column, count, posts } = Astro.props;
+const fileName = `${column}.md`;
+---
+
+<section class="col-section">
+  <div class="col-h">
+    <span class="name">// {fileName}</span>
+    <span class="count">{count} essays</span>
+    <a href={`/posts?column=${column}`} class="more">view all ›</a>
+  </div>
+  <div class="rows">
+    {
+      posts.map((p) => (
+        <a class="row" href={`/posts/${p.slug}`}>
+          <span class="icon">▸</span>
+          <span class="title">
+            <span class="filename">{p.slug}</span>
+            <span class="ext">.md</span>
+          </span>
+        </a>
+      ))
+    }
+  </div>
+</section>
+
+<style>
+  .col-section { margin-bottom: 22px; }
+  .col-h {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--color-border-subtle);
+    padding-bottom: 6px;
+  }
+  .col-h .name { color: var(--color-accent-green); font-weight: 600; }
+  .col-h .count { color: var(--color-text-faint); font-size: 11px; }
+  .col-h .more {
+    color: var(--color-accent-amber);
+    font-size: 11px;
+    text-decoration: none;
+  }
+  .col-h .more:hover { text-decoration: underline; }
+  .rows { display: flex; flex-direction: column; }
+  .row {
+    display: grid;
+    grid-template-columns: 24px 1fr;
+    gap: 8px;
+    padding: 6px 0;
+    text-decoration: none;
+    color: inherit;
+    border-bottom: 1px dashed var(--color-border-subtle);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    transition: padding-left 0.12s;
+  }
+  .row:hover {
+    padding-left: 4px;
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .row .icon { color: var(--color-accent-amber); }
+  .row .title { color: var(--color-text-secondary); }
+  .row .ext { color: var(--color-text-faint); }
+</style>
