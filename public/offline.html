@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Offline · YOMXXX</title>
+  <meta name="theme-color" content="#0a0a0a" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html {
+      background: #0a0a0a;
+      color: #c9d1d9;
+      font-family: 'JetBrains Mono', ui-monospace, 'Menlo', monospace;
+      font-size: 15px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    body { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .container { max-width: 480px; padding: 40px 24px; text-align: center; }
+    .prompt {
+      font-size: 13px;
+      color: #c9d1d9;
+      margin-bottom: 8px;
+    }
+    .prompt .kw { color: #f59e0b; }
+    .prompt .arg { color: #22d3ee; }
+    .err {
+      font-size: 13px;
+      color: #ef4444;
+      margin-bottom: 4px;
+    }
+    .exit {
+      font-size: 12px;
+      color: #5c6370;
+      margin-bottom: 32px;
+    }
+    .exit span { color: #ef4444; font-weight: 700; }
+    h1 {
+      font-size: 24px;
+      color: #f0f6fc;
+      margin: 0 0 14px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    p {
+      font-size: 13px;
+      color: #8b949e;
+      margin-bottom: 20px;
+    }
+    .actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+    a, button {
+      display: inline-block;
+      font-family: inherit;
+      font-size: 13px;
+      color: #10b981;
+      text-decoration: none;
+      background: #111118;
+      border: 1px solid #1f1f24;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    a:hover, button:hover {
+      border-color: #10b981;
+      background: rgba(16, 185, 129, 0.08);
+    }
+    .status {
+      margin-top: 24px;
+      font-size: 11px;
+      color: #5c6370;
+    }
+    .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #ef4444; margin-right: 6px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="prompt">
+      <span class="kw">$</span> curl <span class="arg">yomxxx.com</span>
+    </div>
+    <div class="err">curl: (7) Failed to connect: Network is unreachable</div>
+    <div class="exit">Exit code: <span>offline</span></div>
+
+    <h1>You're offline</h1>
+    <p>
+      No network connection detected. Previously visited pages may still be available from cache.
+    </p>
+
+    <div class="actions">
+      <a href="/">Try homepage</a>
+      <button onclick="window.location.reload()">Retry</button>
+    </div>
+
+    <div class="status">
+      <span class="dot"></span>offline &mdash; cached pages may still work
+    </div>
+  </div>
+</body>
+</html>
