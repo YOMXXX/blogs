@@ -1,20 +1,20 @@
 ---
 interface Props {
-  slot: string;
+  position: string;
   format?: 'auto' | 'horizontal' | 'vertical' | 'rectangle';
   minHeight?: number;
 }
 
-const { slot, format = 'auto', minHeight = 90 } = Astro.props;
+const { position, format = 'auto', minHeight = 90 } = Astro.props;
 ---
 
 <div
   class="ad-slot"
-  data-ad-slot={slot}
+  data-ad-slot={position}
   data-ad-format={format}
   style={`min-height: ${minHeight}px`}
 >
-  <div class="ad-label">// AdSense &middot; {slot}</div>
+  <div class="ad-label">// AdSense &middot; {position}</div>
   <div class="ad-placeholder">
     <span class="ad-skeleton">ad loading...</span>
   </div>

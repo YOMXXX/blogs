@@ -11,6 +11,7 @@ import ProgressBar from '../components/react/ProgressBar.tsx';
 import GiscusComments from '../components/react/GiscusComments.tsx';
 import { COLUMN_LABELS, COLUMN_TAG_COLOR } from '../content/config';
 import { readingTime } from '../lib/readingTime';
+import AdSlot from '../components/astro/AdSlot.astro';
 import JsonLd from '../components/astro/JsonLd.astro';
 import { buildArticleSchema, buildBreadcrumbSchema } from '../lib/seo';
 
@@ -91,15 +92,23 @@ const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month:
 
     <TldrBlock text={fm.tldr} />
 
+    <AdSlot position="above-toc" format="horizontal" minHeight={90} />
+
     <TocSidebar headings={headings} />
+
+    <AdSlot position="in-article-1" format="auto" minHeight={120} />
 
     <article class="prose">
       <slot />
     </article>
 
+    <AdSlot position="in-article-2" format="auto" minHeight={120} />
+
     {fm.faq && fm.faq.length > 0 && <FaqSchema faqs={fm.faq} />}
 
     <AuthorCard name={fm.author} pubDate={fm.pubDate} updatedDate={fm.updatedDate} />
+
+    <AdSlot position="end-of-article" format="rectangle" minHeight={250} />
 
     {
       related.length > 0 && (
