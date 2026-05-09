@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildArticleSchema, buildBreadcrumbSchema, buildOrganizationSchema, buildWebSiteSchema } from '@lib/seo';
+import { buildArticleSchema, buildBreadcrumbSchema, buildOrganizationSchema, buildWebSiteSchema, buildFaqSchema } from '@lib/seo';
 
 describe('buildArticleSchema', () => {
   it('produces a valid Article JSON-LD with required fields', () => {
@@ -99,5 +99,29 @@ describe('buildWebSiteSchema', () => {
     expect(schema.potentialAction['@type']).toBe('SearchAction');
     expect(schema.potentialAction.target).toBe('https://nexus-ai.example.com/posts?q={search_term_string}');
     expect(schema.potentialAction['query-input']).toBe('required name=search_term_string');
+  });
+});
+
+describe('buildFaqSchema', () => {
+  it('produces FAQPage with mainEntity questions', () => {
+    const schema = buildFaqSchema([
+      { q: 'What is Agentic RAG?', a: 'A retrieval pattern where the LLM decides retrieval strategy itself.' },
+      { q: 'How is it different from naive RAG?', a: 'Agentic RAG can plan, retry, and verify; naive RAG retrieves once.' },
+    ]);
+    expect(schema).not.toBeNull();
+    expect(schema!['@type']).toBe('FAQPage');
+    expect(schema!.mainEntity).toHaveLength(2);
+    expect(schema!.mainEntity[0]).toEqual({
+      '@type': 'Question',
+      name: 'What is Agentic RAG?',
+      acceptedAnswer: {
+        '@type': 'Answer',
+        text: 'A retrieval pattern where the LLM decides retrieval strategy itself.',
+      },
+    });
+  });
+
+  it('returns null when faqs array is empty', () => {
+    expect(buildFaqSchema([])).toBeNull();
   });
 });

@@ -103,3 +103,21 @@ export function buildWebSiteSchema(input: WebSiteInput) {
     },
   };
 }
+
+export interface FaqEntry {
+  q: string;
+  a: string;
+}
+
+export function buildFaqSchema(faqs: FaqEntry[]) {
+  if (faqs.length === 0) return null;
+  return {
+    '@context': 'https://schema.org' as const,
+    '@type': 'FAQPage' as const,
+    mainEntity: faqs.map((f) => ({
+      '@type': 'Question' as const,
+      name: f.q,
+      acceptedAnswer: { '@type': 'Answer' as const, text: f.a },
+    })),
+  };
+}
