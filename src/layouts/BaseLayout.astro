@@ -8,7 +8,8 @@ interface Props {
   noindex?: boolean;
 }
 
-const { title, description, ogImage = '/og-default.png', noindex = false } = Astro.props;
+const { title, description, ogImage, noindex = false } = Astro.props;
+const ogImageURL = ogImage ? new URL(ogImage, Astro.site).href : null;
 const canonicalURL = new URL(Astro.url.pathname, Astro.site).href;
 const fullTitle = title.endsWith('Nexus.AI') ? title : `${title} · Nexus.AI`;
 ---
@@ -29,9 +30,10 @@ const fullTitle = title.endsWith('Nexus.AI') ? title : `${title} · Nexus.AI`;
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
     <meta property="og:url" content={canonicalURL} />
-    <meta property="og:image" content={new URL(ogImage, Astro.site).href} />
+    {ogImageURL && <meta property="og:image" content={ogImageURL} />}
     <meta name="twitter:card" content="summary_large_image" />
 
+    {/* theme-color must match --color-bg-primary in tokens.css */}
     <meta name="theme-color" content="#0a0a0a" />
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
