@@ -14,7 +14,8 @@
     "astro": "astro",
     "check": "astro check",
     "test": "vitest run --passWithNoTests",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "fonts:subset": "node scripts/download-fonts.mjs"
   },
   "dependencies": {
     "@astrojs/mdx": "^4.0.3",
