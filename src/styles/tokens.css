@@ -1,0 +1,39 @@
+@import 'tailwindcss';
+
+@theme {
+  /* === 字体 === */
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Menlo', monospace;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+
+  /* === 底色 === */
+  --color-bg-primary: #0a0a0a;
+  --color-bg-surface: #111118;
+  --color-bg-elevated: #1a1a20;
+
+  /* === 边框 === */
+  --color-border-subtle: #1f1f24;
+  --color-border-strong: #2a2a30;
+
+  /* === 文字 === */
+  --color-text-primary: #f0f6fc;
+  --color-text-secondary: #c9d1d9;
+  --color-text-muted: #8b949e;
+  --color-text-faint: #5c6370;
+
+  /* === 语义色 === */
+  --color-accent-green: #10b981;
+  --color-accent-amber: #f59e0b;
+  --color-accent-purple: #a855f7;
+  --color-accent-cyan: #22d3ee;
+  --color-accent-pink: #f472b6;
+  --color-accent-yellow: #fbbf24;
+  --color-accent-emerald: #10b981;
+  --color-accent-red: #ef4444;
+
+  /* === 栏目 tag 色（语义化） === */
+  --color-tag-workshop: #c084fc;
+  --color-tag-paper: #22d3ee;
+  --color-tag-long: #f472b6;
+  --color-tag-tools: #10b981;
+  --color-tag-weekly: #fbbf24;
+}
