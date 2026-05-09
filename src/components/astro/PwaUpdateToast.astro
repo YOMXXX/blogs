@@ -1,0 +1,95 @@
+---
+// PWA Update Toast — shows when new SW version is ready
+// Works with registerType: 'prompt' from @vite-pwa/astro
+---
+
+<div id="pwa-toast" class="pwa-toast" role="alert" aria-live="assertive" hidden>
+  <div class="toast-inner">
+    <span class="toast-icon">&#x21bb;</span>
+    <span class="toast-text">New content available</span>
+    <button id="pwa-refresh" class="toast-btn">Refresh</button>
+    <button id="pwa-close" class="toast-close" aria-label="Close">&times;</button>
+  </div>
+</div>
+
+<script>
+  // Listen for SW update event from @vite-pwa/astro
+  async function initPwaUpdate() {
+    try {
+      const { registerSW } = await import('virtual:pwa-register');
+      const updateSW = registerSW({
+        onNeedRefresh() {
+          const toast = document.getElementById('pwa-toast');
+          if (toast) toast.hidden = false;
+
+          document.getElementById('pwa-refresh')?.addEventListener('click', () => {
+            updateSW(true);
+          });
+
+          document.getElementById('pwa-close')?.addEventListener('click', () => {
+            if (toast) toast.hidden = true;
+          });
+        },
+        onOfflineReady() {
+          // Silently ready for offline — no toast needed
+          console.log('[SW] Offline ready');
+        },
+      });
+    } catch {
+      // SW not available (dev mode or unsupported browser)
+    }
+  }
+
+  if ('serviceWorker' in navigator) {
+    initPwaUpdate();
+  }
+</script>
+
+<style>
+  .pwa-toast {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    z-index: 10000;
+  }
+  .toast-inner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--color-bg-elevated, #1a1a20);
+    border: 1px solid var(--color-accent-cyan, #22d3ee);
+    border-radius: 8px;
+    padding: 10px 14px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+  }
+  .toast-icon {
+    font-size: 16px;
+    color: var(--color-accent-cyan, #22d3ee);
+  }
+  .toast-text {
+    color: var(--color-text-secondary, #c9d1d9);
+  }
+  .toast-btn {
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--color-bg-primary, #0a0a0a);
+    background: var(--color-accent-cyan, #22d3ee);
+    border: none;
+    padding: 4px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .toast-btn:hover { opacity: 0.9; }
+  .toast-close {
+    font-size: 16px;
+    color: var(--color-text-faint, #5c6370);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 2px;
+  }
+  .toast-close:hover { color: var(--color-text-secondary, #c9d1d9); }
+</style>

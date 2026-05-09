@@ -41,6 +41,9 @@ importers:
       web-vitals:
         specifier: ^5.2.0
         version: 5.2.0
+      workbox-window:
+        specifier: ^7.4.1
+        version: 7.4.1
     devDependencies:
       '@astrojs/check':
         specifier: ^0.9.4
