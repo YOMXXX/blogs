@@ -1,5 +1,6 @@
 ---
 import '../styles/global.css';
+import WebVitalsReporter from '../components/react/WebVitalsReporter.tsx';
 import JsonLd from '../components/astro/JsonLd.astro';
 import { buildOrganizationSchema, buildWebSiteSchema } from '../lib/seo';
 
@@ -59,6 +60,7 @@ const fullTitle = title.endsWith('Nexus.AI') ? title : `${title} · Nexus.AI`;
     <JsonLd schema={[orgSchema, webSiteSchema]} />
   </head>
   <body>
+    <WebVitalsReporter client:idle />
     <slot />
   </body>
 </html>
