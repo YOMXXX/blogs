@@ -1,0 +1,28 @@
+# Robots.txt for Nexus.AI
+# Allow all major search engines and AI crawlers (per AEO strategy)
+
+User-agent: *
+Allow: /
+
+# Block dev / private paths
+Disallow: /api/
+Disallow: /admin/
+
+# Sitemap
+Sitemap: https://nexus-ai.example.com/sitemap-index.xml
+
+# AI crawlers explicitly allowed (we want our content indexed by AI engines)
+User-agent: GPTBot
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
