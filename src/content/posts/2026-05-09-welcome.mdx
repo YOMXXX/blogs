@@ -1,0 +1,68 @@
+---
+title: "Hello, World — 一个面向 AI 前沿的工程笔记"
+description: "Nexus.AI 开篇——一个面向 AI 前沿的个人工程博客。本文介绍为什么我决定开这个博客、会写什么样的内容、每周的发布节奏，以及作为读者你能期待从这里获得什么样的深度文章与工程洞见。"
+column: "long-form"
+tags: ["meta", "intro"]
+pubDate: 2026-05-09
+featured: true
+tldr: "Nexus.AI 是一个面向 AI 前沿的个人工程博客，每周二发布一篇深度文章，覆盖实战工坊、深度长文、论文速读、工具速评、AI 周报五个栏目。读者主要是应用层开发者与硬核从业者。"
+author: "AI Frontier"
+---
+
+import TldrBlock from '../../components/astro/TldrBlock.astro';
+
+## 为什么开这个博客
+
+过去一年，AI 应用的飞跃太多。我每天读论文、写代码、试新框架，脑子里有大量笔记没地方系统沉淀。
+
+这个博客就是答案。
+
+## 会写什么
+
+围绕 5 个栏目：
+
+| 栏目 | 频率 | 类型 |
+|---|---|---|
+| `workshop` 实战工坊 | 每周一 | LLM API · Agent · RAG · 微调 |
+| `paper` 论文速读 | 每周三 | arXiv 精读 · 核心贡献 · 工程意义 |
+| `long-form` 深度长文 | 隔周五 | 原理推导 · 架构剖析 · 系统设计 |
+| `tools` 工具速评 | 月 1–2 次 | Cursor / Claude / 框架横评 |
+| `weekly` AI 周报 | 每周日 | 趋势 + 决策视角 |
+
+每篇文章都有：
+
+- 50–300 字的 **TL;DR**（你看到的那个绿框）
+- 自动生成的 **目录大纲**（左侧可点）
+- 文末 **5 个 FAQ**（搜索引擎 + AI 引擎友好）
+- **作者信息**（包括发布与更新时间）
+
+## 节奏
+
+12 篇/月。周一、三、五、日各一篇。
+
+> 写得不够快是因为我宁愿慢，也不愿稀释。
+
+## 读者你能期待什么
+
+如果你是：
+
+- **应用开发者** — 文章会有"能跑、能抄、能改"的代码
+- **硬核从业者** — 偶尔会硬核到论文级别
+- **决策者** — 每周日的周报是为你写的
+
+如果以上都不是，欢迎你看看，但你可能不是核心读者。
+
+## 关于站点本身
+
+视觉风格的设计灵感来自 **OpenAI / Anthropic / Vercel / [skillsmp.com](https://skillsmp.com/)**——深色背景、JetBrains Mono 等宽字体、`// 注释` 与 `~/` 路径式的 UI 语言。我希望你打开这个站点的第一秒就能感觉到："这是写给开发者的"。
+
+技术栈：**Astro 5 + TypeScript + Tailwind CSS 4 + Cloudflare Pages**。整站静态生成，0 KB JS by default，Service Worker 缓存到位后二次访问近乎瞬开。
+
+## 接下来
+
+下一篇（这周三）会是 **paper** 栏目的开篇——Mamba-3 vs Transformers，谁在 200K 上下文上真正胜出。
+
+```ts
+// see you on Wednesday
+console.log("$ ~/nexus");
+```
