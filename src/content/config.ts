@@ -16,6 +16,16 @@ const posts = defineCollection({
     draft: z.boolean().default(false),
     featured: z.boolean().default(false),
     tldr: z.string().min(50).max(300),
+    faq: z
+      .array(
+        z.object({
+          q: z.string().min(8).max(120),
+          a: z.string().min(20).max(400),
+        }),
+      )
+      .min(0)
+      .max(10)
+      .default([]),
     author: z.string().default('AI Frontier'),
   }),
 });
