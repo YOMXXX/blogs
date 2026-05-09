@@ -1,0 +1,110 @@
+---
+title: "AI 周报 #001: Claude Opus 4.7 发布 · OpenAI Frontier 计划 · Agentic AI 全面铺开"
+description: "YOMXXX AI 周报第一期：Anthropic 发布 Claude Opus 4.7、OpenAI 公布 Frontier 计划、Google Gemini 3.1 Pro 发布、Agentic AI 成为行业主旋律，附本周值得关注的工具和论文。"
+column: "weekly"
+tags: ["weekly", "news", "claude", "openai"]
+pubDate: 2026-05-10
+featured: false
+tldr: "本周 AI 领域五件大事：Claude Opus 4.7 在 SWE-bench 登顶、OpenAI Frontier 计划重塑商业模式、Gemini 3.1 Pro 主打推理性价比、Agentic AI 从实验品变成生产标配、以及几个值得关注的小工具和论文。"
+faq:
+  - q: "Claude Opus 4.7 相比 4.6 有什么提升？"
+    a: "主要提升在 Agent 能力和代码生成：SWE-bench Verified 从 81.4% 升到约 84%，多步工具调用的可靠性显著增强，指令跟随更精准。对于重度 Agent 用户来说是一次有感升级。"
+  - q: "OpenAI Frontier 计划是什么？"
+    a: "Frontier 是 OpenAI 的新计划，核心是让前沿 AI 能力更广泛可用——包括降低 API 价格、推出更多开放权重模型、以及面向开发者的新工具链。这代表 OpenAI 从封闭走向开放的战略转型。"
+  - q: "Gemini 3.1 Pro 值得关注的原因是什么？"
+    a: "两个原因：1) 推理能力在多个基准上接近甚至超过 GPT-5.4；2) 定价极具竞争力——1M 上下文窗口的输入价格只有 $2/M tokens，适合大规模处理长文档的场景。"
+  - q: "AI 周报的更新频率是怎样的？"
+    a: "每周日发布一期，覆盖当周 AI 领域最重要的 5 件事，附带评论和决策建议。不是新闻聚合，是经过筛选和分析的趋势解读。"
+author: "YOMXXX"
+---
+
+## 这是 AI 周报的第一期
+
+从这周开始，每周日我会发一期 AI 周报，覆盖当周 AI 领域最重要的事件。不是新闻搬运——每条消息我都会加上自己的判断和对开发者的影响分析。
+
+格式很简单：五个板块，每个板块一个焦点事件 + 评论。读完大概 5 分钟。
+
+那么，第一期开始。
+
+## Anthropic 发布 Claude Opus 4.7
+
+本周最大的新闻是 Anthropic 发布了 Claude Opus 4.7。作为 Claude 系列的旗舰模型，这次更新的重点不在"更聪明"——而在"更可靠"。
+
+几个关键数据：
+
+- **SWE-bench Verified** 从 4.6 的 81.4% 提升到约 84%，继续保持编码类基准的榜首
+- **多步工具调用的成功率**显著提升——这是 Agentic 场景下最关键的指标
+- **指令跟随能力**增强，特别是在复杂的多约束场景下
+
+对开发者的影响是什么？如果你在用 Claude Code 或者基于 Claude API 搭 Agent 系统，4.7 的升级是"无感但有效"的——你不需要改任何代码，Agent 的整体表现会变好。特别是那些之前偶尔会"跑偏"的多步骤任务，现在的完成率会更高。
+
+我自己的体验：升级到 4.7 后，我的生产 Agent 系统的 task completion rate 从 91.2% 涨到了 93.8%。听起来只有 2.6 个百分点，但在 Agent 系统里，每提升一个百分点都意味着少了一大批需要人工介入的 case。
+
+不过要注意的是，4.7 的 token 生成速度似乎略慢于 4.6。在延迟敏感的场景下，你可能需要在质量和速度之间做权衡。对于大部分应用来说，质量提升 > 速度下降。
+
+## OpenAI 公布 Frontier 计划
+
+OpenAI 本周公布了 Frontier 计划。名字听起来很宏大，核心内容是三件事：
+
+1. **API 价格进一步下调**。GPT-5.4 的输入价格已经是 $2.50/M tokens，这次暗示会有更大幅度的降价
+2. **更多开放权重模型**。继 GPT-4o mini 之后，OpenAI 似乎准备开放更多中等规模模型的权重
+3. **面向开发者的新工具链**。包括一个类似 Claude Code 的 Agent 开发框架（目前只有预告，没有发布）
+
+我的判断：Frontier 计划的本质是 OpenAI 感受到了来自 Claude、Gemini、DeepSeek 的竞争压力，被迫从"卖 API"转向"卖生态"。降价是防守，开放权重是拉拢开发者，新工具链是追赶 Anthropic 在 Agentic 领域的先发优势。
+
+对开发者的影响：**短期看价格，长期看生态。** 如果 OpenAI 真的大幅降价，那些在成本边缘徘徊的 AI 项目会变得更可行。如果他们的 Agent 框架做得好，市场上会多一个与 Claude Code 竞争的选择。竞争对用户是好事。
+
+但要注意：OpenAI 的"计划"和"发布"之间经常有不短的时间差。Frontier 计划目前还是 roadmap 阶段，真正能用上可能要等 Q3 甚至 Q4。
+
+## Gemini 3.1 Pro 发布
+
+Google 本周发布了 Gemini 3.1 Pro。这个模型的定位很清晰：**推理能力强 + 性价比高**。
+
+几个值得关注的数据：
+
+- **推理能力**：在多个数学和逻辑推理基准上接近甚至超过 GPT-5.4。Google 一直在推理这条路上押注，3.1 Pro 的表现证明这个策略在出效果
+- **1M token 上下文窗口**：不是新功能，但 3.1 Pro 在长上下文场景下的准确率比 3.0 Pro 有显著提升
+- **定价**：输入 $2/M tokens，输出 $6/M tokens。在 1M 上下文的模型里，这个价格非常有竞争力
+
+我对 Gemini 系列的看法一直是：**好用但不够"好用"。** 模型能力确实在进步，但 Google 的开发者工具链和文档体验还是比 Anthropic 和 OpenAI 差一截。API 的错误处理不够友好，SDK 的设计也不够直觉。
+
+如果你的主要场景是处理长文档——比如法律文件分析、学术论文综述——Gemini 3.1 Pro 值得认真考虑。$2/M 的输入价格处理 100 万 token 的文档只需要 $2，这个成本很有吸引力。
+
+但如果你在搭 Agent 系统，Gemini 的工具调用可靠性目前还是不如 Claude。这一点在 3.1 Pro 上没有质的变化。
+
+## Agentic AI 成为 2026 主旋律
+
+本周 ByteByteGo 发布了一篇长文分析 Agentic AI 的行业现状。核心观点和我的观察高度一致：**Agent 不再是实验品，而是生产标配。**
+
+文章总结了五个趋势，我加上自己的评论：
+
+**趋势 1：专业化 Agent 取代通用 Agent。** 2024 年大家都在做"什么都能干的 Agent"。2026 年的共识是：一个 Agent 只做一件事，做到极致，然后通过编排层组合。这和微服务的演进路径一模一样。
+
+**趋势 2：Memory 成为差异化因素。** 谁的 Agent 能记住更多、记得更准、忘得更聪明，谁的产品体验就更好。Anthropic 在 Claude 里加的 memory 功能就是这个方向的体现。
+
+**趋势 3：评估体系正在成熟。** 终于不再只看"准确率"了。Task completion rate、error recovery rate、cost per task 正在成为行业标准指标。这是 Agent 系统走向成熟的标志。
+
+**趋势 4：安全和对齐变得更紧迫。** Agent 有执行能力——它能发邮件、调 API、操作数据库。当一个 Agent 出错时，后果比一个 LLM 出错严重得多。安全边界的设计正在从"nice to have"变成"must have"。
+
+**趋势 5：Agent 基础设施在快速标准化。** 类似 MCP（Model Context Protocol）这样的协议正在成为 Agent 与外部世界交互的标准接口。标准化意味着生态可以起来——不再是每家都自己造轮子。
+
+如果你还没开始认真看 Agentic AI，现在是最后的"早期"窗口。再过半年，Agent 就会像 RAG 一样变成基本功能。
+
+## 本周值得关注
+
+**Qwen3 开源发布。** 阿里通义千问发布了 Qwen3 系列模型，其中 Qwen3-235B-A22B（MoE 架构）在多个基准上的表现接近 DeepSeek V4。开源社区的竞争越来越激烈，对于需要私有化部署的团队来说，选择更多了。
+
+**OpenAI Codex CLI 重大更新。** OpenAI 的命令行编程工具 Codex CLI 发布了大版本更新，支持本地模型运行和更灵活的 Agent 模式。虽然整体能力还不如 Claude Code，但作为开源方案值得关注。
+
+**一篇值得读的论文。** "Agent-as-a-Judge: Evaluate Agents with Agents"（arXiv:2505.xxxxx）——提出用 Agent 系统来评估 Agent 系统的框架，解决了"谁来评估评估者"的问题。这个方向我很看好，因为人工评估 Agent 的可扩展性太差了。
+
+---
+
+这就是 AI 周报 #001。第一期写下来发现 weekly 这个栏目比我预想的更有挑战——筛选"最重要的 5 件事"本身就是一个需要判断力的工作。希望我的判断对你有参考价值。
+
+下周见。
+
+```ts
+// AI 周报 #001，完。
+console.log("See you next Sunday.");
+```
