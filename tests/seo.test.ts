@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildArticleSchema, buildBreadcrumbSchema, buildOrganizationSchema, buildWebSiteSchema, buildFaqSchema } from '@lib/seo';
+import { buildArticleSchema, buildBreadcrumbSchema, buildOrganizationSchema, buildWebSiteSchema, buildFaqSchema, collectFeedItems, type FeedablePost } from '@lib/seo';
 
 describe('buildArticleSchema', () => {
   it('produces a valid Article JSON-LD with required fields', () => {
@@ -123,5 +123,34 @@ describe('buildFaqSchema', () => {
 
   it('returns null when faqs array is empty', () => {
     expect(buildFaqSchema([])).toBeNull();
+  });
+});
+
+describe('collectFeedItems', () => {
+  const post = (slug: string, date: string, draft = false): FeedablePost => ({
+    slug,
+    body: 'body',
+    data: {
+      title: `Title ${slug}`,
+      description: 'd'.repeat(120),
+      pubDate: new Date(date),
+      author: 'Author',
+      column: 'long-form',
+      draft,
+    },
+  });
+
+  it('filters out drafts', () => {
+    const items = collectFeedItems([post('a', '2026-01-01'), post('b', '2026-01-02', true)]);
+    expect(items.map((i) => i.slug)).toEqual(['a']);
+  });
+
+  it('sorts by pubDate desc', () => {
+    const items = collectFeedItems([
+      post('a', '2026-01-01'),
+      post('b', '2026-03-01'),
+      post('c', '2026-02-01'),
+    ]);
+    expect(items.map((i) => i.slug)).toEqual(['b', 'c', 'a']);
   });
 });

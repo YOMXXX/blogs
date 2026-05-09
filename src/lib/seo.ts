@@ -121,3 +121,22 @@ export function buildFaqSchema(faqs: FaqEntry[]) {
     })),
   };
 }
+
+export interface FeedablePost {
+  slug: string;
+  body: string;
+  data: {
+    title: string;
+    description: string;
+    pubDate: Date;
+    author: string;
+    column: string;
+    draft: boolean;
+  };
+}
+
+export function collectFeedItems<T extends FeedablePost>(posts: T[]): T[] {
+  return posts
+    .filter((p) => !p.data.draft)
+    .sort((a, b) => b.data.pubDate.getTime() - a.data.pubDate.getTime());
+}
