@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildArticleSchema, buildBreadcrumbSchema } from '@lib/seo';
+import { buildArticleSchema, buildBreadcrumbSchema, buildOrganizationSchema, buildWebSiteSchema } from '@lib/seo';
 
 describe('buildArticleSchema', () => {
   it('produces a valid Article JSON-LD with required fields', () => {
@@ -71,5 +71,33 @@ describe('buildBreadcrumbSchema', () => {
   it('returns an empty list for empty input', () => {
     const schema = buildBreadcrumbSchema([]);
     expect(schema.itemListElement).toEqual([]);
+  });
+});
+
+describe('buildOrganizationSchema', () => {
+  it('produces an Organization with name and url', () => {
+    const schema = buildOrganizationSchema({
+      name: 'Nexus.AI',
+      url: 'https://nexus-ai.example.com',
+      logo: 'https://nexus-ai.example.com/favicon.svg',
+    });
+    expect(schema['@type']).toBe('Organization');
+    expect(schema.name).toBe('Nexus.AI');
+    expect(schema.url).toBe('https://nexus-ai.example.com');
+    expect(schema.logo).toBe('https://nexus-ai.example.com/favicon.svg');
+  });
+});
+
+describe('buildWebSiteSchema', () => {
+  it('produces a WebSite with SearchAction potentialAction', () => {
+    const schema = buildWebSiteSchema({
+      name: 'Nexus.AI',
+      url: 'https://nexus-ai.example.com',
+    });
+    expect(schema['@type']).toBe('WebSite');
+    expect(schema.name).toBe('Nexus.AI');
+    expect(schema.potentialAction['@type']).toBe('SearchAction');
+    expect(schema.potentialAction.target).toBe('https://nexus-ai.example.com/posts?q={search_term_string}');
+    expect(schema.potentialAction['query-input']).toBe('required name=search_term_string');
   });
 });

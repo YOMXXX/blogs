@@ -67,3 +67,39 @@ export function buildBreadcrumbSchema(items: BreadcrumbItem[]): BreadcrumbSchema
     })),
   };
 }
+
+export interface OrganizationInput {
+  name: string;
+  url: string;
+  logo: string;
+}
+
+export function buildOrganizationSchema(input: OrganizationInput) {
+  return {
+    '@context': 'https://schema.org' as const,
+    '@type': 'Organization' as const,
+    name: input.name,
+    url: input.url,
+    logo: input.logo,
+  };
+}
+
+export interface WebSiteInput {
+  name: string;
+  url: string;
+}
+
+export function buildWebSiteSchema(input: WebSiteInput) {
+  const base = input.url.replace(/\/$/, '');
+  return {
+    '@context': 'https://schema.org' as const,
+    '@type': 'WebSite' as const,
+    name: input.name,
+    url: input.url,
+    potentialAction: {
+      '@type': 'SearchAction' as const,
+      target: `${base}/posts?q={search_term_string}`,
+      'query-input': 'required name=search_term_string',
+    },
+  };
+}
