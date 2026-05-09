@@ -1,0 +1,81 @@
+---
+import { COLUMN_LABELS, COLUMN_TAG_COLOR } from '../../content/config';
+import { readingTime } from '../../lib/readingTime';
+
+interface Props {
+  slug: string;
+  title: string;
+  description: string;
+  column: keyof typeof COLUMN_LABELS;
+  pubDate: Date;
+  body: string;
+}
+
+const { slug, title, description, column, pubDate, body } = Astro.props;
+const dateStr = pubDate.toLocaleDateString('en-US', { year: '2-digit', month: '2-digit', day: '2-digit' });
+const tagColor = COLUMN_TAG_COLOR[column];
+---
+
+<a class="hero" href={`/posts/${slug}`}>
+  <div class="kicker">★ THIS WEEK · DEEP DIVE</div>
+  <h2>{title}</h2>
+  <p>{description}</p>
+  <div class="meta">
+    <span style={`color: ${tagColor}`}>{COLUMN_LABELS[column]}</span>
+    <span class="dot">·</span>
+    <span>{readingTime(body)}</span>
+    <span class="dot">·</span>
+    <span>{dateStr}</span>
+  </div>
+</a>
+
+<style>
+  .hero {
+    display: block;
+    background: linear-gradient(135deg, rgba(168, 85, 247, 0.12), rgba(34, 211, 238, 0.06));
+    border: 1px solid rgba(168, 85, 247, 0.3);
+    border-radius: 12px;
+    padding: 28px 30px;
+    margin-bottom: 28px;
+    text-decoration: none;
+    color: inherit;
+    transition: transform 0.18s, border-color 0.18s, box-shadow 0.18s;
+  }
+  .hero:hover {
+    transform: translateY(-2px);
+    border-color: rgba(168, 85, 247, 0.6);
+    box-shadow: 0 12px 32px rgba(168, 85, 247, 0.15);
+  }
+  .kicker {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-accent-yellow);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+  .hero h2 {
+    font-family: var(--font-sans);
+    font-size: 28px;
+    line-height: 1.2;
+    margin: 0 0 12px;
+    color: var(--color-text-primary);
+    font-weight: 700;
+    letter-spacing: -0.4px;
+  }
+  .hero p {
+    font-size: 14px;
+    color: var(--color-text-muted);
+    line-height: 1.6;
+    margin: 0 0 16px;
+  }
+  .meta {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-faint);
+    display: flex;
+    gap: 8px;
+  }
+  .dot { color: var(--color-border-strong); }
+</style>
