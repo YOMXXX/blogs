@@ -1,0 +1,61 @@
+---
+interface Heading {
+  depth: number;
+  slug: string;
+  text: string;
+}
+
+interface Props {
+  headings: Heading[];
+}
+
+const { headings } = Astro.props;
+const tocHeadings = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+{
+  tocHeadings.length > 0 && (
+    <nav class="toc" aria-label="Table of contents">
+      <div class="toc-h">// table of contents</div>
+      <ol>
+        {tocHeadings.map((h) => (
+          <li class:list={['toc-li', { sub: h.depth === 3 }]}>
+            <a href={`#${h.slug}`}>{h.text}</a>
+          </li>
+        ))}
+      </ol>
+    </nav>
+  )
+}
+
+<style>
+  .toc {
+    background: rgba(16, 185, 129, 0.04);
+    border: 1px solid rgba(16, 185, 129, 0.15);
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 16px 0 24px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .toc-h {
+    color: var(--color-accent-green);
+    font-weight: 600;
+    margin-bottom: 6px;
+    font-size: 11px;
+  }
+  .toc ol { list-style: none; padding: 0; margin: 0; counter-reset: toc; }
+  .toc-li { counter-increment: toc; padding: 2px 0; }
+  .toc-li::before {
+    content: counter(toc, decimal-leading-zero) '. ';
+    color: var(--color-text-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .toc-li.sub { padding-left: 16px; counter-increment: none; }
+  .toc-li.sub::before { content: '▸ '; color: var(--color-accent-amber); }
+  .toc a {
+    color: var(--color-text-secondary);
+    text-decoration: none;
+  }
+  .toc a:hover { color: var(--color-accent-green); }
+</style>
