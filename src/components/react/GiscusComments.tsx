@@ -6,9 +6,9 @@ interface Props {
 
 export default function GiscusComments({ slug }: Props) {
   const repo = 'YOMXXX/blogs' as `${string}/${string}`;
-  const repoId = 'PLACEHOLDER_REPO_ID';
+  const repoId = 'R_kgDOSYZjvQ';
   const category = 'Announcements';
-  const categoryId = 'PLACEHOLDER_CATEGORY_ID';
+  const categoryId = 'DIC_kwDOSYZjvc4C8pQ8';
 
   return (
     <div style={{ marginTop: 48 }}>

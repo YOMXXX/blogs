@@ -56,6 +56,8 @@ const fullTitle = title.endsWith('YOMXXX') ? title : `${title} · YOMXXX`;
     {/* theme-color must match --color-bg-primary in tokens.css */}
     <meta name="theme-color" content="#0a0a0a" />
 
+    <meta name="google-site-verification" content="gkrKesZ0bWlzvOIZngz96hGzHbkFyQ5RUMJeY7--Dv4" />
+
     <!-- Third-party preconnect (AdSense + Giscus) -->
     <link rel="dns-prefetch" href="https://pagead2.googlesyndication.com" />
     <link rel="dns-prefetch" href="https://giscus.app" />
@@ -72,5 +74,6 @@ const fullTitle = title.endsWith('YOMXXX') ? title : `${title} · YOMXXX`;
     <slot />
     <PwaUpdateToast />
     <InstallPrompt />
+    <script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "f0d2577c827b4596a158ee752d68a709"}'></script>
   </body>
 </html>
