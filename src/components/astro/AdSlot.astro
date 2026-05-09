@@ -2,13 +2,12 @@
 interface Props {
   position: string;
   format?: 'auto' | 'horizontal' | 'vertical' | 'rectangle';
-  minHeight?: number;
 }
 
-const { position, format = 'auto', minHeight = 90 } = Astro.props;
+const { position, format = 'auto' } = Astro.props;
 ---
 
-<div class="ad-slot" style={`min-height: ${minHeight}px`}>
+<div class="ad-slot">
   <ins
     class="adsbygoogle"
     style="display:block"
@@ -24,6 +23,10 @@ const { position, format = 'auto', minHeight = 90 } = Astro.props;
 
 <style>
   .ad-slot {
-    margin: 24px 0;
+    margin: 16px 0;
+  }
+  .ad-slot:empty,
+  .ad-slot:has(ins[data-ad-status="unfilled"]) {
+    display: none;
   }
 </style>
