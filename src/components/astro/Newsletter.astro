@@ -1,0 +1,83 @@
+---
+---
+
+<section class="newsletter">
+  <h4>// subscribe to nexus weekly</h4>
+  <p>1 deep essay + 1 weekly digest, every Tuesday. No spam, ever.</p>
+  <form class="form" action="/api/subscribe" method="post" novalidate>
+    <input
+      class="input"
+      type="email"
+      name="email"
+      required
+      autocomplete="email"
+      placeholder="your@email.com"
+      aria-label="Email address"
+    />
+    <button class="btn" type="submit">SUBSCRIBE</button>
+  </form>
+  <p class="note">// backend wired up in Plan 4 (Buttondown)</p>
+</section>
+
+<style>
+  .newsletter {
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 10px;
+    padding: 24px 28px;
+    text-align: center;
+    margin-top: 28px;
+  }
+  .newsletter h4 {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-accent-green);
+    margin: 0 0 4px;
+    font-weight: 600;
+  }
+  .newsletter p {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-muted);
+    margin: 0 0 14px;
+  }
+  .form {
+    display: flex;
+    gap: 6px;
+    max-width: 420px;
+    margin: 0 auto;
+  }
+  .input {
+    flex: 1;
+    background: var(--color-bg-primary);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 5px;
+    padding: 8px 12px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-primary);
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--color-accent-green);
+  }
+  .input::placeholder { color: var(--color-text-faint); }
+  .btn {
+    background: var(--color-accent-green);
+    color: var(--color-bg-primary);
+    border: none;
+    border-radius: 5px;
+    padding: 8px 18px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    letter-spacing: 0.5px;
+  }
+  .btn:hover { opacity: 0.9; }
+  .note {
+    font-size: 10px;
+    color: var(--color-text-faint);
+    margin: 12px 0 0;
+  }
+</style>
