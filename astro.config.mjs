@@ -4,8 +4,7 @@ import react from '@astrojs/react';
 import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
 
-// TODO: replace with real domain before deploy (used by sitemap and OG canonical URLs)
-const SITE = 'https://nexus-ai.example.com';
+const SITE = 'https://yomxxx.com';
 
 export default defineConfig({
   site: SITE,
