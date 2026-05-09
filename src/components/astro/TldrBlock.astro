@@ -1,0 +1,36 @@
+---
+interface Props {
+  text: string;
+}
+const { text } = Astro.props;
+---
+
+<aside class="tldr" aria-label="TL;DR summary">
+  <span class="label">TL;DR</span>
+  <p>{text}</p>
+</aside>
+
+<style>
+  .tldr {
+    background: rgba(16, 185, 129, 0.06);
+    border-left: 2px solid var(--color-accent-green);
+    border-radius: 0 6px 6px 0;
+    padding: 12px 16px;
+    margin: 18px 0 24px;
+    font-family: var(--font-mono);
+  }
+  .label {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--color-accent-green);
+    letter-spacing: 1.5px;
+    margin-bottom: 4px;
+  }
+  .tldr p {
+    margin: 0;
+    font-size: 13px;
+    color: var(--color-text-secondary);
+    line-height: 1.55;
+  }
+</style>
