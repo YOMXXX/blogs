@@ -3,6 +3,7 @@ import '../styles/global.css';
 import WebVitalsReporter from '../components/react/WebVitalsReporter.tsx';
 import JsonLd from '../components/astro/JsonLd.astro';
 import InstallPrompt from '../components/astro/InstallPrompt.astro';
+import { ViewTransitions } from 'astro:transitions';
 import { buildOrganizationSchema, buildWebSiteSchema } from '../lib/seo';
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? '';
@@ -58,6 +59,7 @@ const fullTitle = title.endsWith('YOMXXX') ? title : `${title} · YOMXXX`;
     <link rel="preload" href="/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
     <JsonLd schema={[orgSchema, webSiteSchema]} />
+    <ViewTransitions />
   </head>
   <body>
     <WebVitalsReporter client:idle />
