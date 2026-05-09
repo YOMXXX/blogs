@@ -1,0 +1,68 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+---
+
+<BaseLayout
+  title="404 · Page Not Found"
+  description="The page you requested could not be found."
+  noindex={true}
+>
+  <Header />
+  <main class="container">
+    <div class="oops">
+      <div class="prompt">
+        <span class="kw">$</span> cat <span class="arg">{Astro.url.pathname}</span>
+      </div>
+      <div class="err">cat: {Astro.url.pathname}: No such file or directory</div>
+      <div class="exit">Exit code: <span>404</span></div>
+
+      <h1>404 — page not found</h1>
+      <p>
+        Looks like you wandered off the manifest. Try one of these:
+      </p>
+      <ul>
+        <li><a href="/">→ home</a></li>
+        <li><a href="/posts">→ ~/posts (all essays)</a></li>
+        <li><a href="/about">→ ~/about</a></li>
+      </ul>
+    </div>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 60px 24px 40px; }
+  .oops { font-family: var(--font-mono); }
+  .prompt {
+    font-size: 13px;
+    color: var(--color-text-secondary);
+    margin-bottom: 6px;
+  }
+  .prompt .kw { color: var(--color-accent-amber); margin-right: 4px; }
+  .prompt .arg { color: var(--color-accent-cyan); }
+  .err { font-size: 13px; color: var(--color-accent-red); margin-bottom: 4px; }
+  .exit {
+    font-size: 12px;
+    color: var(--color-text-faint);
+    margin-bottom: 28px;
+  }
+  .exit span { color: var(--color-accent-red); font-weight: 700; }
+  h1 {
+    font-size: 28px;
+    color: var(--color-text-primary);
+    margin: 0 0 14px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  .oops p { font-size: 13px; color: var(--color-text-muted); margin: 0 0 14px; }
+  .oops ul { list-style: none; padding: 0; }
+  .oops li { padding: 4px 0; }
+  .oops a {
+    color: var(--color-accent-green);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  .oops a:hover { text-decoration: underline; }
+</style>
