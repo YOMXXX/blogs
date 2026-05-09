@@ -1,0 +1,67 @@
+---
+import JsonLd from './JsonLd.astro';
+import { buildFaqSchema, type FaqEntry } from '../../lib/seo';
+
+interface Props {
+  faqs: FaqEntry[];
+}
+
+const { faqs } = Astro.props;
+const schema = buildFaqSchema(faqs);
+---
+
+{
+  schema && (
+    <section class="faq" aria-label="Frequently asked questions">
+      <h2>Frequently asked questions</h2>
+      <dl>
+        {faqs.map((f) => (
+          <>
+            <dt>{f.q}</dt>
+            <dd>{f.a}</dd>
+          </>
+        ))}
+      </dl>
+      <JsonLd schema={schema as Record<string, any>} />
+    </section>
+  )
+}
+
+<style>
+  .faq {
+    margin: 48px 0 0;
+    padding: 24px 0 0;
+    border-top: 1px solid var(--color-border-subtle);
+  }
+  .faq h2 {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    color: var(--color-accent-green);
+    margin: 0 0 16px;
+    font-weight: 600;
+  }
+  .faq h2::before {
+    content: '// ';
+  }
+  .faq dl {
+    margin: 0;
+    padding: 0;
+  }
+  .faq dt {
+    font-family: var(--font-sans);
+    font-size: 15px;
+    color: var(--color-text-primary);
+    font-weight: 600;
+    margin-top: 18px;
+  }
+  .faq dt:first-of-type {
+    margin-top: 0;
+  }
+  .faq dd {
+    margin: 6px 0 0;
+    font-family: var(--font-sans);
+    font-size: 14px;
+    color: var(--color-text-secondary);
+    line-height: 1.6;
+  }
+</style>
