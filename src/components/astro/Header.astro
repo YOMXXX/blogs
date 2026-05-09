@@ -1,4 +1,6 @@
 ---
+import SearchDialog from '../react/SearchDialog.tsx';
+
 const path = Astro.url.pathname;
 const isActive = (prefix: string) => path === prefix || path.startsWith(prefix + '/');
 ---
@@ -9,6 +11,7 @@ const isActive = (prefix: string) => path === prefix || path.startsWith(prefix +
       <span class="prompt">$</span>
       <span class="logo-text">~/nexus</span>
     </a>
+    <SearchDialog client:idle />
     <nav class="nav">
       <a href="/" class:list={['nav-item', { active: path === '/' }]}>home</a>
       <a href="/posts" class:list={['nav-item', { active: isActive('/posts') }]}>~/posts</a>
@@ -30,7 +33,7 @@ const isActive = (prefix: string) => path === prefix || path.startsWith(prefix +
     margin: 0 auto;
     padding: 14px 24px;
     display: flex;
-    justify-content: space-between;
+    gap: 12px;
     align-items: center;
     font-family: var(--font-mono);
   }
@@ -44,7 +47,7 @@ const isActive = (prefix: string) => path === prefix || path.startsWith(prefix +
     color: var(--color-accent-amber);
     margin-right: 4px;
   }
-  .nav { display: flex; gap: 18px; }
+  .nav { margin-left: auto; display: flex; gap: 18px; }
   .nav-item {
     color: var(--color-text-muted);
     text-decoration: none;
