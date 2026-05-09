@@ -1,0 +1,42 @@
+name: IndexNow Submit
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/content/posts/**'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Single URL to submit (optional)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Submit IndexNow
+        env:
+          KEY: ${{ secrets.INDEXNOW_KEY }}
+          SITE: ${{ vars.SITE_URL }}
+        run: |
+          set -e
+          if [ -z "$KEY" ] || [ -z "$SITE" ]; then
+            echo "Missing INDEXNOW_KEY secret or SITE_URL variable; skipping"
+            exit 0
+          fi
+          if [ -n "${{ inputs.url }}" ]; then
+            URLS="[\"${{ inputs.url }}\"]"
+          else
+            URLS="[\"${SITE}/sitemap-index.xml\"]"
+          fi
+          HOST=$(echo "$SITE" | sed 's,https\?://,,;s,/$,,')
+          PAYLOAD="{\"host\":\"${HOST}\",\"key\":\"${KEY}\",\"keyLocation\":\"${SITE}/${KEY}.txt\",\"urlList\":${URLS}}"
+          curl -fsS -X POST 'https://api.indexnow.org/IndexNow' \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"
+          echo "Submitted: $URLS"
