@@ -139,19 +139,9 @@ export default defineConfig({
           },
         ],
 
-        // Offline fallback
-        navigateFallback: '/offline',
-        navigateFallbackDenylist: [
-          /\/rss\.xml$/,
-          /\/atom\.xml$/,
-          /\/feed\.json$/,
-          /\/llms.*\.txt$/,
-          /\/sitemap.*\.xml$/,
-          /\/robots\.txt$/,
-          /\/cdn-cgi\//,
-        ],
-
-        navigateFallbackAllowlist: [/^\/(?!cdn-cgi)/],
+        // Offline: SW will serve cached pages when available.
+        // No navigateFallback — SSG pages load from network directly.
+        // offline.html is precached and available if user goes fully offline.
       },
       devOptions: {
         enabled: false,
