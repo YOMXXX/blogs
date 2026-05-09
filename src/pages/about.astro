@@ -16,6 +16,10 @@ import Footer from '../components/astro/Footer.astro';
     <h1><span class="prefix">▸</span>About</h1>
     <p class="lead">Who I am · why this blog · how to reach me.</p>
 
+    <div class="avatar-row">
+      <img src="/avatar.jpeg" alt="YOMXXX" class="avatar" width="120" height="120" />
+    </div>
+
     <div class="prose">
       <h2>Who I am</h2>
       <p>
@@ -68,6 +72,14 @@ import Footer from '../components/astro/Footer.astro';
     font-weight: 700;
   }
   h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .avatar-row {
+    margin: 0 0 24px;
+  }
+  .avatar {
+    border-radius: 50%;
+    border: 2px solid var(--color-border-strong);
+    object-fit: cover;
+  }
   .lead {
     font-family: var(--font-mono);
     font-size: 13px;
