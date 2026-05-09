@@ -7,6 +7,7 @@ import Hero from '../components/astro/Hero.astro';
 import EditorPicks from '../components/astro/EditorPicks.astro';
 import ColumnSection from '../components/astro/ColumnSection.astro';
 import Newsletter from '../components/astro/Newsletter.astro';
+import AdSlot from '../components/astro/AdSlot.astro';
 import { readingTime } from '../lib/readingTime';
 
 const allPosts = (await getCollection('posts', ({ data }) => !data.draft))
@@ -65,6 +66,8 @@ const columnPostsMap = Object.fromEntries(
       )
     }
 
+    <AdSlot position="home-after-hero" format="horizontal" minHeight={90} />
+
     {editorPicks.length > 0 && <EditorPicks picks={editorPicks} />}
 
     {
@@ -74,6 +77,8 @@ const columnPostsMap = Object.fromEntries(
         return <ColumnSection column={col} count={m.count} posts={m.items} />;
       })
     }
+
+    <AdSlot position="home-before-newsletter" format="auto" minHeight={120} />
 
     <Newsletter />
   </main>
