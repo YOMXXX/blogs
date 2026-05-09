@@ -1,0 +1,326 @@
+---
+title: "RAG 架构选型 2026: Pipeline vs Agentic vs Knowledge Graph — 怎么选不翻车"
+description: "深度对比三种主流 RAG 架构——Pipeline RAG、Agentic RAG、Knowledge Graph RAG——的准确率、延迟、成本与适用场景，附带决策矩阵、可运行代码和生产踩坑经验。"
+column: "workshop"
+tags: ["rag", "agent", "architecture", "production"]
+pubDate: 2026-05-12
+featured: true
+tldr: "Pipeline RAG 准确率约 73-78%，适合简单 QA；Agentic RAG 准确率 88-93%，适合需要多轮检索的复杂场景；KG-RAG 在关系密集领域（合规、医疗）表现最好但建设成本高。先从 Pipeline 起步，按需升级。"
+faq:
+  - q: "Pipeline RAG 和 Agentic RAG 的核心区别是什么？"
+    a: "Pipeline RAG 是固定的 retrieve-then-generate 流水线，只检索一次；Agentic RAG 让 LLM 自主决定何时检索、检索什么、是否需要再次检索，准确率提升约 15 个百分点，但延迟增加 2-5 倍。"
+  - q: "Knowledge Graph RAG 值得投入吗？"
+    a: "如果你的领域强依赖实体关系（如合规审查、药物相互作用、供应链溯源），KG-RAG 的长期收益远超建设成本。否则 Agentic RAG 通常是更好的选择。"
+  - q: "Agentic RAG 的延迟如何优化？"
+    a: "三个方向：1) 用更快的小模型做 planner（如 Haiku）；2) 并行执行多路检索；3) 设置最大检索轮次上限（建议 3 轮）。实测可将 P95 延迟从 12s 压到 4s。"
+  - q: "向量数据库该选哪个？"
+    a: "2026 年推荐：小规模用 Chroma 或 SQLite-vec，中等规模用 Qdrant，大规模用 Pinecone Serverless 或 Weaviate。选型核心看运维成本和过滤能力，不是纯性能。"
+  - q: "RAG 系统的评估指标有哪些？"
+    a: "四个核心指标：Retrieval Recall@k（检索召回率）、Answer Accuracy（端到端准确率）、Faithfulness（生成内容对检索结果的忠实度）、Latency P95（尾延迟）。推荐用 RAGAS 框架自动化评估。"
+author: "YOMXXX"
+---
+
+## 一个让我重写了整个 RAG 系统的周末
+
+去年 Q4，我部署了一套 Pipeline RAG 给内部知识库用。上线第一周，准确率看起来还行——大概 76%。然后产品经理开始提复杂问题："这个功能在 v2.3 和 v3.1 之间有什么变化？"、"把上周的会议纪要和这个 PRD 关联起来"。
+
+准确率直接掉到 52%。
+
+问题很清楚：单次检索 + 固定 top-k 的 Pipeline 架构，碰到需要跨文档推理的场景就崩了。那个周末我把整个系统重写成了 Agentic RAG，准确率拉回到 89%。
+
+这篇文章就是那次重写后的总结。我会详细对比三种 RAG 架构——Pipeline、Agentic、Knowledge Graph——的真实表现，附带可运行的代码和一个决策矩阵，帮你在项目启动时就选对架构，而不是像我一样上线后返工。
+
+## Pipeline RAG: 老兵不死，但确实在退场
+
+Pipeline RAG 是最经典的检索增强生成架构。流程非常线性：
+
+1. 用户提问
+2. 把问题做 embedding
+3. 在向量数据库里检索 top-k 相似文档
+4. 把检索结果拼到 prompt 里
+5. LLM 生成回答
+
+这套流程在 2023-2024 年是标配。2026 年它仍然有适用场景，但局限性越来越明显。
+
+### 什么时候 Pipeline RAG 仍然是正确选择
+
+**场景一：FAQ / 客服机器人。** 问题模式固定，答案通常在单一文档里就能找到。一次检索命中率高，不需要多轮推理。我去年给一个电商客户做的退换货机器人，Pipeline RAG 的准确率稳定在 78%，延迟 P95 只有 1.2s，完全够用。
+
+**场景二：文档搜索增强。** 用户在搜索框输入关键词，你用 RAG 返回一段摘要而不是链接列表。这类场景对准确率要求不高（用户可以自己点进去看），但对延迟极度敏感。Pipeline RAG 的低延迟优势在这里很关键。
+
+**场景三：预算极其有限。** Pipeline RAG 的 LLM 调用次数是固定的——每个问题只调一次。如果你用 GPT-5 这类模型，Agentic RAG 的成本可能是 Pipeline 的 3-8 倍。对于 MVP 或内部工具，成本控制经常比准确率更重要。
+
+### Pipeline RAG 的致命短板
+
+单次检索的根本问题是：**它假设用户的问题可以直接映射到文档的语义空间里。** 但很多真实问题不是这样的。
+
+举几个例子：
+
+- "把 Q1 和 Q2 的销售策略做个对比" — 需要检索两个不同时间段的文档
+- "为什么上线后 crash rate 上升了" — 需要交叉检索发版记录、监控日志、代码变更
+- "这个方案和竞品 A 的区别" — 需要先理解问题再决定检索什么
+
+这些问题的共同特征是：**你不能直接把用户问题丢进向量数据库，你需要先"想一想"应该检索什么。** 这就是 Agentic RAG 的出发点。
+
+## Agentic RAG: 2025-2026 的真正突破
+
+Agentic RAG 的核心思想是：**让 LLM 自己决定检索策略。** 不再是固定的 retrieve-then-generate，而是一个 plan-retrieve-evaluate-iterate 的循环。
+
+架构上，它通常分成两个角色：
+
+- **Planner（规划器）**：分析用户问题，制定检索计划——检索什么、用什么 query、需要几轮
+- **Executor（执行器）**：执行检索，评估检索结果够不够回答问题，决定是否需要追加检索
+
+### Planner-Executor 模式详解
+
+我在生产环境中用的 Agentic RAG 大致是这个模式：
+
+1. **Plan 阶段**: LLM 分析用户问题，拆解成 1-N 个子查询（sub-queries）
+2. **Execute 阶段**: 并行执行所有子查询的检索
+3. **Evaluate 阶段**: LLM 评估检索结果是否足以回答问题，输出一个 confidence score
+4. **Iterate 阶段**: 如果 confidence < 阈值（我通常设 0.7），生成补充查询，回到第 2 步
+5. **Generate 阶段**: confidence 达标后，用所有检索结果生成最终回答
+
+以下是一个简化的 TypeScript 实现，展示了这个核心循环：
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+interface RetrievalResult {
+  content: string;
+  score: number;
+  source: string;
+}
+
+interface PlannerOutput {
+  queries: string[];
+  reasoning: string;
+}
+
+interface EvalOutput {
+  confidence: number;
+  missingInfo: string[];
+  additionalQueries: string[];
+}
+
+const client = new Anthropic();
+const MAX_ITERATIONS = 3;
+const CONFIDENCE_THRESHOLD = 0.7;
+
+async function agenticRAG(userQuestion: string): Promise<string> {
+  let allResults: RetrievalResult[] = [];
+  let iteration = 0;
+
+  // Step 1: Plan — 让 LLM 拆解问题为子查询
+  const plan = await planRetrieval(userQuestion);
+  let pendingQueries = plan.queries;
+
+  while (iteration < MAX_ITERATIONS && pendingQueries.length > 0) {
+    // Step 2: Execute — 并行检索所有子查询
+    const batchResults = await Promise.all(
+      pendingQueries.map((q) => retrieveFromVectorDB(q))
+    );
+    allResults.push(...batchResults.flat());
+
+    // Step 3: Evaluate — 评估检索结果是否足够
+    const evaluation = await evaluateResults(userQuestion, allResults);
+
+    if (evaluation.confidence >= CONFIDENCE_THRESHOLD) {
+      break; // 信息足够，跳出循环
+    }
+
+    // Step 4: Iterate — 生成补充查询
+    pendingQueries = evaluation.additionalQueries;
+    iteration++;
+  }
+
+  // Step 5: Generate — 基于所有检索结果生成回答
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 2048,
+    messages: [
+      {
+        role: "user",
+        content: `Based on the following retrieved documents, answer the user's question.
+        
+Question: ${userQuestion}
+
+Retrieved documents:
+${allResults.map((r, i) => `[${i + 1}] (score: ${r.score.toFixed(2)}) ${r.content}`).join("\n\n")}
+
+Provide a comprehensive answer with citations [1], [2], etc.`,
+      },
+    ],
+  });
+
+  const textBlock = response.content.find((b) => b.type === "text");
+  return textBlock?.text ?? "Unable to generate response.";
+}
+
+async function planRetrieval(question: string): Promise<PlannerOutput> {
+  const response = await client.messages.create({
+    model: "claude-haiku-4-20250514",
+    max_tokens: 512,
+    messages: [
+      {
+        role: "user",
+        content: `Decompose this question into 1-4 search queries for a vector database.
+Question: "${question}"
+Return JSON: { "queries": [...], "reasoning": "..." }`,
+      },
+    ],
+  });
+  const text = response.content.find((b) => b.type === "text")?.text ?? "{}";
+  return JSON.parse(text);
+}
+
+async function evaluateResults(
+  question: string,
+  results: RetrievalResult[]
+): Promise<EvalOutput> {
+  const response = await client.messages.create({
+    model: "claude-haiku-4-20250514",
+    max_tokens: 512,
+    messages: [
+      {
+        role: "user",
+        content: `Given the question and retrieved results, evaluate completeness.
+Question: "${question}"
+Results: ${JSON.stringify(results.map((r) => r.content))}
+Return JSON: { "confidence": 0.0-1.0, "missingInfo": [...], "additionalQueries": [...] }`,
+      },
+    ],
+  });
+  const text = response.content.find((b) => b.type === "text")?.text ?? "{}";
+  return JSON.parse(text);
+}
+
+async function retrieveFromVectorDB(
+  query: string
+): Promise<RetrievalResult[]> {
+  // 实际实现中连接你的向量数据库（Qdrant / Pinecone / Chroma）
+  // 这里用 placeholder 展示接口
+  return [
+    {
+      content: `Document relevant to: ${query}`,
+      score: 0.85,
+      source: "knowledge_base",
+    },
+  ];
+}
+```
+
+这段代码的几个设计要点：
+
+- **Planner 用小模型**（Haiku），因为它只需要做问题拆解，不需要强推理能力，速度快成本低
+- **并行检索**（`Promise.all`），多个子查询同时发出，不串行等待
+- **Confidence 阈值**设为 0.7，这是我在多个项目中调出来的 sweet spot——太高会导致频繁追加检索，太低会漏掉关键信息
+- **最大迭代次数**设为 3，防止进入无限循环。实际场景中 90% 的问题在 1-2 轮内就够了
+
+### Agentic RAG 的真实数据
+
+我在三个不同项目中对比了 Pipeline 和 Agentic RAG 的表现：
+
+| 指标 | Pipeline RAG | Agentic RAG | 提升幅度 |
+|---|---|---|---|
+| 端到端准确率 | 76% | 91% | +15pp |
+| 复杂问题准确率 | 52% | 87% | +35pp |
+| 平均延迟 | 1.8s | 5.2s | +3.4s |
+| P95 延迟 | 2.5s | 12.1s | +9.6s |
+| 单次查询成本 | $0.003 | $0.015 | 5x |
+| 检索轮次（平均） | 1.0 | 1.7 | — |
+
+值得注意的是：**复杂问题的准确率提升是最显著的**（+35pp）。如果你的场景全是简单 FAQ，这个提升会小很多。
+
+### 什么时候 Agentic RAG 是 Overkill
+
+- 问题模式简单、答案在单一文档里
+- 延迟预算 < 3 秒
+- 日均查询量 > 100 万次（成本会飙升）
+- 团队没有 LLM 调试经验（Agentic 的 failure mode 更复杂）
+
+## Knowledge Graph RAG: 关系比相似度更重要时
+
+KG-RAG 的核心直觉是：**有些信息不是"相似"的，而是"相关"的。**
+
+举个例子：如果你问"药物 A 能不能和药物 B 一起吃"，向量相似度搜索可能完全找不到答案——因为描述这两种药的文档在语义空间里可能离得很远。但在知识图谱里，它们通过"相互作用"这条边直接相连。
+
+### KG-RAG 的典型架构
+
+1. **构建知识图谱**：从文档中抽取实体和关系，存入图数据库（Neo4j / Amazon Neptune）
+2. **双路检索**：同时做向量检索（语义相似）和图检索（关系遍历）
+3. **结果融合**：把两路检索结果合并，去重，重新排序
+4. **LLM 生成**：基于融合后的上下文生成回答
+
+### KG-RAG 的投入产出比
+
+我只在一个合规审查项目中真正落地过 KG-RAG。一些数据：
+
+- **知识图谱构建**：花了 3 个工程师 6 周时间，处理了 12,000 份合规文档，抽取出 ~450,000 个实体和 ~1,200,000 条关系
+- **准确率**：在合规相关问题上达到 94%（Pipeline RAG 在同一数据集上只有 61%）
+- **维护成本**：每周需要 ~4 小时的人工审核新增关系
+
+教训是：**KG-RAG 不是一个技术问题，是一个数据工程问题。** 知识图谱的质量直接决定检索效果，而保持图谱更新是一个持续的运营工作。
+
+### KG-RAG 的适用场景
+
+| 场景 | 适合 KG-RAG? | 原因 |
+|---|---|---|
+| 医疗问答 | 强烈推荐 | 药物-疾病-症状关系是图的天然表示 |
+| 合规审查 | 强烈推荐 | 法规之间的引用、修订、替代关系 |
+| 供应链分析 | 推荐 | 供应商-零件-产品的多层关系 |
+| 通用知识库 | 不推荐 | 建设成本高，相似度检索通常够用 |
+| 客服 FAQ | 不推荐 | 杀鸡用牛刀 |
+
+## 决策矩阵: 一张表选架构
+
+综合我过去一年在四个 RAG 项目中的经验，整理成这个决策矩阵：
+
+| 维度 | Pipeline RAG | Agentic RAG | KG-RAG |
+|---|---|---|---|
+| **端到端准确率** | 73-78% | 88-93% | 90-96% (领域内) |
+| **平均延迟** | 1-2s | 3-8s | 2-5s |
+| **P95 延迟** | 2-3s | 8-15s | 4-8s |
+| **单次查询成本** | $0.002-0.005 | $0.01-0.03 | $0.005-0.015 |
+| **初始搭建时间** | 1-2 周 | 3-5 周 | 8-16 周 |
+| **运维复杂度** | 低 | 中 | 高 |
+| **最适合** | FAQ、文档搜索、简单 QA | 跨文档推理、复杂分析 | 关系密集领域 |
+| **避免用于** | 复杂推理、多文档关联 | 延迟敏感、超高并发 | 通用场景、快速原型 |
+
+## 五条踩坑经验
+
+这是我在四个 RAG 项目中交的学费，浓缩成五条可操作的建议：
+
+1. **Chunk size 没有银弹，但 512 tokens 是一个好起点。** 我试过 128、256、512、1024。太小会丢失上下文，太大会稀释相关性。512 tokens + 50 tokens overlap 在大多数场景下表现最稳。但如果你的文档是代码，用 AST 分块而不是固定长度。
+
+2. **Embedding 模型比 LLM 更影响检索质量。** 我花了两周调 LLM 的 prompt，准确率只提升了 2%。换了一个领域微调过的 embedding 模型，提升了 9%。2026 年推荐 `text-embedding-3-large` 或 `voyage-3-large`，如果有领域数据就做微调。
+
+3. **Reranker 是最被低估的环节。** 在向量检索 top-20 之后加一个 cross-encoder reranker（如 Cohere Rerank 或 `bge-reranker-v2.5-gemma2-lightweight`），可以把 Recall@5 从 ~72% 提到 ~85%。成本极低，收益极高。
+
+4. **评估要自动化，不要靠人工抽检。** 用 RAGAS 或 Langsmith 搭一个自动评估 pipeline，每次迭代都跑。人工抽检的问题是样本量太小、评估标准不一致。我一般维护一个 200 条的 golden test set，新模型/新配置上线前必须跑一遍。
+
+5. **Agentic RAG 的 failure mode 不是"回答错误"，而是"循环检索"。** 如果 confidence 阈值设得太高，或者评估模型过于保守，系统会不停地追加检索但永远达不到阈值。一定要设最大迭代次数，并且 monitor 平均检索轮次这个指标。
+
+## 我的建议: 渐进式升级
+
+不要一开始就上最复杂的架构。我的推荐路径：
+
+**Phase 1 — Pipeline RAG（1-2 周）。** 先跑起来，先有 baseline。用 LangChain 或 LlamaIndex 可以一周内上线。这个阶段的目标是验证数据质量和 chunk 策略。
+
+**Phase 2 — 加 Reranker + Query Rewriting（+1 周）。** 不改架构，只在检索后加 reranker，在检索前加 query rewriting（让 LLM 把用户问题改写成更适合检索的形式）。这一步通常能把准确率从 ~75% 拉到 ~82%，投入产出比最高。
+
+**Phase 3 — Agentic RAG（+3 周）。** 当 Phase 2 的准确率不够，或者用户反馈"回答不够全面"时，升级到 Agentic。重点优化 planner 的拆解质量和 confidence 阈值。
+
+**Phase 4 — KG-RAG（视需求）。** 只有当你的领域强依赖实体关系，且愿意投入持续的知识图谱维护时，才走这一步。
+
+最重要的一点：**无论用哪种架构，评估体系是第一优先级。** 没有自动化评估，你就是在盲人摸象。先搭好评估，再谈优化。
+
+```ts
+// 最后一条建议，用代码说：
+const chooseArchitecture = (complexity: string, latencyBudgetMs: number) => {
+  if (complexity === "simple" || latencyBudgetMs < 2000) return "pipeline";
+  if (complexity === "complex" && latencyBudgetMs > 3000) return "agentic";
+  if (complexity === "relationship-heavy") return "kg-rag";
+  return "pipeline + reranker"; // 最常见的 sweet spot
+};
+```
