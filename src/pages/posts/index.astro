@@ -1,0 +1,123 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Header from '../../components/astro/Header.astro';
+import Footer from '../../components/astro/Footer.astro';
+import FileList from '../../components/astro/FileList.astro';
+import { COLUMN_LABELS } from '../../content/config';
+
+const COLUMNS = ['workshop', 'long-form', 'paper', 'tools', 'weekly'] as const;
+type Col = (typeof COLUMNS)[number];
+
+const url = new URL(Astro.request.url);
+const colParam = url.searchParams.get('column');
+const activeCol: Col | 'all' = COLUMNS.includes(colParam as Col) ? (colParam as Col) : 'all';
+
+const allPosts = (await getCollection('posts', ({ data }) => !data.draft))
+  .sort((a, b) => b.data.pubDate.getTime() - a.data.pubDate.getTime());
+
+const filtered = activeCol === 'all'
+  ? allPosts
+  : allPosts.filter((p) => p.data.column === activeCol);
+
+const items = filtered.map((p, i) => ({
+  slug: p.slug,
+  title: p.data.title,
+  column: p.data.column,
+  pubDate: p.data.pubDate,
+  index: filtered.length - i,
+}));
+---
+
+<BaseLayout
+  title={activeCol === 'all' ? 'All Posts · Nexus.AI' : `${COLUMN_LABELS[activeCol]} · Nexus.AI`}
+  description="All essays from Nexus.AI · workshop, long-form, paper, tools, weekly."
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>nexus</span> / posts / <span class="cur">index</span>
+    </div>
+    <h1><span class="prefix">▸</span>~/posts</h1>
+    <p class="lead">{filtered.length} essays · sorted by date desc</p>
+
+    <nav class="filter" aria-label="Filter by column">
+      <a href="/posts" class:list={['f', { active: activeCol === 'all' }]}>all</a>
+      {
+        COLUMNS.map((c) => (
+          <a
+            href={`/posts?column=${c}`}
+            class:list={['f', { active: activeCol === c }]}
+          >
+            {c}
+          </a>
+        ))
+      }
+    </nav>
+
+    {items.length === 0
+      ? <p class="empty">// no essays here yet</p>
+      : <FileList items={items} />
+    }
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 28px 24px 40px;
+  }
+  .breadcrumb {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-faint);
+    margin-bottom: 6px;
+  }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    color: var(--color-text-primary);
+    margin: 0 0 8px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-muted);
+    margin: 0 0 18px;
+  }
+  .filter {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .filter .f {
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: var(--color-bg-surface);
+    color: var(--color-text-muted);
+    text-decoration: none;
+    transition: background 0.12s, color 0.12s;
+  }
+  .filter .f:hover { color: var(--color-text-primary); }
+  .filter .f.active {
+    background: var(--color-accent-green);
+    color: var(--color-bg-primary);
+    font-weight: 600;
+  }
+  .empty {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-faint);
+    padding: 24px 0;
+  }
+</style>
