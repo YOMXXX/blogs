@@ -1,0 +1,162 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+import TldrBlock from '../components/astro/TldrBlock.astro';
+import TocSidebar from '../components/astro/TocSidebar.astro';
+import AuthorCard from '../components/astro/AuthorCard.astro';
+import ArticleCard from '../components/astro/ArticleCard.astro';
+import ProgressBar from '../components/react/ProgressBar.tsx';
+import { COLUMN_LABELS, COLUMN_TAG_COLOR } from '../content/config';
+import { readingTime } from '../lib/readingTime';
+
+interface Props {
+  frontmatter: {
+    title: string;
+    description: string;
+    column: keyof typeof COLUMN_LABELS;
+    pubDate: Date;
+    updatedDate?: Date;
+    tldr: string;
+    author: string;
+    tags: string[];
+  };
+  body: string;
+  headings: Array<{ depth: number; slug: string; text: string }>;
+  related: Array<{
+    slug: string;
+    data: {
+      title: string;
+      description: string;
+      column: keyof typeof COLUMN_LABELS;
+    };
+    body: string;
+  }>;
+  slug: string;
+}
+
+const { frontmatter, body, headings, related, slug } = Astro.props;
+const fm = frontmatter;
+const tagColor = COLUMN_TAG_COLOR[fm.column];
+const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+---
+
+<BaseLayout title={fm.title} description={fm.description}>
+  <ProgressBar client:idle />
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>nexus</span> / posts / <span class="cur">{slug}</span>
+    </div>
+
+    <span class="tag" style={`color: ${tagColor}; --tag-color: ${tagColor}`}>
+      {COLUMN_LABELS[fm.column]}
+    </span>
+
+    <h1>{fm.title}</h1>
+
+    <div class="meta">
+      <span>{readingTime(body)}</span>
+      <span class="dot">·</span>
+      <time datetime={fm.pubDate.toISOString()}>{dateStr}</time>
+      {fm.updatedDate && (<>
+        <span class="dot">·</span>
+        <span>updated {fm.updatedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+      </>)}
+    </div>
+
+    <TldrBlock text={fm.tldr} />
+
+    <TocSidebar headings={headings} />
+
+    <article class="prose">
+      <slot />
+    </article>
+
+    <AuthorCard name={fm.author} pubDate={fm.pubDate} updatedDate={fm.updatedDate} />
+
+    {
+      related.length > 0 && (
+        <section class="related">
+          <div class="related-h">// related.json ›</div>
+          <div class="related-grid">
+            {related.map((r) => (
+              <ArticleCard
+                slug={r.slug}
+                title={r.data.title}
+                description={r.data.description}
+                column={r.data.column}
+                readingTimeStr={readingTime(r.body)}
+              />
+            ))}
+          </div>
+        </section>
+      )
+    }
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 28px 24px 40px;
+  }
+  .breadcrumb {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-faint);
+    margin-bottom: 8px;
+  }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  .tag {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    background: color-mix(in srgb, var(--tag-color) 12%, transparent);
+  }
+  h1 {
+    font-family: var(--font-sans);
+    font-size: 36px;
+    line-height: 1.15;
+    color: var(--color-text-primary);
+    margin: 0 0 12px;
+    font-weight: 700;
+    letter-spacing: -0.6px;
+  }
+  .meta {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-faint);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 4px;
+  }
+  .dot { color: var(--color-border-strong); }
+  .prose { margin: 24px 0; }
+  .related { margin-top: 48px; }
+  .related-h {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-accent-green);
+    margin-bottom: 12px;
+  }
+  .related-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+  @media (max-width: 720px) {
+    .related-grid { grid-template-columns: 1fr; }
+    h1 { font-size: 28px; }
+  }
+</style>
