@@ -9,6 +9,8 @@ import ArticleCard from '../components/astro/ArticleCard.astro';
 import ProgressBar from '../components/react/ProgressBar.tsx';
 import { COLUMN_LABELS, COLUMN_TAG_COLOR } from '../content/config';
 import { readingTime } from '../lib/readingTime';
+import JsonLd from '../components/astro/JsonLd.astro';
+import { buildArticleSchema, buildBreadcrumbSchema } from '../lib/seo';
 
 interface Props {
   frontmatter: {
@@ -37,11 +39,30 @@ interface Props {
 
 const { frontmatter, body, headings, related, slug } = Astro.props;
 const fm = frontmatter;
+
+const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? '';
+const articleSchema = buildArticleSchema({
+  title: fm.title,
+  description: fm.description,
+  slug,
+  pubDate: fm.pubDate,
+  updatedDate: fm.updatedDate,
+  author: fm.author,
+  siteUrl,
+  image: `${siteUrl}/og/${slug}.svg`,
+});
+const breadcrumbSchema = buildBreadcrumbSchema([
+  { name: 'Home', url: `${siteUrl}/` },
+  { name: 'Posts', url: `${siteUrl}/posts` },
+  { name: fm.title, url: `${siteUrl}/posts/${slug}` },
+]);
+
 const tagColor = COLUMN_TAG_COLOR[fm.column];
 const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 ---
 
 <BaseLayout title={fm.title} description={fm.description}>
+  <JsonLd schema={[articleSchema, breadcrumbSchema]} />
   <ProgressBar client:idle />
   <Header />
   <main class="container">
