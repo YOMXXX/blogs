@@ -26,8 +26,7 @@ function formatDate(d: Date): string {
       <a class="row" href={`/posts/${it.slug}`}>
         <span class="ln">{it.index.toString().padStart(3, '0')}</span>
         <span class="title">
-          <span class="filename">{it.slug}</span>
-          <span class="ext">.md</span>
+          <span class="filename">{it.title}</span>
           <span class="tag" style={`--tag-color: ${COLUMN_TAG_COLOR[it.column]}`}>
             {COLUMN_LABELS[it.column].toLowerCase()}
           </span>
