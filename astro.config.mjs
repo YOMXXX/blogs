@@ -140,7 +140,7 @@ export default defineConfig({
         ],
 
         // Offline fallback
-        navigateFallback: '/offline.html',
+        navigateFallback: '/offline',
         navigateFallbackDenylist: [
           /\/rss\.xml$/,
           /\/atom\.xml$/,

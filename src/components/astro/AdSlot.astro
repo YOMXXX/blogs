@@ -14,44 +14,10 @@ const { position, format = 'auto', minHeight = 90 } = Astro.props;
   data-ad-format={format}
   style={`min-height: ${minHeight}px`}
 >
-  <div class="ad-label">// AdSense &middot; {position}</div>
-  <div class="ad-placeholder">
-    <span class="ad-skeleton">ad loading...</span>
-  </div>
 </div>
 
 <style>
   .ad-slot {
-    background: rgba(124, 58, 237, 0.04);
-    border: 1px dashed rgba(124, 58, 237, 0.25);
-    border-radius: 6px;
     margin: 24px 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-family: var(--font-mono);
-    position: relative;
-    overflow: hidden;
-  }
-  .ad-label {
-    position: absolute;
-    top: 4px;
-    left: 8px;
-    font-size: 9px;
-    color: rgba(124, 58, 237, 0.5);
-    letter-spacing: 0.5px;
-  }
-  .ad-placeholder {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    height: 100%;
-  }
-  .ad-skeleton {
-    font-size: 11px;
-    color: var(--color-text-faint);
-    opacity: 0.5;
   }
 </style>
