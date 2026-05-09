@@ -1,0 +1,70 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+---
+
+<BaseLayout
+  title="Contact · Nexus.AI"
+  description="How to reach Nexus.AI — for collaboration, corrections, or just to say hi."
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>nexus</span> / <span class="cur">contact</span>
+    </div>
+    <h1><span class="prefix">▸</span>Contact</h1>
+    <p class="lead">For corrections, collaboration, or just to say hi.</p>
+
+    <div class="prose">
+      <h2>Email</h2>
+      <p>
+        <code>hello [at] nexus-ai [dot] example</code>
+        <br />
+        <em class="hint">// replace with your real address before deploy</em>
+      </p>
+
+      <h2>Social</h2>
+      <ul>
+        <li>GitHub — <a href="https://github.com" target="_blank" rel="noopener noreferrer">@yourhandle</a></li>
+        <li>Twitter / X — <a href="https://twitter.com" target="_blank" rel="noopener noreferrer">@yourhandle</a></li>
+      </ul>
+
+      <h2>Found a typo?</h2>
+      <p>
+        Every article in the blog is generated from MDX in a public GitHub repo. If you
+        spot an error, the fastest fix is a pull request.
+      </p>
+
+      <h2>Press / inquiries</h2>
+      <p>
+        I'm a single human writing in my spare time. I generally don't take sponsored
+        content, but I do read every email that mentions a paper or project I'd find
+        interesting.
+      </p>
+    </div>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 6px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    color: var(--color-text-primary);
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-text-muted);
+    margin: 0 0 24px;
+  }
+  .hint { color: var(--color-text-faint); font-size: 11px; }
+</style>
