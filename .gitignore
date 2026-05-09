@@ -1,0 +1,25 @@
+# build
+dist/
+.astro/
+
+# deps
+node_modules/
+
+# log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# env
+.env
+.env.production
+
+# editor
+.vscode/
+.idea/
+.DS_Store
+
+# superpowers (specs / plans / brainstorm — local only, not tracked)
+.superpowers/
+docs/superpowers/
