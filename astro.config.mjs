@@ -4,9 +4,11 @@ import react from '@astrojs/react';
 import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
 
+// TODO: replace with real domain before deploy (used by sitemap and OG canonical URLs)
+const SITE = 'https://nexus-ai.example.com';
+
 export default defineConfig({
-  // TODO: replace with real domain before deploy (used by sitemap and OG canonical URLs)
-  site: 'https://nexus-ai.example.com',
+  site: SITE,
   trailingSlash: 'never',
   build: {
     format: 'file',
@@ -14,7 +16,19 @@ export default defineConfig({
   integrations: [
     mdx(),
     react(),
-    sitemap(),
+    sitemap({
+      changefreq: 'weekly',
+      priority: 0.7,
+      lastmod: new Date(),
+      filter: (page) => !page.includes('/404'),
+      serialize(item) {
+        const isPostDetail = /\/posts\/[^/]+$/.test(item.url) && !item.url.endsWith('/posts');
+        const isHome = item.url === SITE || item.url === `${SITE}/`;
+        if (isPostDetail) return { ...item, priority: 0.9, changefreq: 'monthly' };
+        if (isHome) return { ...item, priority: 1.0, changefreq: 'daily' };
+        return item;
+      },
+    }),
   ],
   vite: {
     plugins: [tailwindcss()],
