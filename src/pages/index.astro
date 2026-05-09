@@ -66,7 +66,7 @@ const columnPostsMap = Object.fromEntries(
       )
     }
 
-    <AdSlot position="home-after-hero" format="horizontal" minHeight={90} />
+    <AdSlot position="home-after-hero" format="horizontal" />
 
     {editorPicks.length > 0 && <EditorPicks picks={editorPicks} />}
 
@@ -78,7 +78,7 @@ const columnPostsMap = Object.fromEntries(
       })
     }
 
-    <AdSlot position="home-before-newsletter" format="auto" minHeight={120} />
+    <AdSlot position="home-before-newsletter" format="auto" />
 
     <Newsletter />
   </main>

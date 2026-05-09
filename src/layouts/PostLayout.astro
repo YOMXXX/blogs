@@ -92,23 +92,23 @@ const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month:
 
     <TldrBlock text={fm.tldr} />
 
-    <AdSlot position="above-toc" format="horizontal" minHeight={90} />
+    <AdSlot position="above-toc" format="horizontal" />
 
     <TocSidebar headings={headings} />
 
-    <AdSlot position="in-article-1" format="auto" minHeight={120} />
+    <AdSlot position="in-article-1" format="auto" />
 
     <article class="prose">
       <slot />
     </article>
 
-    <AdSlot position="in-article-2" format="auto" minHeight={120} />
+    <AdSlot position="in-article-2" format="auto" />
 
     {fm.faq && fm.faq.length > 0 && <FaqSchema faqs={fm.faq} />}
 
     <AuthorCard name={fm.author} pubDate={fm.pubDate} updatedDate={fm.updatedDate} />
 
-    <AdSlot position="end-of-article" format="rectangle" minHeight={250} />
+    <AdSlot position="end-of-article" format="rectangle" />
 
     {
       related.length > 0 && (
