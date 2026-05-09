@@ -1,6 +1,1 @@
-# ads.txt for yomxxx.com
-# Replace PUBLISHER_ID with your actual Google AdSense publisher ID after approval
-# Format: google.com, pub-XXXXXXXXXXXXXXXX, DIRECT, f08c47fec0942fa0
-
-# Placeholder — update after AdSense approval:
-# google.com, pub-0000000000000000, DIRECT, f08c47fec0942fa0
+google.com, pub-7299456929245815, DIRECT, f08c47fec0942fa0
