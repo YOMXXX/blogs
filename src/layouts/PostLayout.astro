@@ -61,7 +61,7 @@ const tagColor = COLUMN_TAG_COLOR[fm.column];
 const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 ---
 
-<BaseLayout title={fm.title} description={fm.description}>
+<BaseLayout title={fm.title} description={fm.description} ogImage={`/og/${slug}.svg`}>
   <JsonLd schema={[articleSchema, breadcrumbSchema]} />
   <ProgressBar client:idle />
   <Header />

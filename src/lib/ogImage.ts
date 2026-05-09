@@ -53,7 +53,7 @@ export async function renderOgSvg(input: OgInput): Promise<string> {
   `);
 
   const fontData = loadFont();
-  const svg = await satori(markup, {
+  const svg = await satori(markup as unknown as React.ReactNode, {
     width: 1200,
     height: 630,
     fonts: [{ name: 'Inter', data: fontData, weight: 400, style: 'normal' }],
