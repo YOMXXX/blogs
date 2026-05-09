@@ -1,0 +1,90 @@
+---
+const year = new Date().getFullYear();
+---
+
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="block">
+      <div class="block-h">// nexus.ai</div>
+      <p class="block-p">
+        Frontier ML, decoded.<br />
+        Production AI, dissected.
+      </p>
+    </div>
+    <div class="block">
+      <div class="block-h">// columns</div>
+      <ul>
+        <li><a href="/posts?column=workshop">workshop</a></li>
+        <li><a href="/posts?column=long-form">long-form</a></li>
+        <li><a href="/posts?column=paper">paper</a></li>
+        <li><a href="/posts?column=tools">tools</a></li>
+        <li><a href="/posts?column=weekly">weekly</a></li>
+      </ul>
+    </div>
+    <div class="block">
+      <div class="block-h">// site</div>
+      <ul>
+        <li><a href="/about">about</a></li>
+        <li><a href="/privacy">privacy</a></li>
+        <li><a href="/contact">contact</a></li>
+        <li><a href="/rss.xml">rss</a></li>
+      </ul>
+    </div>
+    <div class="block">
+      <div class="block-h">// elsewhere</div>
+      <ul>
+        <li><a href="https://github.com" target="_blank" rel="noopener">github</a></li>
+        <li><a href="https://twitter.com" target="_blank" rel="noopener">twitter</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="copyright">
+    <span>© {year} Nexus.AI</span>
+    <span class="dot">·</span>
+    <span>built with Astro on Cloudflare</span>
+  </div>
+</footer>
+
+<style>
+  .footer {
+    border-top: 1px solid var(--color-border-subtle);
+    margin-top: 80px;
+    padding: 48px 24px 24px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .footer-inner {
+    max-width: 1080px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 32px;
+  }
+  .block-h {
+    color: var(--color-accent-green);
+    margin-bottom: 10px;
+    font-weight: 600;
+  }
+  .block-p { color: var(--color-text-muted); line-height: 1.6; margin: 0; }
+  .footer ul { list-style: none; padding: 0; margin: 0; }
+  .footer li { padding: 3px 0; }
+  .footer a {
+    color: var(--color-text-secondary);
+    text-decoration: none;
+    transition: color 0.15s;
+  }
+  .footer a:hover { color: var(--color-accent-green); }
+  .copyright {
+    max-width: 1080px;
+    margin: 32px auto 0;
+    padding-top: 16px;
+    border-top: 1px solid var(--color-border-subtle);
+    color: var(--color-text-faint);
+    display: flex;
+    gap: 8px;
+  }
+  .dot { color: var(--color-border-strong); }
+  @media (max-width: 720px) {
+    .footer-inner { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
