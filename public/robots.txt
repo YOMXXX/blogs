@@ -1,21 +1,54 @@
 # Robots.txt for YOMXXX
-# Allow all major search engines and AI crawlers (per AEO strategy)
+# 允许所有搜索引擎和 AI 爬虫
 
 User-agent: *
 Allow: /
-
-# Block dev / private paths
 Disallow: /api/
 Disallow: /admin/
 
-# Sitemap
-Sitemap: https://yomxxx.com/sitemap-index.xml
+# 国内搜索引擎 — 显式允许
+User-agent: Baiduspider
+Allow: /
 
-# AI crawlers explicitly allowed (we want our content indexed by AI engines)
+User-agent: Baiduspider-render
+Allow: /
+
+User-agent: Sogou web spider
+Allow: /
+
+User-agent: 360Spider
+Allow: /
+
+User-agent: YisouSpider
+Allow: /
+
+User-agent: Bytespider
+Allow: /
+
+# 国际搜索引擎
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: YandexBot
+Allow: /
+
+User-agent: DuckDuckBot
+Allow: /
+
+# AI 搜索引擎和爬虫 — 显式允许
 User-agent: GPTBot
 Allow: /
 
+User-agent: ChatGPT-User
+Allow: /
+
 User-agent: ClaudeBot
+Allow: /
+
+User-agent: anthropic-ai
 Allow: /
 
 User-agent: PerplexityBot
@@ -24,5 +57,11 @@ Allow: /
 User-agent: Google-Extended
 Allow: /
 
-User-agent: anthropic-ai
+User-agent: Applebot
 Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+
+# Sitemap
+Sitemap: https://yomxxx.com/sitemap-index.xml
