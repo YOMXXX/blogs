@@ -96,8 +96,8 @@ export default function SearchDialog() {
         aria-label="Open search"
         style={{
           background: 'transparent',
-          border: '1px solid #2a2a30',
-          color: '#8b949e',
+          border: '1px solid var(--color-border-strong)',
+          color: 'var(--color-text-muted)',
           padding: '4px 10px',
           borderRadius: 5,
           fontFamily: 'JetBrains Mono, monospace',
@@ -132,11 +132,11 @@ export default function SearchDialog() {
       <div
         style={{
           width: 'min(640px, 90vw)',
-          background: '#0a0a0a',
-          border: '1px solid #2a2a30',
+          background: 'var(--color-bg-primary)',
+          border: '1px solid var(--color-border-strong)',
           borderRadius: 8,
           fontFamily: 'JetBrains Mono, monospace',
-          color: '#f0f6fc',
+          color: 'var(--color-text-primary)',
         }}
       >
         <input
@@ -149,18 +149,18 @@ export default function SearchDialog() {
             width: '100%',
             border: 'none',
             background: 'transparent',
-            color: '#f0f6fc',
+            color: 'var(--color-text-primary)',
             padding: '14px 16px',
             fontSize: 14,
             outline: 'none',
             fontFamily: 'inherit',
-            borderBottom: '1px solid #1f1f24',
+            borderBottom: '1px solid var(--color-border-subtle)',
           }}
         />
         <div style={{ maxHeight: '50vh', overflowY: 'auto' }}>
-          {loading && <p style={{ padding: 16, color: '#5c6370' }}>// searching...</p>}
+          {loading && <p style={{ padding: 16, color: 'var(--color-text-faint)' }}>// searching...</p>}
           {!loading && hits.length === 0 && query && (
-            <p style={{ padding: 16, color: '#5c6370' }}>// no results</p>
+            <p style={{ padding: 16, color: 'var(--color-text-faint)' }}>// no results</p>
           )}
           {hits.map((h) => (
             <a
@@ -169,15 +169,15 @@ export default function SearchDialog() {
               style={{
                 display: 'block',
                 padding: '10px 16px',
-                borderBottom: '1px dashed #1f1f24',
+                borderBottom: '1px dashed var(--color-border-subtle)',
                 color: 'inherit',
                 textDecoration: 'none',
                 fontSize: 12,
               }}
             >
-              <div style={{ color: '#10b981', marginBottom: 2 }}>▸ {h.title}</div>
+              <div style={{ color: 'var(--color-accent-green)', marginBottom: 2 }}>▸ {h.title}</div>
               <div
-                style={{ color: '#8b949e' }}
+                style={{ color: 'var(--color-text-muted)' }}
                 dangerouslySetInnerHTML={{ __html: h.excerpt }}
               />
             </a>

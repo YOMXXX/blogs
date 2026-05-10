@@ -89,16 +89,14 @@ describe('buildOrganizationSchema', () => {
 });
 
 describe('buildWebSiteSchema', () => {
-  it('produces a WebSite with SearchAction potentialAction', () => {
+  it('produces a WebSite schema', () => {
     const schema = buildWebSiteSchema({
       name: 'YOMXXX',
       url: 'https://nexus-ai.example.com',
     });
     expect(schema['@type']).toBe('WebSite');
     expect(schema.name).toBe('YOMXXX');
-    expect(schema.potentialAction['@type']).toBe('SearchAction');
-    expect(schema.potentialAction.target).toBe('https://nexus-ai.example.com/posts?q={search_term_string}');
-    expect(schema.potentialAction['query-input']).toBe('required name=search_term_string');
+    expect(schema.url).toBe('https://nexus-ai.example.com');
   });
 });
 

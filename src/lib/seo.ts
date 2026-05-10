@@ -17,6 +17,7 @@ export interface ArticleSchema {
   datePublished: string;
   dateModified?: string;
   author: { '@type': 'Person'; name: string };
+  publisher?: { '@type': 'Organization'; name: string };
   image: string;
   mainEntityOfPage: string;
 }
@@ -30,6 +31,7 @@ export function buildArticleSchema(input: ArticleSchemaInput): ArticleSchema {
     description: input.description,
     datePublished: input.pubDate.toISOString(),
     author: { '@type': 'Person', name: input.author },
+    publisher: { '@type': 'Organization', name: 'YOMXXX' },
     image: input.image,
     mainEntityOfPage: url,
   };
@@ -90,17 +92,11 @@ export interface WebSiteInput {
 }
 
 export function buildWebSiteSchema(input: WebSiteInput) {
-  const base = input.url.replace(/\/$/, '');
   return {
     '@context': 'https://schema.org' as const,
     '@type': 'WebSite' as const,
     name: input.name,
     url: input.url,
-    potentialAction: {
-      '@type': 'SearchAction' as const,
-      target: `${base}/posts?q={search_term_string}`,
-      'query-input': 'required name=search_term_string',
-    },
   };
 }
 

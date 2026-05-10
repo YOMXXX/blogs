@@ -53,7 +53,7 @@ const articleSchema = buildArticleSchema({
   updatedDate: fm.updatedDate,
   author: fm.author,
   siteUrl,
-  image: `${siteUrl}/og/${slug}.svg`,
+  image: `${siteUrl}/og/${slug}.png`,
 });
 const breadcrumbSchema = buildBreadcrumbSchema([
   { name: 'Home', url: `${siteUrl}/` },
@@ -65,7 +65,7 @@ const tagColor = COLUMN_TAG_COLOR[fm.column];
 const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 ---
 
-<BaseLayout title={fm.title} description={fm.description} ogImage={`/og/${slug}.svg`}>
+<BaseLayout title={fm.title} description={fm.description} ogImage={`/og/${slug}.png`} ogType="article">
   <JsonLd schema={[articleSchema, breadcrumbSchema]} />
   <ProgressBar client:idle />
   <Header />

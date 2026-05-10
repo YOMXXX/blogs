@@ -23,10 +23,9 @@ const posts = defineCollection({
           a: z.string().min(20).max(400),
         }),
       )
-      .min(0)
       .max(10)
       .default([]),
-    author: z.string().default('AI Frontier'),
+    author: z.string().default('YOMXXX'),
   }),
 });
 

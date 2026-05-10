@@ -1,5 +1,6 @@
 import satori from 'satori';
 import { html as satoriHtml } from 'satori-html';
+import sharp from 'sharp';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -59,4 +60,9 @@ export async function renderOgSvg(input: OgInput): Promise<string> {
     fonts: [{ name: 'Inter', data: fontData, weight: 400, style: 'normal' }],
   });
   return svg;
+}
+
+export async function renderOgPng(input: OgInput): Promise<Buffer> {
+  const svg = await renderOgSvg(input);
+  return sharp(Buffer.from(svg)).png().toBuffer();
 }

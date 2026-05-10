@@ -1,6 +1,6 @@
 import type { APIRoute, GetStaticPaths } from 'astro';
 import { getCollection } from 'astro:content';
-import { renderOgSvg } from '../../lib/ogImage';
+import { renderOgPng } from '../../lib/ogImage';
 
 export const getStaticPaths: GetStaticPaths = async () => {
   const posts = await getCollection('posts', ({ data }) => !data.draft);
@@ -12,14 +12,14 @@ export const getStaticPaths: GetStaticPaths = async () => {
 
 export const GET: APIRoute = async ({ props }) => {
   const post = props.post as Awaited<ReturnType<typeof getCollection>>[number];
-  const svg = await renderOgSvg({
+  const png = await renderOgPng({
     title: post.data.title,
     column: post.data.column,
     date: post.data.pubDate,
   });
-  return new Response(svg, {
+  return new Response(new Uint8Array(png), {
     headers: {
-      'Content-Type': 'image/svg+xml',
+      'Content-Type': 'image/png',
       'Cache-Control': 'public, max-age=31536000, immutable',
     },
   });

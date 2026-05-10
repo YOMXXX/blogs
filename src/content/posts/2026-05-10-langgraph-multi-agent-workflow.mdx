@@ -1,0 +1,344 @@
+---
+title: "LangGraph 实战：用状态机思维构建生产级多 Agent 工作流"
+description: "从 LangChain 的线性 Chain 到 LangGraph 的状态图——手把手用 TypeScript 搭建一个包含 Planner、Researcher、Coder 三个 Agent 的协作系统，附完整代码和踩坑经验。"
+column: "workshop"
+tags: ["agent", "langgraph", "multi-agent", "production", "typescript"]
+pubDate: 2026-05-10
+featured: false
+tldr: "LangGraph 是 LangChain 团队推出的多 Agent 编排框架，核心思想是把 Agent 工作流建模为有向图。本文用一个 Planner → Researcher → Coder 的三 Agent 系统演示完整开发流程，覆盖状态定义、条件路由、人工审批节点和错误恢复。"
+faq:
+  - q: "LangGraph 和 LangChain 的关系是什么？"
+    a: "LangGraph 是 LangChain 生态的一部分，专注于有状态的多步 Agent 编排。LangChain 提供基础的 LLM 交互能力（prompt、chain、tool），而 LangGraph 在其之上添加了图结构、状态管理和持久化能力。你可以把 LangChain 看作单个 Agent 的构建块，LangGraph 是多 Agent 的协调层。"
+  - q: "LangGraph 和 CrewAI 哪个更适合生产环境？"
+    a: "LangGraph 更底层、更灵活，适合需要精细控制工作流的团队；CrewAI 更高层、更开箱即用，适合快速原型。生产环境中如果你需要自定义状态机、条件路由和人工审批节点，LangGraph 是更好的选择。如果你的场景相对固定（如角色扮演型多 Agent），CrewAI 上手更快。"
+  - q: "为什么不直接用 Chain 来编排多个 Agent？"
+    a: "Chain 是线性的——A 调 B 调 C，不支持条件分支、循环和并行。真实的多 Agent 场景需要根据中间结果决定下一步（比如代码审查不通过要回退到 Coder），这种控制流只有图结构能优雅表达。LangGraph 的状态图天然支持条件边、循环和人工中断。"
+  - q: "LangGraph 的状态持久化怎么做？"
+    a: "LangGraph 内置了 Checkpoint 机制，支持 SQLite、Postgres 等后端。每个节点执行完后自动保存状态快照，中断或失败后可以从最后一个 checkpoint 恢复。生产环境推荐用 Postgres 作为 checkpoint 后端，配合 Redis 做运行时缓存。"
+  - q: "多 Agent 系统的调试难点在哪里？"
+    a: "主要有三点：1) 状态在节点间传递时的数据丢失或类型错误；2) 条件路由的边界条件没覆盖全导致死循环；3) Agent 之间的 prompt 上下文污染。LangGraph Studio 提供了可视化调试界面，可以逐节点检查状态变化，是目前最好的调试工具。"
+author: "YOMXXX"
+---
+
+## 为什么需要 LangGraph
+
+如果你在 2025 年用 LangChain 的 `SequentialChain` 或 `AgentExecutor` 搭过多 Agent 系统，大概率踩过这些坑：
+
+- Chain 是线性的，无法根据中间结果做分支
+- Agent 之间的状态传递靠手动拼接 prompt，容易丢失上下文
+- 一个 Agent 出错后无法回退，只能从头重跑
+- 没有人工审批节点，无法在关键步骤加入人工判断
+
+LangGraph 的核心思想是：**把多 Agent 工作流建模为一个有向图（Directed Graph）**。每个 Agent 是图中的一个节点，边定义了控制流，状态在节点间显式传递。
+
+```
+Planner → Researcher → Coder → Reviewer
+                ↑                    ↓
+                └──── (reject) ──────┘
+```
+
+这不是新概念——有限状态机（FSM）在工程领域用了几十年。LangGraph 的贡献是把 FSM 和 LLM Agent 做了优雅的结合。
+
+## 核心概念：三分钟速通
+
+### StateGraph
+
+LangGraph 的核心数据结构。一个 `StateGraph` 定义了：
+
+- **State**: 在节点间传递的数据结构（TypeScript interface）
+- **Nodes**: 处理状态的函数（可以是 LLM 调用、工具调用或纯逻辑）
+- **Edges**: 节点之间的连接（支持条件路由）
+- **Checkpointer**: 状态持久化后端
+
+### 状态定义
+
+```typescript
+interface WorkflowState {
+  task: string;
+  plan: string[];
+  research: Record<string, string>;
+  code: string;
+  review: { approved: boolean; feedback: string };
+  iteration: number;
+}
+```
+
+状态是类型安全的。每个节点接收当前状态，返回部分更新（类似 React 的 `setState`）。
+
+### 条件边
+
+```typescript
+graph.addConditionalEdges("reviewer", (state) => {
+  if (state.review.approved) return "end";
+  if (state.iteration >= 3) return "human_review";
+  return "coder";
+});
+```
+
+条件边是 LangGraph 最强大的特性——根据运行时状态动态决定下一个节点。
+
+## 实战：搭建 Planner-Researcher-Coder 系统
+
+### 场景描述
+
+我们要搭建一个能自动完成技术调研任务的系统：
+
+1. **Planner** 接收用户需求，拆解成具体的调研步骤
+2. **Researcher** 按步骤搜索信息，整理为结构化知识
+3. **Coder** 根据调研结果生成代码实现
+4. **Reviewer** 审查代码质量，不通过则回退到 Coder
+
+### Step 1: 安装依赖
+
+```bash
+pnpm add @langchain/langgraph @langchain/core @langchain/anthropic
+```
+
+### Step 2: 定义状态
+
+```typescript
+import { Annotation } from "@langchain/langgraph";
+
+const AgentState = Annotation.Root({
+  task: Annotation<string>(),
+  plan: Annotation<string[]>({
+    reducer: (_, next) => next,
+    default: () => [],
+  }),
+  research: Annotation<Record<string, string>>({
+    reducer: (prev, next) => ({ ...prev, ...next }),
+    default: () => ({}),
+  }),
+  code: Annotation<string>({
+    reducer: (_, next) => next,
+    default: () => "",
+  }),
+  reviewResult: Annotation<{
+    approved: boolean;
+    feedback: string;
+  }>({
+    reducer: (_, next) => next,
+    default: () => ({ approved: false, feedback: "" }),
+  }),
+  iteration: Annotation<number>({
+    reducer: (prev, next) => next ?? prev + 1,
+    default: () => 0,
+  }),
+});
+```
+
+`Annotation` 的 `reducer` 函数定义了状态更新策略。`research` 用的是合并策略（每次调研的结果叠加），`plan` 和 `code` 用的是替换策略。
+
+### Step 3: 实现各个 Agent 节点
+
+```typescript
+import { ChatAnthropic } from "@langchain/anthropic";
+
+const llm = new ChatAnthropic({
+  model: "claude-sonnet-4-6",
+  temperature: 0,
+});
+
+async function plannerNode(state: typeof AgentState.State) {
+  const response = await llm.invoke([
+    {
+      role: "system",
+      content: `你是一个技术项目规划师。根据用户需求，拆解为 3-5 个具体的调研步骤。
+每个步骤必须是一句话，可独立执行。输出 JSON 数组格式。`,
+    },
+    { role: "user", content: state.task },
+  ]);
+
+  const plan = JSON.parse(response.content as string);
+  return { plan };
+}
+
+async function researcherNode(state: typeof AgentState.State) {
+  const results: Record<string, string> = {};
+
+  for (const step of state.plan) {
+    if (state.research[step]) continue;
+
+    const response = await llm.invoke([
+      {
+        role: "system",
+        content: `你是一个技术调研员。针对给定的调研任务，提供详细、准确的技术分析。
+包含具体的数据、代码示例和引用来源。`,
+      },
+      { role: "user", content: step },
+    ]);
+    results[step] = response.content as string;
+  }
+
+  return { research: results };
+}
+
+async function coderNode(state: typeof AgentState.State) {
+  const researchContext = Object.entries(state.research)
+    .map(([k, v]) => `### ${k}\n${v}`)
+    .join("\n\n");
+
+  const prompt = state.reviewResult.feedback
+    ? `根据审查反馈修改代码。\n反馈：${state.reviewResult.feedback}\n当前代码：\n${state.code}`
+    : `根据以下调研结果生成代码实现：\n${researchContext}`;
+
+  const response = await llm.invoke([
+    {
+      role: "system",
+      content: "你是一个高级工程师。输出生产级 TypeScript 代码，包含类型定义和错误处理。",
+    },
+    { role: "user", content: prompt },
+  ]);
+
+  return {
+    code: response.content as string,
+    iteration: state.iteration + 1,
+  };
+}
+
+async function reviewerNode(state: typeof AgentState.State) {
+  const response = await llm.invoke([
+    {
+      role: "system",
+      content: `你是一个代码审查员。检查代码的类型安全、错误处理、边界条件。
+输出 JSON 格式：{ "approved": boolean, "feedback": "具体改进建议" }`,
+    },
+    { role: "user", content: state.code },
+  ]);
+
+  const result = JSON.parse(response.content as string);
+  return { reviewResult: result };
+}
+```
+
+### Step 4: 组装图
+
+```typescript
+import { StateGraph, END } from "@langchain/langgraph";
+
+const workflow = new StateGraph(AgentState)
+  .addNode("planner", plannerNode)
+  .addNode("researcher", researcherNode)
+  .addNode("coder", coderNode)
+  .addNode("reviewer", reviewerNode)
+  .addEdge("__start__", "planner")
+  .addEdge("planner", "researcher")
+  .addEdge("researcher", "coder")
+  .addEdge("coder", "reviewer")
+  .addConditionalEdges("reviewer", (state) => {
+    if (state.reviewResult.approved) return END;
+    if (state.iteration >= 3) return END;
+    return "coder";
+  });
+
+const app = workflow.compile();
+```
+
+### Step 5: 运行
+
+```typescript
+const result = await app.invoke({
+  task: "实现一个支持重试和超时的 HTTP 客户端封装",
+});
+
+console.log(result.code);
+```
+
+## 生产环境的三个关键改进
+
+### 1. 添加 Checkpoint 持久化
+
+```typescript
+import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
+
+const checkpointer = SqliteSaver.fromConnString("./checkpoints.db");
+const app = workflow.compile({ checkpointer });
+
+const config = { configurable: { thread_id: "task-001" } };
+const result = await app.invoke({ task: "..." }, config);
+```
+
+有了 Checkpoint，即使进程崩溃也能从最后一个节点恢复。
+
+### 2. 添加人工审批节点
+
+```typescript
+import { interrupt } from "@langchain/langgraph";
+
+async function humanReviewNode(state: typeof AgentState.State) {
+  const decision = interrupt({
+    question: "代码已经过 3 轮自动审查仍未通过，请人工决定：",
+    code: state.code,
+    feedback: state.reviewResult.feedback,
+  });
+  return { reviewResult: decision };
+}
+```
+
+`interrupt()` 会暂停图的执行，等待外部输入。配合 Checkpoint，暂停和恢复是无缝的。
+
+### 3. 并行执行
+
+如果多个调研步骤之间没有依赖关系，可以并行执行：
+
+```typescript
+import { Send } from "@langchain/langgraph";
+
+function routeResearch(state: typeof AgentState.State) {
+  return state.plan.map(
+    (step) => new Send("researcher", { ...state, currentStep: step })
+  );
+}
+
+graph.addConditionalEdges("planner", routeResearch);
+```
+
+`Send` 会为每个步骤创建一个独立的执行分支，结果自动通过 reducer 合并。
+
+## 踩坑记录
+
+### 坑 1: 状态 reducer 的合并顺序
+
+当多个并行节点同时更新同一个字段时，reducer 的执行顺序是不确定的。如果你的 reducer 依赖顺序（比如数组追加），需要额外加锁或使用时间戳排序。
+
+### 坑 2: 条件边的默认分支
+
+条件路由函数必须处理所有可能的状态。如果返回了未注册的节点名，LangGraph 会静默失败。建议在条件函数末尾加一个兜底的 `return END`。
+
+### 坑 3: Token 消耗控制
+
+多 Agent 系统的 token 消耗是单 Agent 的 N 倍。每个节点都在调用 LLM，如果 Researcher 有 5 个步骤、Coder-Reviewer 循环 3 次，一个任务就会产生 10+ 次 LLM 调用。建议：
+
+- 给每个节点设置 `max_tokens` 上限
+- 在状态中记录累计 token 消耗，超过阈值自动终止
+- 非关键节点使用更便宜的模型（如 Haiku）
+
+### 坑 4: 调试的可观测性
+
+在生产环境中，推荐使用 LangSmith 追踪每个节点的输入输出：
+
+```typescript
+import { Client } from "langsmith";
+
+const app = workflow.compile({
+  checkpointer,
+  callbacks: [new LangSmithTracer({ client: new Client() })],
+});
+```
+
+## 什么时候不应该用 LangGraph
+
+- **单 Agent + 工具调用就能解决的问题**：不需要多 Agent 就别用多 Agent
+- **工作流是严格线性的**：如果没有条件分支和循环，用 LangChain 的 `RunnableSequence` 更简单
+- **团队不熟悉图计算概念**：学习曲线不低，CrewAI 等高层框架可能更适合快速启动
+
+## 总结
+
+LangGraph 把多 Agent 编排从"粘合 prompt 的艺术"变成了"工程化的状态机设计"。核心要点：
+
+1. **状态是一等公民**——显式定义、类型安全、可持久化
+2. **条件边是灵魂**——让工作流能根据运行时结果动态调整
+3. **Checkpoint 是生产标配**——没有持久化的多 Agent 系统不可上线
+4. **可观测性不可少**——LangSmith 或等价的追踪方案是必须的
+
+下一步建议：先用 LangGraph Studio 可视化你的工作流，再写代码。

@@ -1,3 +1,15 @@
 # 旧路径重定向
 /post/*  /posts/:splat  301
 /blog/*  /posts/:splat  301
+
+# 文件名日期修正重定向
+/posts/2026-05-10-ai-weekly-001 /posts/2026-05-09-ai-weekly-001 301
+/posts/2026-05-11-agentic-ai-architecture-evolution /posts/2026-05-09-agentic-ai-architecture-evolution 301
+/posts/2026-05-12-rag-architecture-selection-guide /posts/2026-05-09-rag-architecture-selection-guide 301
+/posts/2026-05-13-ai-coding-assistant-showdown-2026 /posts/2026-05-09-ai-coding-assistant-showdown-2026 301
+/posts/2026-05-14-llm-benchmark-spring-2026 /posts/2026-05-09-llm-benchmark-spring-2026 301
+/posts/2026-05-15-mcp-server-from-scratch /posts/2026-05-09-mcp-server-from-scratch 301
+/posts/2026-05-16-state-space-models-vs-transformer /posts/2026-05-09-state-space-models-vs-transformer 301
+/posts/2026-05-17-llm-inference-optimization-landscape /posts/2026-05-09-llm-inference-optimization-landscape 301
+/posts/2026-05-18-multimodal-ai-pipeline /posts/2026-05-09-multimodal-ai-pipeline 301
+/posts/2026-05-19-ai-agent-security-trust-boundary /posts/2026-05-09-ai-agent-security-trust-boundary 301

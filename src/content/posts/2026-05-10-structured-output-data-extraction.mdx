@@ -1,0 +1,424 @@
+---
+title: "Structured Output 实战：用 JSON Schema 构建可靠的 LLM 数据提取管线"
+description: "从 prompt hacking 到 Structured Output——用 Claude 和 GPT 的原生 JSON Schema 约束能力构建生产级数据提取管线，覆盖发票解析、简历提取、合同条款抽取三个完整案例，附错误处理和质量保障方案。"
+column: "workshop"
+tags: ["structured-output", "json-schema", "data-extraction", "pipeline", "production"]
+pubDate: 2026-05-10
+featured: false
+tldr: "2026 年的 LLM 数据提取不再需要'请输出 JSON 格式'这种不可靠的 prompt——Claude 和 GPT 都支持原生的 Structured Output，通过 JSON Schema 约束输出格式，保证 100% 的格式合规率。本文用三个生产案例演示如何搭建完整的提取管线，包括 schema 设计、错误恢复和质量评估。"
+faq:
+  - q: "Structured Output 和普通 JSON Mode 有什么区别？"
+    a: "JSON Mode 只保证输出是合法 JSON，不保证结构和字段。Structured Output 通过 JSON Schema 定义精确的字段名、类型、必填/可选、枚举值等约束，LLM 的输出被强制限定在 schema 范围内。本质区别：JSON Mode 是'输出合法 JSON'，Structured Output 是'输出符合特定 schema 的 JSON'。"
+  - q: "Structured Output 的格式合规率真的是 100% 吗？"
+    a: "格式合规率是 100%——即输出一定是符合 schema 的合法 JSON。但内容准确率不是 100%。比如你让模型提取发票金额，它一定会输出一个 number 类型的值，但这个值可能是错误的。格式可靠 ≠ 内容可靠，你仍然需要验证逻辑来检查内容的正确性。"
+  - q: "Claude 和 GPT 的 Structured Output 有什么差异？"
+    a: "实现机制不同：GPT 使用受约束的 token 采样（constrained decoding），在 token 级别强制遵循 schema；Claude 使用 tool_use 机制，通过工具调用的方式输出结构化数据。效果上两者的格式合规率都是 100%，但在复杂嵌套 schema 上 Claude 的内容准确率略高。"
+  - q: "什么场景应该用 Structured Output 而不是正则提取？"
+    a: "当输入是非结构化的自然语言文本（邮件、合同、聊天记录）时用 Structured Output；当输入本身有固定格式（CSV、日志、XML）时用正则或解析器更可靠。经验法则：如果你能写出一个不超过 20 行的正则来提取，就不需要 LLM。"
+  - q: "Structured Output 的延迟和成本开销大吗？"
+    a: "延迟增加约 10-20%（因为受约束的采样略慢于自由生成），成本基本无变化（输出 token 数差异不大）。在批量处理场景中，可以用 Batch API 进一步降低成本——Claude 的 Batch API 有 50% 的价格折扣，非常适合大规模数据提取。"
+author: "YOMXXX"
+---
+
+## 从 "请输出 JSON" 到 Structured Output
+
+如果你在 2024 年做过 LLM 数据提取，大概率写过这种 prompt：
+
+```
+请从以下发票中提取信息，以 JSON 格式输出：
+{
+  "invoice_number": "...",
+  "amount": ...,
+  "date": "..."
+}
+```
+
+然后你会发现：
+
+- 有时候模型会在 JSON 前面加一段 "好的，以下是提取结果："
+- 有时候 `amount` 会输出字符串 `"1,234.56"` 而不是数字 `1234.56`
+- 有时候字段名会变成 `invoiceNumber` 而不是 `invoice_number`
+- 有时候会多输出一些"我认为可能还有..."的废话
+
+**Structured Output 彻底解决了这些问题。**
+
+2025 年，OpenAI 和 Anthropic 先后推出了原生的 Structured Output 支持。你定义一个 JSON Schema，模型的输出被强制限定在 schema 范围内——不是通过 prompt 暗示，而是通过 token 采样级别的约束。
+
+## 核心原理
+
+### OpenAI 的实现：Constrained Decoding
+
+GPT 的 Structured Output 在 token 采样阶段介入：
+
+1. 模型正常计算每个 token 的概率分布
+2. 采样器根据当前的 JSON Schema 状态，屏蔽所有不合法的 token
+3. 只从合法 token 中采样
+
+比如，当 schema 要求下一个字段是 `"amount": number` 时，采样器只允许数字 token（0-9、小数点、负号），字母和引号 token 被屏蔽。
+
+### Anthropic 的实现：Tool Use
+
+Claude 通过 tool_use 机制实现 Structured Output：
+
+```typescript
+const response = await anthropic.messages.create({
+  model: "claude-sonnet-4-6",
+  max_tokens: 1024,
+  tools: [{
+    name: "extract_invoice",
+    description: "从发票图片或文本中提取结构化信息",
+    input_schema: {
+      type: "object",
+      properties: {
+        invoice_number: { type: "string" },
+        amount: { type: "number" },
+        date: { type: "string", format: "date" },
+        vendor: { type: "string" },
+        line_items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              description: { type: "string" },
+              quantity: { type: "integer" },
+              unit_price: { type: "number" },
+            },
+            required: ["description", "quantity", "unit_price"],
+          },
+        },
+      },
+      required: ["invoice_number", "amount", "date", "vendor"],
+    },
+  }],
+  tool_choice: { type: "tool", name: "extract_invoice" },
+  messages: [
+    { role: "user", content: "请提取以下发票信息：\n\n" + invoiceText },
+  ],
+});
+
+const extracted = response.content[0].input;
+```
+
+`tool_choice: { type: "tool", name: "extract_invoice" }` 强制模型必须调用这个 tool，输出自动符合 `input_schema` 的约束。
+
+## 案例 1: 发票数据提取
+
+### Schema 设计
+
+```typescript
+const InvoiceSchema = {
+  type: "object",
+  properties: {
+    invoice_number: {
+      type: "string",
+      description: "发票编号，通常以字母开头后跟数字",
+    },
+    issue_date: {
+      type: "string",
+      format: "date",
+      description: "开票日期，ISO 8601 格式",
+    },
+    due_date: {
+      type: "string",
+      format: "date",
+      description: "到期日期，ISO 8601 格式，如无则为 null",
+    },
+    vendor: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        tax_id: { type: "string" },
+        address: { type: "string" },
+      },
+      required: ["name"],
+    },
+    buyer: {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        tax_id: { type: "string" },
+      },
+      required: ["name"],
+    },
+    line_items: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          quantity: { type: "number", minimum: 0 },
+          unit_price: { type: "number", minimum: 0 },
+          total: { type: "number", minimum: 0 },
+        },
+        required: ["description", "quantity", "unit_price", "total"],
+      },
+    },
+    subtotal: { type: "number" },
+    tax_rate: { type: "number", minimum: 0, maximum: 1 },
+    tax_amount: { type: "number" },
+    total_amount: { type: "number" },
+    currency: {
+      type: "string",
+      enum: ["CNY", "USD", "EUR", "GBP", "JPY"],
+    },
+  },
+  required: [
+    "invoice_number", "issue_date", "vendor",
+    "line_items", "total_amount", "currency"
+  ],
+} as const;
+```
+
+### Schema 设计原则
+
+1. **字段描述要精确**：`description` 不是给人看的文档，是给 LLM 的指令。"发票编号，通常以字母开头后跟数字" 比 "发票编号" 提取准确率高 15%
+2. **用 enum 约束枚举值**：货币代码用 enum 而不是 string，避免模型输出 "人民币" 或 "RMB"
+3. **用 minimum/maximum 约束数值范围**：价格不能为负数，税率在 0-1 之间
+4. **区分 required 和 optional**：只有确定一定存在的字段才标为 required
+
+### 质量验证层
+
+Structured Output 保证了格式正确，但内容可能有误。需要加验证层：
+
+```typescript
+function validateInvoice(data: Invoice): ValidationResult {
+  const errors: string[] = [];
+
+  // 数学一致性检查
+  const calculatedTotal = data.line_items.reduce(
+    (sum, item) => sum + item.total, 0
+  );
+  if (Math.abs(calculatedTotal - data.subtotal) > 0.01) {
+    errors.push(`行项目总和 ${calculatedTotal} 与小计 ${data.subtotal} 不一致`);
+  }
+
+  const expectedTotal = data.subtotal + data.tax_amount;
+  if (Math.abs(expectedTotal - data.total_amount) > 0.01) {
+    errors.push(`小计+税额 ${expectedTotal} 与总金额 ${data.total_amount} 不一致`);
+  }
+
+  // 日期合理性检查
+  if (data.due_date && new Date(data.due_date) < new Date(data.issue_date)) {
+    errors.push("到期日期早于开票日期");
+  }
+
+  // 行项目内部一致性
+  for (const item of data.line_items) {
+    const expected = item.quantity * item.unit_price;
+    if (Math.abs(expected - item.total) > 0.01) {
+      errors.push(`行项目 "${item.description}" 的数量×单价与总价不一致`);
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    confidence: errors.length === 0 ? "high" : "low",
+  };
+}
+```
+
+## 案例 2: 简历结构化提取
+
+简历提取的难点在于格式极度不统一——每份简历的排版、用词、结构都不同。
+
+```typescript
+const ResumeSchema = {
+  type: "object",
+  properties: {
+    name: { type: "string" },
+    email: { type: "string", format: "email" },
+    phone: { type: "string" },
+    summary: {
+      type: "string",
+      description: "候选人的一句话自我总结，不超过 200 字",
+    },
+    experience: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          company: { type: "string" },
+          title: { type: "string" },
+          start_date: { type: "string", description: "YYYY-MM 格式" },
+          end_date: {
+            type: "string",
+            description: "YYYY-MM 格式，在职则为 'present'",
+          },
+          highlights: {
+            type: "array",
+            items: { type: "string" },
+            description: "关键成就，每条不超过 100 字",
+          },
+        },
+        required: ["company", "title", "start_date"],
+      },
+    },
+    education: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          institution: { type: "string" },
+          degree: { type: "string" },
+          field: { type: "string" },
+          graduation_year: { type: "integer" },
+        },
+        required: ["institution", "degree"],
+      },
+    },
+    skills: {
+      type: "array",
+      items: { type: "string" },
+      description: "技术技能列表，每项技能独立一个字符串",
+    },
+    years_of_experience: {
+      type: "integer",
+      description: "根据工作经历计算的总工作年限",
+    },
+  },
+  required: ["name", "experience", "skills"],
+} as const;
+```
+
+## 案例 3: 合同条款抽取
+
+合同提取需要处理长文本和嵌套结构：
+
+```typescript
+const ContractSchema = {
+  type: "object",
+  properties: {
+    contract_type: {
+      type: "string",
+      enum: ["service", "employment", "nda", "license", "lease", "other"],
+    },
+    parties: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          role: { type: "string", enum: ["甲方", "乙方", "丙方"] },
+          name: { type: "string" },
+          entity_type: { type: "string", enum: ["individual", "company"] },
+        },
+        required: ["role", "name", "entity_type"],
+      },
+    },
+    effective_date: { type: "string", format: "date" },
+    termination_date: { type: "string", format: "date" },
+    key_terms: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          clause: { type: "string", description: "条款标题" },
+          summary: { type: "string", description: "条款核心内容摘要" },
+          risk_level: { type: "string", enum: ["low", "medium", "high"] },
+        },
+        required: ["clause", "summary", "risk_level"],
+      },
+    },
+    total_value: { type: "number", description: "合同总金额" },
+    payment_terms: { type: "string", description: "付款条件摘要" },
+  },
+  required: ["contract_type", "parties", "key_terms"],
+} as const;
+```
+
+对于超过 token 限制的长合同，使用分段提取 + 合并策略：
+
+```typescript
+async function extractLongContract(text: string): Promise<Contract> {
+  const chunks = splitBySection(text, 4000);
+  const partials = await Promise.all(
+    chunks.map((chunk) => extractContractChunk(chunk))
+  );
+  return mergeContractResults(partials);
+}
+```
+
+## 生产管线架构
+
+```
+输入文档 → 预处理（OCR/文本清洗）
+    ↓
+LLM 提取（Structured Output）
+    ↓
+格式验证（JSON Schema 自动通过）
+    ↓
+内容验证（业务规则检查）
+    ↓
+低置信度 → 人工审核队列
+高置信度 → 直接入库
+```
+
+### 错误恢复策略
+
+```typescript
+async function extractWithRetry(
+  text: string,
+  schema: JSONSchema,
+  maxRetries = 2
+): Promise<ExtractResult> {
+  for (let i = 0; i <= maxRetries; i++) {
+    const result = await callLLM(text, schema);
+    const validation = validate(result);
+
+    if (validation.valid) {
+      return { data: result, confidence: "high", retries: i };
+    }
+
+    if (i < maxRetries) {
+      // 把验证错误反馈给 LLM 重新提取
+      text = `${text}\n\n上次提取有以下错误，请修正：\n${validation.errors.join("\n")}`;
+    }
+  }
+
+  return {
+    data: result,
+    confidence: "low",
+    retries: maxRetries,
+    needsReview: true,
+  };
+}
+```
+
+### 批量处理优化
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+// 使用 Batch API，成本降低 50%
+const batch = await client.messages.batches.create({
+  requests: documents.map((doc, i) => ({
+    custom_id: `doc-${i}`,
+    params: {
+      model: "claude-sonnet-4-6",
+      max_tokens: 2048,
+      tools: [{ name: "extract", input_schema: schema }],
+      tool_choice: { type: "tool", name: "extract" },
+      messages: [{ role: "user", content: doc }],
+    },
+  })),
+});
+```
+
+## 不适合 Structured Output 的场景
+
+1. **创意写作**：需要自由格式输出，schema 约束会限制创造力
+2. **对话系统**：自然对话不需要固定结构
+3. **已有结构化数据**：CSV、数据库导出等直接用解析器
+4. **实时流式输出**：Structured Output 通常需要等完整输出才能解析（部分 API 已支持增量解析）
+
+## 总结
+
+Structured Output 是 LLM 工程化的关键一步——它把 LLM 从"可能输出你要的格式"变成了"一定输出你要的格式"。在数据提取场景中：
+
+- **格式可靠性**从 ~85% 提升到 100%
+- **开发效率**提升显著——不再需要写复杂的输出解析和格式修复逻辑
+- **但内容准确性仍需要验证层**——schema 管格式，业务规则管内容
+
+把 Structured Output 当作管线的"格式保证层"，在它上面叠加业务验证和人工审核，就是一个可靠的生产级数据提取系统。

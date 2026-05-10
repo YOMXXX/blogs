@@ -43,7 +43,7 @@ export default function ProgressBar() {
         left: 0,
         height: 2,
         width: `${progress}%`,
-        background: 'linear-gradient(90deg, #10b981, #22d3ee)',
+        background: 'linear-gradient(90deg, var(--color-accent-green), var(--color-accent-cyan))',
         zIndex: 100,
         transition: 'width 0.05s linear',
         pointerEvents: 'none',

@@ -2,8 +2,6 @@
 import '../styles/global.css';
 
 import JsonLd from '../components/astro/JsonLd.astro';
-import InstallPrompt from '../components/astro/InstallPrompt.astro';
-import PwaUpdateToast from '../components/astro/PwaUpdateToast.astro';
 import { buildOrganizationSchema, buildWebSiteSchema } from '../lib/seo';
 
 const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? '';
@@ -21,10 +19,11 @@ interface Props {
   title: string;
   description: string;
   ogImage?: string;
+  ogType?: string;
   noindex?: boolean;
 }
 
-const { title, description, ogImage, noindex = false } = Astro.props;
+const { title, description, ogImage, ogType = 'website', noindex = false } = Astro.props;
 const ogImageURL = ogImage ? new URL(ogImage, Astro.site).href : null;
 const cleanPath = Astro.url.pathname.replace(/\.html$/, '').replace(/\/index$/, '/') || '/';
 const canonicalURL = new URL(cleanPath, Astro.site).href;
@@ -47,10 +46,18 @@ const fullTitle = title.includes('YOMXXX') ? title : `${title} · YOMXXX`;
 
     <meta property="og:title" content={fullTitle} />
     <meta property="og:description" content={description} />
-    <meta property="og:type" content="website" />
+    <meta property="og:type" content={ogType} />
     <meta property="og:url" content={canonicalURL} />
     {ogImageURL && <meta property="og:image" content={ogImageURL} />}
+    {ogImageURL && <meta property="og:image:width" content="1200" />}
+    {ogImageURL && <meta property="og:image:height" content="630" />}
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={fullTitle} />
+    <meta name="twitter:description" content={description} />
+    {ogImageURL && <meta name="twitter:image" content={ogImageURL} />}
+
+    <link rel="alternate" type="application/rss+xml" title="YOMXXX RSS Feed" href="/rss.xml" />
+    <link rel="alternate" type="application/atom+xml" title="YOMXXX Atom Feed" href="/atom.xml" />
 
     {/* theme-color must match --color-bg-primary in tokens.css */}
     <meta name="theme-color" content="#0a0a0a" />
@@ -72,11 +79,6 @@ const fullTitle = title.includes('YOMXXX') ? title : `${title} · YOMXXX`;
   </head>
   <body>
     <slot />
-    <script is:inline>
-      if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.register('/sw.js');
-      }
-    </script>
     <script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "f0d2577c827b4596a158ee752d68a709"}'></script>
   </body>
 </html>
