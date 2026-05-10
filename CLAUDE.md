@@ -45,17 +45,53 @@ faq:                             # 必须 5 条，中文
 - 代码示例必须可运行或有明确的伪代码标注
 - 禁止出现占位符文本（如 `@yourhandle`、`example.com`）
 
+## 选题流程（必须执行）
+
+每次发文前**必须**按以下流程选题，禁止凭经验拍脑袋。
+
+### Step 1: 从信息源搜索热点
+
+按优先级依次搜索以下渠道（使用 `tvly search`），每个渠道至少看 5 条结果：
+
+| 优先级 | 渠道 | 搜索方式 | 适合栏目 |
+|--------|------|---------|---------|
+| P0 | **arXiv cs.AI / cs.CL** | `tvly search "arXiv AI {今天日期} new papers"` | paper |
+| P0 | **Hugging Face Daily Papers** | `tvly search "huggingface daily papers site:huggingface.co"` | paper |
+| P1 | **Hacker News 首页** | `tvly search "hacker news AI top stories today"` | tools, workshop |
+| P1 | **GitHub Trending** | `tvly search "github trending AI machine-learning today"` | tools, workshop |
+| P2 | **Reddit r/MachineLearning** | `tvly search "reddit MachineLearning hot posts this week"` | paper, long-form |
+| P2 | **Reddit r/LocalLLaMA** | `tvly search "reddit LocalLLaMA hot posts"` | workshop, tools |
+| P3 | **Twitter/X AI KOL** | `tvly search "AI news twitter trending this week"` | weekly |
+| P3 | **产品发布/公告** | `tvly search "AI product launch announcement {当月}"` | tools |
+
+### Step 2: 筛选和去重
+
+1. 从搜索结果中提取 10-15 个候选主题
+2. 与已有文章对比（`ls src/content/posts/`），排除已覆盖的主题
+3. 按以下标准打分：
+   - **时效性**（3 天内的话题 > 1 周内 > 1 月内）
+   - **开发者实用性**（能用的 > 能看的 > 只能聊的）
+   - **深度空间**（能写 1500+ 字的 > 只能写 500 字的）
+
+### Step 3: 确定 5 篇选题
+
+从候选中选出 5 篇，确保覆盖不同栏目。优先选择：
+- 有**完整代码示例**可写的主题（workshop）
+- 有**明确论文来源**的主题（paper）
+- 有**多方对比数据**的主题（tools）
+- 有**架构级洞察**的主题（long-form）
+
 ## 每日发文计划（5 篇/天）
 
 按以下顺序每天各写一篇，覆盖所有栏目：
 
 | 顺序 | 栏目 | 主题选择策略 |
 |------|------|-------------|
-| 1 | `workshop` | 紧跟最新 AI 工具/框架的实战教程 |
-| 2 | `paper` | 近一周 arXiv 高引论文精读 |
-| 3 | `long-form` | 深度架构分析或系统设计 |
-| 4 | `tools` | AI 工具/IDE/框架的诚实测评 |
-| 5 | `weekly` | 本周 AI 领域 5 件大事（仅周日发） |
+| 1 | `workshop` | 从 GitHub Trending / HN 中选新框架或工具，写实战教程 |
+| 2 | `paper` | 从 arXiv / HF Daily Papers 中选高引论文精读 |
+| 3 | `long-form` | 从 Reddit 讨论或行业趋势中选深度架构分析 |
+| 4 | `tools` | 从产品发布或 HN 讨论中选工具横评 |
+| 5 | `weekly` | 综合所有渠道的本周热点（仅周日发） |
 
 周日发 weekly，其余天 weekly 替换为额外一篇其他栏目文章。
 
