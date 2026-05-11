@@ -1,0 +1,568 @@
+---
+title: "AI Agent Memory 架构全解：从 Buffer 到 Persistent Memory 的工程实践"
+description: "基于 Mem0 的 State of AI Agent Memory 2026 报告，深度解析三层记忆架构——Working Memory、Episodic Memory、Semantic Memory——的工程实现、选型建议和生产陷阱。"
+column: "long-form"
+tags: ["agent", "memory", "architecture", "production", "rag"]
+pubDate: 2026-05-10
+featured: false
+tldr: "Agent Memory 分三层：Working Memory（当前对话 token window）、Episodic Memory（历史对话向量存储）、Semantic Memory（提炼的知识图谱）。Mem0 报告显示 full-context 准确率最高（72.9%）但延迟不可用，Mem0g 以 68.4% 准确率和 2.59s 延迟成为生产最佳选择。记忆不是越多越好，eviction 策略同样关键。"
+faq:
+  - q: "为什么 Agent 需要记忆系统？"
+    a: "没有记忆的 Agent 每次对话都是陌生人。用户说'我上周提到的那个需求'，Agent 完全不知道你在说什么。记忆系统让 Agent 能跨对话积累上下文，从'工具'进化为'助手'。"
+  - q: "Working Memory 和 Episodic Memory 有什么区别？"
+    a: "Working Memory 是当前对话的上下文窗口（token buffer），读写极快但容量有限；Episodic Memory 是历史对话的持久化存储（通常用向量数据库），容量大但检索有延迟。类比人脑：Working Memory 是你正在想的事，Episodic Memory 是你能回忆起的事。"
+  - q: "Mem0 和 LangChain Memory 怎么选？"
+    a: "如果你需要开箱即用的完整记忆方案，Mem0 更合适——它提供 managed service 和 graph memory。如果你已经在用 LangChain 生态且需要灵活定制，LangChain Memory 集成更自然。小团队推荐 Mem0，大团队可考虑自研。"
+  - q: "Memory 爆炸怎么处理？"
+    a: "三个策略：1) 设置 TTL 自动过期旧记忆；2) 定期做 memory summarization 把细节压缩成摘要；3) 用 relevance score 做 eviction，低分记忆优先清除。Mem0 内置了这些机制，自研则需要自己实现。"
+  - q: "跨用户记忆泄露如何防范？"
+    a: "这是 Agent Memory 最严重的安全问题。必须在查询层强制过滤 user_id，不能依赖 LLM 自己判断'这条记忆属于谁'。建议在向量数据库的 metadata filter 中硬编码用户隔离，并做定期审计。"
+author: "YOMXXX"
+---
+
+## 没有记忆的 Agent = 每次对话都是陌生人
+
+去年我给一个客户部署了一套 AI 客服 Agent。技术上一切正常——意图识别准确、回答质量高、延迟在 2 秒以内。
+
+然后用户开始投诉："我已经说了三次我的订单号了，它每次都让我重新报。"
+
+问题不在 NLU，不在 LLM，不在 RAG——问题是这个 Agent 没有记忆。每次新对话，它面对的都是一个"陌生用户"。用户说的"上次那个问题"、"我之前选的方案"、"继续之前的对话"——它全都不知道。
+
+这就是 Agent Memory 要解决的核心问题：**让 AI Agent 能跨会话、跨时间地积累和运用上下文信息。**
+
+2026 年 3 月，Mem0 发布了 "State of AI Agent Memory 2026" 报告，首次用标准化的 LOCOMO Benchmark 对比了 10 种 Memory 方案。这篇文章基于那份报告和我的实战经验，拆解 Agent Memory 的三层架构、工程实现和生产陷阱。
+
+## 三层记忆架构：类比人脑
+
+人的记忆不是一个单一系统。心理学把它分成多种类型——短期记忆、情景记忆、语义记忆、程序记忆。AI Agent 的 Memory 架构也遵循类似的分层逻辑。
+
+我把它归纳为三层：
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Layer 3: Semantic Memory（语义记忆）                  │
+│  ✦ 知识图谱、用户画像、提炼的长期知识                     │
+│  ✦ 更新频率：低（天/周级别）                             │
+│  ✦ 存储：Graph DB / 结构化 DB                          │
+├─────────────────────────────────────────────────────┤
+│  Layer 2: Episodic Memory（情景记忆）                  │
+│  ✦ 历史对话记录、向量化的交互片段                         │
+│  ✦ 更新频率：中（每次对话后）                             │
+│  ✦ 存储：Vector DB + Metadata                         │
+├─────────────────────────────────────────────────────┤
+│  Layer 1: Working Memory（工作记忆）                   │
+│  ✦ 当前对话的 token window                             │
+│  ✦ 更新频率：高（每轮对话实时更新）                       │
+│  ✦ 存储：In-memory（LLM 上下文窗口）                    │
+└─────────────────────────────────────────────────────┘
+```
+
+每一层解决不同的问题，有不同的技术实现和性能特征。
+
+## Layer 1: Working Memory — 当前对话的"思维空间"
+
+Working Memory 是最直观的——它就是 LLM 当前上下文窗口里的内容。
+
+当用户在一个 session 中连续对话时，之前的消息还在 context window 里，模型"记得"这些内容。但这不是真正的"记忆"——更准确地说，它是一个有限容量的 buffer。
+
+### 核心挑战：Token Window 的天花板
+
+即使 2026 年的模型已经支持 128K-256K 的 context window，Working Memory 仍然有三个根本限制：
+
+1. **成本线性增长**：context 越长，每次 API 调用的 token 消耗越大。一个 100K token 的对话，每轮的成本可能是短对话的 50 倍。
+
+2. **Attention 衰减**：LLM 对 context 中间位置的信息注意力明显弱于开头和结尾（"Lost in the Middle" 问题）。128K 的窗口不意味着模型能均匀地利用所有 128K 的信息。
+
+3. **Session 边界**：Working Memory 只存在于单次 session 中。用户关闭浏览器，记忆就消失了。
+
+### 工程实现：Sliding Window + Compaction
+
+最常见的 Working Memory 管理策略是 sliding window + compaction：
+
+```typescript
+interface Message {
+  role: "user" | "assistant" | "system";
+  content: string;
+  timestamp: number;
+  tokenCount: number;
+}
+
+class WorkingMemory {
+  private messages: Message[] = [];
+  private readonly maxTokens: number;
+  private currentTokens: number = 0;
+
+  constructor(maxTokens: number = 32000) {
+    this.maxTokens = maxTokens;
+  }
+
+  addMessage(msg: Message): void {
+    this.messages.push(msg);
+    this.currentTokens += msg.tokenCount;
+
+    // 当 token 用量超过阈值时，触发 compaction
+    if (this.currentTokens > this.maxTokens * 0.8) {
+      this.compact();
+    }
+  }
+
+  private async compact(): Promise<void> {
+    // 保留最近 5 轮对话不动
+    const recentCount = 10; // 5 轮 = 10 条消息（user + assistant）
+    const recent = this.messages.slice(-recentCount);
+    const older = this.messages.slice(0, -recentCount);
+
+    if (older.length === 0) return;
+
+    // 把旧消息压缩成摘要
+    const summary = await this.summarize(older);
+
+    // 用摘要替换旧消息
+    this.messages = [
+      { role: "system", content: `对话历史摘要：${summary}`, timestamp: Date.now(), tokenCount: this.estimateTokens(summary) },
+      ...recent,
+    ];
+    this.currentTokens = this.messages.reduce((sum, m) => sum + m.tokenCount, 0);
+  }
+
+  private async summarize(messages: Message[]): Promise<string> {
+    // 调用一个小模型做摘要，保留关键信息
+    const conversationText = messages
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n");
+
+    // 实际实现中调用 LLM API
+    return `[摘要] 用户讨论了...的主题，关键决策包括...`;
+  }
+
+  private estimateTokens(text: string): number {
+    return Math.ceil(text.length / 4); // 粗略估计，生产环境用 tiktoken
+  }
+
+  getContext(): Message[] {
+    return [...this.messages];
+  }
+}
+```
+
+这段代码的核心逻辑是：当 token 用量达到 80% 时，把较早的消息压缩成摘要，只保留最近 5 轮的完整对话。这样既能控制成本，又能保留关键上下文。
+
+**关键参数**：
+- `maxTokens` 设多大？我通常设为模型 context window 的 25%。比如 128K 的模型，Working Memory 设 32K，剩余空间留给 system prompt、RAG 检索结果和 Episodic Memory。
+- 保留最近几轮？5 轮是一个经验值。太少会丢失最近的上下文，太多会让 compaction 效果不明显。
+
+## Layer 2: Episodic Memory — 跨会话的"回忆"
+
+Episodic Memory 解决的是 Working Memory 的 session 边界问题——用户昨天说过的话、上周讨论的方案、上个月的偏好设置，都需要被记住。
+
+### 核心思想：对话 → 向量 → 检索
+
+Episodic Memory 的基本流程：
+
+1. 每次对话结束后，把对话内容（或提取的关键信息）向量化，存入 Vector DB
+2. 新对话开始时，用当前 query 检索相关的历史片段
+3. 把检索结果注入到 Working Memory 中，作为上下文
+
+这本质上就是 RAG——但检索的不是文档，而是历史对话。
+
+### 工程实现：Mem0 的方案
+
+Mem0 在这个领域做得最成熟。以下是一个基于 Mem0 的 Episodic Memory 实现：
+
+```typescript
+import { MemoryClient } from "mem0ai";
+
+const mem0 = new MemoryClient({ apiKey: process.env.MEM0_API_KEY! });
+
+class EpisodicMemory {
+  private userId: string;
+
+  constructor(userId: string) {
+    this.userId = userId;
+  }
+
+  // 对话结束后，写入记忆
+  async remember(conversation: Message[]): Promise<void> {
+    const conversationText = conversation
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n");
+
+    await mem0.add(conversationText, {
+      user_id: this.userId,
+      metadata: {
+        session_id: crypto.randomUUID(),
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  // 新对话时，检索相关记忆
+  async recall(currentQuery: string, limit: number = 5): Promise<string[]> {
+    const memories = await mem0.search(currentQuery, {
+      user_id: this.userId, // 强制用户隔离
+      limit,
+    });
+
+    return memories.map((m: { memory: string }) => m.memory);
+  }
+
+  // 获取用户的所有记忆（用于调试）
+  async getAllMemories(): Promise<string[]> {
+    const all = await mem0.getAll({ user_id: this.userId });
+    return all.map((m: { memory: string }) => m.memory);
+  }
+}
+
+// 使用示例
+const memory = new EpisodicMemory("user-123");
+
+// 对话结束后保存
+await memory.remember([
+  { role: "user", content: "我想用 Next.js 重构现有的 React 项目", timestamp: Date.now(), tokenCount: 20 },
+  { role: "assistant", content: "好的，我建议分三个阶段...", timestamp: Date.now(), tokenCount: 100 },
+]);
+
+// 下次对话时检索
+const relevantMemories = await memory.recall("上次说的重构方案是什么？");
+// → ["用户想用 Next.js 重构 React 项目，助手建议分三阶段进行..."]
+```
+
+注意 `user_id` 参数——这是防止跨用户记忆泄露的关键。每次检索都必须在 user_id 维度上做过滤，不能依赖模型自己去判断这条记忆属于谁。
+
+### LOCOMO Benchmark：各方案对比
+
+Mem0 的报告用 LOCOMO Benchmark 对比了 10 种 Memory 方案。最有参考价值的数据：
+
+| 方案 | 准确率 | P95 延迟 | Tokens/查询 | 适合场景 |
+|---|---|---|---|---|
+| Full-context（全量对话） | 72.9% | 17.12s | ~26,000 | 不适合生产 |
+| Mem0g（Graph Memory） | 68.4% | 2.59s | ~1,800 | 关系密集场景 |
+| Mem0（Vector Memory） | 66.9% | 1.44s | ~1,800 | 通用场景最佳 |
+| RAG（标准向量检索） | 61.0% | 0.70s | ~1,500 | 简单场景 |
+| OpenAI Memory | 52.9% | — | — | 消费级产品 |
+
+关键洞察：
+
+1. **Full-context 准确率最高但延迟不可用。** 把所有历史对话都塞进 context window，准确率确实最高（72.9%），但 P95 延迟 17 秒——这在生产环境完全不可接受。
+
+2. **Mem0 是准确率和延迟的最佳平衡点。** 66.9% 的准确率 + 1.44s 的延迟，对大多数应用来说足够了。
+
+3. **Graph Memory（Mem0g）在关系密集场景显著优于纯向量。** 68.4% vs 66.9%，虽然只差 1.5 个百分点，但在需要多跳推理的问题上差距更大。
+
+4. **OpenAI Memory 明显落后。** 52.9% 的准确率说明它的记忆提取和检索策略还有很大改进空间。
+
+## Layer 3: Semantic Memory — 长期知识的"世界模型"
+
+Semantic Memory 是最高层的抽象——它不是记录"什么时候说了什么"，而是提炼出"我知道什么"。
+
+### 从事实到知识
+
+Episodic Memory 存的是对话片段："用户在 3 月 15 日说他喜欢用 Python"。
+Semantic Memory 存的是提炼后的知识："用户偏好 Python，技术栈是 FastAPI + PostgreSQL"。
+
+区别在于：Episodic Memory 是原始事实的堆积，Semantic Memory 是理解和抽象后的结构化知识。
+
+### 工程实现：知识图谱 + 用户画像
+
+```typescript
+interface UserProfile {
+  userId: string;
+  preferences: Record<string, string>;
+  techStack: string[];
+  communicationStyle: string;
+  knowledgeGraph: Triple[];
+  lastUpdated: Date;
+}
+
+interface Triple {
+  subject: string;
+  predicate: string;
+  object: string;
+  confidence: number;
+  source: string; // 哪次对话推导出的
+}
+
+class SemanticMemory {
+  private profile: UserProfile;
+
+  constructor(userId: string) {
+    this.profile = {
+      userId,
+      preferences: {},
+      techStack: [],
+      communicationStyle: "unknown",
+      knowledgeGraph: [],
+      lastUpdated: new Date(),
+    };
+  }
+
+  // 从对话中提取语义知识
+  async extractKnowledge(conversation: Message[]): Promise<void> {
+    const conversationText = conversation
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n");
+
+    // 用 LLM 提取结构化知识
+    const extraction = await this.llmExtract(conversationText);
+
+    // 合并到知识图谱
+    for (const triple of extraction.triples) {
+      const existing = this.profile.knowledgeGraph.find(
+        (t) => t.subject === triple.subject && t.predicate === triple.predicate
+      );
+
+      if (existing) {
+        // 如果已有同类知识，用更新的替换
+        if (triple.confidence > existing.confidence) {
+          existing.object = triple.object;
+          existing.confidence = triple.confidence;
+          existing.source = triple.source;
+        }
+      } else {
+        this.profile.knowledgeGraph.push(triple);
+      }
+    }
+
+    // 更新用户偏好
+    Object.assign(this.profile.preferences, extraction.preferences);
+    this.profile.lastUpdated = new Date();
+  }
+
+  // 查询语义记忆
+  query(subject: string): Triple[] {
+    return this.profile.knowledgeGraph.filter(
+      (t) => t.subject.includes(subject) || t.object.includes(subject)
+    );
+  }
+
+  // 生成用户画像摘要（注入到 system prompt）
+  generateProfileSummary(): string {
+    const prefs = Object.entries(this.profile.preferences)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join("; ");
+
+    const tech = this.profile.techStack.join(", ");
+
+    return `用户偏好: ${prefs}。技术栈: ${tech}。沟通风格: ${this.profile.communicationStyle}。`;
+  }
+
+  private async llmExtract(text: string) {
+    // 实际实现中调用 LLM 做结构化提取
+    return {
+      triples: [] as Triple[],
+      preferences: {} as Record<string, string>,
+    };
+  }
+}
+```
+
+Semantic Memory 的价值在于**长期个性化**。当 Agent 知道"这个用户是资深后端，偏好 TypeScript，讨厌冗长解释"时，它的每一次回答都能更精准。
+
+## 三层联动：完整的 Memory 系统
+
+真正的 Agent Memory 不是三层独立运作，而是联动的：
+
+```typescript
+class AgentMemorySystem {
+  private working: WorkingMemory;
+  private episodic: EpisodicMemory;
+  private semantic: SemanticMemory;
+
+  constructor(userId: string) {
+    this.working = new WorkingMemory(32000);
+    this.episodic = new EpisodicMemory(userId);
+    this.semantic = new SemanticMemory(userId);
+  }
+
+  async processMessage(userMessage: string): Promise<string> {
+    // 1. 检索 Episodic Memory 中的相关历史
+    const relevantMemories = await this.episodic.recall(userMessage, 3);
+
+    // 2. 获取 Semantic Memory 中的用户画像
+    const profile = this.semantic.generateProfileSummary();
+
+    // 3. 构造完整的 context
+    const systemPrompt = `你是一个 AI 助手。
+用户画像：${profile}
+相关历史记忆：
+${relevantMemories.map((m, i) => `[${i + 1}] ${m}`).join("\n")}`;
+
+    // 4. 加入 Working Memory
+    this.working.addMessage({
+      role: "user",
+      content: userMessage,
+      timestamp: Date.now(),
+      tokenCount: Math.ceil(userMessage.length / 4),
+    });
+
+    // 5. 调用 LLM 生成回复
+    const response = await this.callLLM(systemPrompt, this.working.getContext());
+
+    // 6. 更新 Working Memory
+    this.working.addMessage({
+      role: "assistant",
+      content: response,
+      timestamp: Date.now(),
+      tokenCount: Math.ceil(response.length / 4),
+    });
+
+    return response;
+  }
+
+  // 对话结束时，同步到长期记忆
+  async onSessionEnd(): Promise<void> {
+    const context = this.working.getContext();
+    await Promise.all([
+      this.episodic.remember(context),
+      this.semantic.extractKnowledge(context),
+    ]);
+  }
+
+  private async callLLM(systemPrompt: string, messages: Message[]): Promise<string> {
+    // 实际实现中调用 LLM API
+    return "AI 回复";
+  }
+}
+```
+
+这个架构的数据流是：
+
+**读取路径**：Semantic Memory（用户画像）+ Episodic Memory（相关历史）→ 注入 Working Memory → LLM 生成
+**写入路径**：对话结束 → 异步写入 Episodic Memory → 定期提炼到 Semantic Memory
+
+## 选型建议：Mem0 vs LangChain Memory vs 自研
+
+| 维度 | Mem0 | LangChain Memory | 自研 |
+|---|---|---|---|
+| 上手速度 | 最快（SaaS） | 快（Python 生态） | 最慢 |
+| 灵活性 | 中等 | 高 | 最高 |
+| Graph Memory | 内置 | 需额外集成 | 自行实现 |
+| 多租户隔离 | 内置 | 需自行实现 | 自行实现 |
+| 记忆衰减/Eviction | 内置 | 基础支持 | 自行实现 |
+| 适合团队 | 小团队 / 快速原型 | 已有 LangChain 的团队 | 有充足工程资源的团队 |
+| 月成本（10K 用户） | ~$200-500 | 基础设施成本 | 工程师人力 + 基础设施 |
+
+**我的建议**：先用 Mem0 跑通 MVP，验证记忆系统对你的产品确实有价值。如果有价值，再根据规模和定制需求决定是否迁移到自研方案。
+
+## 记忆衰减：不是所有记忆都该保留
+
+这是很多人忽略的问题——记忆不是越多越好。
+
+一个活跃用户一天可能产生 50 条记忆，一个月就是 1500 条。如果不做任何清理，一年后你的 Memory 检索会被大量过时、矛盾、无关的信息淹没，准确率反而会下降。
+
+### Memory Summarization + Eviction 策略
+
+```typescript
+interface MemoryEntry {
+  id: string;
+  content: string;
+  createdAt: Date;
+  lastAccessedAt: Date;
+  accessCount: number;
+  relevanceScore: number;
+}
+
+class MemoryEviction {
+  // 综合评分：结合时间衰减、访问频率、相关性
+  calculateRetentionScore(entry: MemoryEntry): number {
+    const ageInDays = (Date.now() - entry.createdAt.getTime()) / (1000 * 60 * 60 * 24);
+    const recencyDays = (Date.now() - entry.lastAccessedAt.getTime()) / (1000 * 60 * 60 * 24);
+
+    // 时间衰减（指数衰减，半衰期 30 天）
+    const timeDecay = Math.exp(-0.023 * recencyDays);
+
+    // 访问频率权重
+    const frequencyWeight = Math.log2(entry.accessCount + 1) / 10;
+
+    // 综合评分
+    return entry.relevanceScore * timeDecay + frequencyWeight;
+  }
+
+  // 定期执行 eviction
+  async evict(memories: MemoryEntry[], keepRatio: number = 0.7): Promise<MemoryEntry[]> {
+    const scored = memories.map((m) => ({
+      memory: m,
+      score: this.calculateRetentionScore(m),
+    }));
+
+    // 按分数排序，保留 top 70%
+    scored.sort((a, b) => b.score - a.score);
+    const keepCount = Math.ceil(scored.length * keepRatio);
+
+    const toKeep = scored.slice(0, keepCount).map((s) => s.memory);
+    const toEvict = scored.slice(keepCount).map((s) => s.memory);
+
+    // 被淘汰的记忆可以先做 summarization 再删除
+    if (toEvict.length > 10) {
+      await this.summarizeAndArchive(toEvict);
+    }
+
+    return toKeep;
+  }
+
+  private async summarizeAndArchive(memories: MemoryEntry[]): Promise<void> {
+    // 把要淘汰的记忆压缩成一条摘要，存入 Semantic Memory
+    // 这样即使细节丢失，核心知识仍然保留
+  }
+}
+```
+
+关键设计点：
+
+- **半衰期 30 天**：这是一个经验值。太短会丢失有价值的长期记忆，太长会积累太多噪音。
+- **访问频率权重**：被频繁检索到的记忆说明有价值，即使很老也应该保留。
+- **Summarization before Eviction**：不是直接删除，而是先压缩成摘要存入 Semantic Memory。细节丢了但知识保留了。
+
+## 生产陷阱：五个踩过的坑
+
+### 1. Memory 爆炸
+
+用户频繁交互时，每秒可能产生多条记忆。如果写入是同步的，会直接拖慢 API 响应时间。
+
+**解决方案**：Memory 写入必须异步。用消息队列（如 Redis Stream）缓冲写入请求，批量处理。Mem0 的 managed service 默认就是异步模式。
+
+### 2. 跨用户记忆泄露
+
+这是最危险的安全问题。如果你的 Memory 查询没有严格按 user_id 过滤，用户 A 可能检索到用户 B 的私人对话。
+
+**解决方案**：在向量数据库的 metadata filter 中硬编码 user_id 过滤——不要在 prompt 里"提醒" LLM 注意用户隔离，因为 LLM 不可靠。把隔离做在基础设施层，而不是应用层。
+
+### 3. 记忆矛盾
+
+用户上个月说"我喜欢 Python"，这个月说"我转到 TypeScript 了"。如果两条记忆同时被检索出来，LLM 不知道听谁的。
+
+**解决方案**：给记忆加时间戳，检索时告诉 LLM "以最新信息为准"。更好的方案是在 Semantic Memory 层做知识更新——新信息覆盖旧信息。
+
+### 4. 隐私合规
+
+用户的对话记忆属于个人数据，受 GDPR/CCPA 保护。你必须支持"被遗忘权"——用户要求删除时，你要能删除他所有的记忆数据。
+
+**解决方案**：所有记忆必须与 user_id 关联，支持按 user_id 批量删除。向量数据库中的嵌入也要删除——不能只删原文留嵌入。
+
+### 5. 评估困难
+
+"记忆系统好不好"是一个很难量化的问题。用户的满意度提升可能来自记忆系统，也可能来自其他优化。
+
+**解决方案**：用 LOCOMO Benchmark 做离线评估，用 A/B 测试做在线评估。关键指标包括：记忆检索准确率、用户重复信息率（应该随记忆系统上线而下降）、对话满意度评分。
+
+## 总结：记忆是 Agent 进化的关键
+
+2026 年的 AI Agent 领域，记忆系统正在从"可选功能"变成"必备基础设施"。
+
+没有记忆的 Agent 只能做一次性的任务处理——有记忆的 Agent 能成为真正理解用户的个人助手。
+
+但记忆不是免费的。它带来了工程复杂度（三层架构）、安全风险（泄露、合规）和运营成本（存储、维护、衰减管理）。
+
+我的建议是从简单开始：先实现 Working Memory 的 compaction，然后加入 Episodic Memory 的基本检索，最后在用户量和需求验证后再考虑 Semantic Memory 和知识图谱。
+
+```typescript
+// 一句话选型
+const chooseMemoryStack = (stage: string) => {
+  if (stage === "mvp") return "Working Memory only (compaction)";
+  if (stage === "growth") return "Working + Episodic (Mem0)";
+  if (stage === "scale") return "Full 3-layer + Graph Memory";
+  return "先想清楚你的 Agent 需不需要记忆";
+};
+```
+
+记忆让 Agent 从工具变成伙伴。但和所有基础设施一样——做好它需要的不是灵感，而是工程纪律。
