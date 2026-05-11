@@ -1,0 +1,75 @@
+name: Baidu Push Submit
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/content/posts/**.mdx'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Single URL to submit (optional, full URL)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Collect URLs to submit
+        id: collect
+        env:
+          SITE: ${{ vars.SITE_URL }}
+          MANUAL_URL: ${{ inputs.url }}
+        run: |
+          set -e
+          SITE="${SITE:-https://yomxxx.com}"
+          SITE="${SITE%/}"
+
+          if [ -n "$MANUAL_URL" ]; then
+            echo "$MANUAL_URL" > urls.txt
+          else
+            # Diff against previous commit, find added/modified .mdx files
+            git diff --name-only --diff-filter=AM HEAD^ HEAD -- 'src/content/posts/*.mdx' \
+              | sed -E 's|^src/content/posts/(.+)\.mdx$|'"$SITE"'/posts/\1|' \
+              > urls.txt || true
+          fi
+
+          if [ ! -s urls.txt ]; then
+            echo "No URLs to submit"
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "URLs to submit:"
+          cat urls.txt
+          echo "count=$(wc -l < urls.txt | tr -d ' ')" >> $GITHUB_OUTPUT
+
+      - name: Submit to Baidu
+        if: steps.collect.outputs.count != '0'
+        env:
+          BAIDU_TOKEN: ${{ secrets.BAIDU_PUSH_TOKEN }}
+          SITE: ${{ vars.SITE_URL }}
+        run: |
+          set -e
+          SITE="${SITE:-https://yomxxx.com}"
+          if [ -z "$BAIDU_TOKEN" ]; then
+            echo "Missing BAIDU_PUSH_TOKEN secret; skipping"
+            exit 0
+          fi
+          RESPONSE=$(curl -sS -H 'Content-Type: text/plain' \
+            --data-binary @urls.txt \
+            "http://data.zz.baidu.com/urls?site=$SITE&token=$BAIDU_TOKEN")
+          echo "Baidu API response: $RESPONSE"
+          # Fail if response contains error
+          if echo "$RESPONSE" | grep -q '"error"'; then
+            echo "Baidu push failed"
+            exit 1
+          fi
