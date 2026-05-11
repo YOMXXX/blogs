@@ -1,0 +1,330 @@
+---
+title: "Browser Use 实战：让 AI Agent 操控浏览器完成自动化任务"
+description: "用 Browser Use 这个 GitHub 热门开源项目，让 LLM 直接操控浏览器——点击、填表、截图、提取数据，实现从'人手动操作网页'到'Agent 自动化完成'的跃迁，附 Python 完整代码和 5 个实际案例。"
+column: "workshop"
+tags: ["browser-use", "automation", "agent", "scraping", "python"]
+pubDate: 2026-05-11
+featured: false
+tldr: "Browser Use 是 2026 年 GitHub Trending 上最热的 AI 自动化工具之一，它让 LLM Agent 能像人一样操控浏览器——导航页面、点击按钮、填写表单、提取数据。底层基于 Playwright，上层通过 Vision + DOM 混合感知让 LLM 理解页面内容并规划操作序列。本文用 5 个完整案例演示从安装到生产部署的全流程。"
+faq:
+  - q: "Browser Use 和 Selenium/Playwright 有什么区别？"
+    a: "Selenium/Playwright 是确定性的浏览器自动化工具——你需要手动编写每一步操作（定位元素、点击、输入）。Browser Use 是 AI 驱动的——你只需描述目标（'帮我在 Amazon 上搜索 MacBook Pro 并找到最低价'），LLM 自动规划并执行操作序列。Selenium 适合固定流程的自动化测试，Browser Use 适合动态、多变的网页操作。"
+  - q: "Browser Use 支持哪些 LLM 模型？"
+    a: "支持所有主流模型：Claude 4.7（推荐，视觉理解最强）、GPT-4o（性价比好）、Gemini 3（多模态强）、DeepSeek V4（成本最低）、本地 Ollama 模型（隐私优先）。通过 LangChain 的模型接口统一管理，切换模型只需改一行配置。推荐用 Claude 或 GPT-4o 做复杂任务，DeepSeek 做简单批量任务。"
+  - q: "Browser Use 的可靠性如何？会不会经常出错？"
+    a: "可靠性取决于三个因素：1) 网页复杂度——简单表单填写成功率 90%+，复杂 SPA 应用降到 60-70%；2) 模型选择——Claude 4.7 的页面理解能力最强；3) 任务描述的清晰度——越具体的指令越可靠。生产环境建议加入重试机制和人工兜底。Browser Use 不适合对可靠性要求 >99% 的关键业务流程。"
+  - q: "Browser Use 合法吗？会不会被网站封禁？"
+    a: "法律层面：自动化操作公开网页本身不违法，但违反网站 ToS（Terms of Service）可能面临法律风险。技术层面：Browser Use 使用真实浏览器（Chromium），比传统爬虫更难被检测，但频繁访问仍可能触发反爬机制。建议：1) 遵守 robots.txt；2) 控制访问频率；3) 不要用于抓取受版权保护的内容；4) 只在授权的系统上使用自动化操作。"
+  - q: "Browser Use 和 Browserbase/Playwright MCP 有什么区别？"
+    a: "Browserbase 是云端浏览器基础设施，提供远程浏览器实例；Playwright MCP 是让 LLM 通过 MCP 协议调用 Playwright 的适配器。Browser Use 是更高层的抽象——它内置了 Vision+DOM 的混合感知、自动元素定位、操作规划等 AI 逻辑。三者可以组合：Browser Use 做智能层，Playwright 做执行层，Browserbase 做基础设施层。"
+author: "YOMXXX"
+---
+
+## 从"看到"到"操作"
+
+2025 年，多模态 LLM 学会了"看"网页——你截图发给 Claude，它能准确描述页面内容。
+
+2026 年，下一步来了：**让 LLM 不只是看，而是直接操作网页**。
+
+Browser Use 就是这个"手"。它是一个 Python 库，底层用 Playwright 驱动真实 Chromium 浏览器，上层用 LLM 理解页面并规划操作：
+
+```python
+from browser_use import Agent
+from langchain_anthropic import ChatAnthropic
+
+agent = Agent(
+    task="去 GitHub Trending 页面，找到今天 Star 最多的 Python 项目，记录项目名和描述",
+    llm=ChatAnthropic(model="claude-sonnet-4-6"),
+)
+
+result = await agent.run()
+print(result)
+```
+
+就这么简单。Agent 会自动打开浏览器、导航到 GitHub Trending、解析页面、提取信息。
+
+## 安装
+
+```bash
+pip install browser-use
+playwright install chromium
+```
+
+需要配置 LLM API Key：
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+# 或
+export OPENAI_API_KEY="sk-..."
+```
+
+## 核心原理：Vision + DOM 混合感知
+
+Browser Use 的一个关键设计决策是**同时使用截图和 DOM 树**来理解页面：
+
+### 纯 Vision 方案的问题
+
+只靠截图让 LLM 决定点哪里，有三个致命问题：
+
+1. **坐标不精确**：LLM 输出"点击 (340, 520)"，但按钮实际在 (345, 518)
+2. **遮挡和重叠**：弹窗、下拉菜单等动态元素会遮挡目标
+3. **不可见内容**：需要滚动才能看到的内容，截图里没有
+
+### 纯 DOM 方案的问题
+
+只靠 DOM 树让 LLM 定位元素，也有问题：
+
+1. **DOM 太大**：一个普通网页的 DOM 可能有几千个节点，超出上下文窗口
+2. **语义缺失**：DOM 节点名（`div.css-1a2b3c`）没有语义信息
+3. **视觉布局丢失**：DOM 是树结构，丢失了"这个按钮在页面右上角"的空间信息
+
+### Browser Use 的混合方案
+
+```
+截图 (Vision)  → LLM 理解页面布局和视觉内容
+       +
+DOM 树 (精简)  → 提供精确的元素选择器和交互能力
+       ↓
+LLM 输出: "点击 selector='#submit-btn' 的按钮"
+       ↓
+Playwright 执行精确的元素操作
+```
+
+DOM 树会被精简——移除不可见元素、合并无交互的容器节点，通常压缩到原始 DOM 的 10-20%。
+
+## 案例 1: 竞品价格监控
+
+```python
+from browser_use import Agent
+from langchain_anthropic import ChatAnthropic
+
+async def monitor_competitor_prices():
+    agent = Agent(
+        task="""
+        1. 打开 jd.com
+        2. 搜索 "MacBook Pro M4"
+        3. 找到前 5 个搜索结果
+        4. 提取每个商品的名称、价格和商家
+        5. 按价格从低到高排序后返回
+        """,
+        llm=ChatAnthropic(model="claude-sonnet-4-6"),
+    )
+    
+    result = await agent.run()
+    return result
+```
+
+### 处理反爬
+
+```python
+from browser_use import Agent, BrowserConfig
+
+agent = Agent(
+    task="...",
+    llm=llm,
+    browser_config=BrowserConfig(
+        headless=False,       # 有头模式更不容易被检测
+        disable_security=False,
+        extra_chromium_args=[
+            "--disable-blink-features=AutomationControlled",
+        ],
+    ),
+)
+```
+
+## 案例 2: 自动填写表单
+
+```python
+async def fill_expense_report():
+    agent = Agent(
+        task="""
+        1. 打开公司报销系统 https://expense.internal.com
+        2. 点击"新建报销单"
+        3. 填写以下信息：
+           - 类型: 差旅费
+           - 日期: 2026-05-11
+           - 金额: 1280.50
+           - 事由: 北京出差-客户拜访
+           - 交通方式: 高铁
+        4. 上传附件 /tmp/receipt.pdf
+        5. 点击"提交审批"
+        6. 等待页面显示"提交成功"
+        """,
+        llm=ChatAnthropic(model="claude-sonnet-4-6"),
+    )
+    
+    result = await agent.run()
+    return result
+```
+
+## 案例 3: 网页数据提取
+
+```python
+async def extract_job_listings():
+    agent = Agent(
+        task="""
+        1. 打开 LinkedIn Jobs
+        2. 搜索 "AI Engineer" 职位，地点设为 "Remote"
+        3. 提取前 10 个职位的：
+           - 公司名
+           - 职位标题
+           - 薪资范围（如果显示）
+           - 发布日期
+        4. 以 JSON 数组格式返回结果
+        """,
+        llm=ChatAnthropic(model="claude-sonnet-4-6"),
+    )
+    
+    result = await agent.run()
+    return result
+```
+
+## 案例 4: 自动化测试
+
+Browser Use 也可以用于"智能 E2E 测试"——不需要写精确的选择器：
+
+```python
+async def smart_e2e_test():
+    agent = Agent(
+        task="""
+        测试电商网站的购物流程：
+        1. 打开 https://shop.example.com
+        2. 搜索 "无线耳机"
+        3. 选择第一个商品
+        4. 添加到购物车
+        5. 进入购物车页面
+        6. 确认商品名称和价格正确
+        7. 点击"去结算"
+        8. 验证跳转到了结算页面
+        
+        如果任何步骤失败，记录失败原因和截图
+        """,
+        llm=ChatAnthropic(model="claude-sonnet-4-6"),
+    )
+    
+    result = await agent.run()
+    return result
+```
+
+传统 E2E 测试的痛点是选择器变化导致测试脆弱。Browser Use 用语义描述代替选择器，网页改版后测试仍然能跑。
+
+## 案例 5: 多步工作流自动化
+
+```python
+from browser_use import Agent
+from browser_use.controller.service import Controller
+
+controller = Controller()
+
+@controller.action("保存到数据库")
+async def save_to_db(data: dict):
+    """将提取的数据保存到 PostgreSQL"""
+    # 你的数据库逻辑
+    await db.insert("competitor_data", data)
+    return "已保存"
+
+agent = Agent(
+    task="""
+    每天执行以下工作流：
+    1. 打开竞品 A 的定价页面，提取所有套餐价格
+    2. 打开竞品 B 的定价页面，提取所有套餐价格
+    3. 对比两家的价格差异
+    4. 使用"保存到数据库"工具保存对比结果
+    """,
+    llm=ChatAnthropic(model="claude-sonnet-4-6"),
+    controller=controller,
+)
+
+result = await agent.run()
+```
+
+`@controller.action` 装饰器让你可以注册自定义工具——Agent 在执行浏览器任务的同时，可以调用你的业务逻辑。
+
+## 生产部署要点
+
+### 1. 错误处理和重试
+
+```python
+from browser_use import Agent
+
+agent = Agent(
+    task="...",
+    llm=llm,
+    max_actions_per_step=10,   # 每步最多执行 10 个操作
+    max_steps=50,               # 最多 50 步
+)
+
+try:
+    result = await agent.run(max_retries=3)
+except Exception as e:
+    # 回退到人工处理
+    notify_human(task, error=str(e))
+```
+
+### 2. 会话管理
+
+```python
+from browser_use import Agent, BrowserConfig
+from browser_use.browser.context import BrowserContextConfig
+
+agent = Agent(
+    task="...",
+    llm=llm,
+    browser_config=BrowserConfig(
+        new_context_config=BrowserContextConfig(
+            storage_state="./auth-state.json",  # 复用登录态
+            viewport={"width": 1920, "height": 1080},
+        ),
+    ),
+)
+```
+
+`storage_state` 可以保存和恢复浏览器的 Cookie 和 LocalStorage，避免每次任务都重新登录。
+
+### 3. 并发执行
+
+```python
+import asyncio
+
+async def batch_extract(urls: list[str]):
+    tasks = [
+        Agent(
+            task=f"打开 {url}，提取页面标题和主要内容",
+            llm=ChatAnthropic(model="claude-sonnet-4-6"),
+        ).run()
+        for url in urls
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return results
+```
+
+### 4. 成本控制
+
+Browser Use 的每一步都会调用 LLM（发送截图 + DOM），成本会快速累积：
+
+| 操作步数 | Claude Sonnet 成本 | DeepSeek V4 成本 |
+|----------|-------------------|-----------------|
+| 5 步 | ~$0.15 | ~$0.01 |
+| 20 步 | ~$0.60 | ~$0.04 |
+| 50 步 | ~$1.50 | ~$0.10 |
+
+**简单任务用 DeepSeek V4 可以把成本降到几分钱**。
+
+## 局限性
+
+1. **速度**：每步需要 LLM 推理 + 浏览器操作，一个 10 步的任务约需 30-60 秒
+2. **可靠性**：复杂 SPA（如 React/Vue 单页应用）的动态加载和虚拟列表会导致 DOM 树不完整
+3. **安全**：Agent 有完整的浏览器权限——理论上可以做任何你在浏览器中能做的事情
+4. **成本**：每步都需要发送截图（约 1000 token），高频使用成本不低
+
+## 什么时候用 Browser Use
+
+| 场景 | 适合 | 不适合 |
+|------|------|--------|
+| 竞品监控 | ✅ 动态页面、频率低 | ❌ 秒级实时监控 |
+| 表单填写 | ✅ 结构多变的表单 | ❌ 固定格式的批量填写 |
+| 数据提取 | ✅ 少量页面、结构不固定 | ❌ 百万级页面爬取 |
+| E2E 测试 | ✅ 探索性测试、冒烟测试 | ❌ 回归测试套件 |
+| RPA 替代 | ✅ 临时性自动化任务 | ❌ 7×24 关键业务流程 |
+
+Browser Use 的定位是"用 AI 处理那些写 Selenium 脚本太麻烦、但手动操作又太重复"的中间地带。它不是要替代 Playwright，而是让那些"本来不值得写自动化脚本"的任务也能自动化。
