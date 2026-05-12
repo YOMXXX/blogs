@@ -59,13 +59,16 @@ export default defineConfig({
     sitemap({
       changefreq: 'weekly',
       priority: 0.7,
-      filter: (page) => !page.includes('/404'),
+      filter: (page) =>
+        !page.includes('/404') &&
+        !page.includes('/tag/') &&
+        !page.includes('/year/'),
       serialize(item) {
         const isPostDetail = /\/posts\/[^/]+$/.test(item.url) && !item.url.endsWith('/posts');
         const isHome = item.url === SITE || item.url === `${SITE}/`;
-        if (isPostDetail) return { ...item, priority: 0.9, changefreq: 'monthly' };
-        if (isHome) return { ...item, priority: 1.0, changefreq: 'daily' };
-        return item;
+        if (isPostDetail) return { ...item, lastmod: new Date().toISOString(), priority: 0.9, changefreq: 'monthly' };
+        if (isHome) return { ...item, lastmod: new Date().toISOString(), priority: 1.0, changefreq: 'daily' };
+        return { ...item, lastmod: new Date().toISOString() };
       },
     }),
   ],
