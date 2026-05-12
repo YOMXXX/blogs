@@ -1,0 +1,239 @@
+---
+title: "KV Cache 压缩技术全景：从 GQA 到量化到 PagedAttention 的工程进化"
+description: "系统梳理 LLM 推理中 KV Cache 的内存瓶颈和五种主流压缩方案——MQA/GQA 减头、KV Cache 量化、PagedAttention 分页、Sliding Window 裁剪、Token Merging 合并——对比精度、延迟、内存和适用场景。"
+column: "paper"
+tags: ["kv-cache", "inference", "optimization", "transformer", "memory"]
+pubDate: 2026-05-12
+featured: false
+tldr: "KV Cache 是 LLM 推理的最大内存瓶颈——Llama 3 70B 处理 128K 上下文时 KV Cache 占 40GB，比模型权重还大。五种压缩方案各有权衡：GQA 在训练时减少 KV 头数（最主流）；KV 量化在推理时把 FP16 压到 INT4（节省 75%）；PagedAttention 用虚拟内存管理消除碎片（vLLM 核心）；Sliding Window 截断老 token（StreamingLLM）；Token Merging 合并相似 token 的 KV。2026 年的最佳实践是 GQA + PagedAttention + 选择性量化的组合。"
+faq:
+  - q: "KV Cache 是什么？为什么它是推理瓶颈？"
+    a: "Transformer 在自回归生成时，每个新 token 需要和前面所有 token 做注意力计算。为了避免重复计算，会把前面 token 的 Key 和 Value 向量缓存起来——这就是 KV Cache。问题是它的大小随序列长度线性增长：一个 70B 模型处理 128K token 时 KV Cache 约 40GB，甚至超过模型权重本身。"
+  - q: "GQA 和 MQA 的区别是什么？"
+    a: "MQA（Multi-Query Attention）让所有注意力头共享同一组 KV，KV Cache 缩小到原来的 1/N（N 是头数）。GQA（Grouped-Query Attention）是折中方案——将注意力头分成 G 组，每组共享一组 KV，Cache 缩小到 1/G。GQA 在精度和内存之间取得了更好的平衡，是 Llama 3、Gemma 4 等主流模型的标配。"
+  - q: "KV Cache 量化会影响输出质量吗？"
+    a: "影响很小。实验表明 KV Cache 从 FP16 量化到 INT8 几乎无损（Perplexity 变化 <0.1%），INT4 的损失约 0.5-2%。Key 向量对量化更敏感（因为它参与注意力分数计算），Value 向量更鲁棒。最佳实践是 Key 用 INT8、Value 用 INT4 的混合方案，或对前几层保持 FP16、后面层用 INT4。"
+  - q: "PagedAttention 的核心创新是什么？"
+    a: "PagedAttention 把操作系统的虚拟内存管理概念引入了 KV Cache 管理。传统方式为每个请求预分配连续的最大长度内存（造成 60-80% 的浪费），PagedAttention 把 KV Cache 切成固定大小的 Block，按需分配、动态释放——就像操作系统的分页内存。这让 vLLM 的吞吐量比 HuggingFace 原生推理高 2-4 倍。"
+  - q: "这些优化技术可以叠加使用吗？"
+    a: "可以且推荐叠加。2026 年的最佳组合是：模型层面用 GQA（训练时确定）→ 推理框架用 PagedAttention（vLLM/SGLang）→ KV Cache 用 INT4/INT8 量化 → 超长序列场景额外加 Sliding Window 或 Attention Sink。这些技术作用于不同层面，互不冲突。叠加后 KV Cache 内存可以压缩到原来的 1/16。"
+author: "YOMXXX"
+---
+
+## KV Cache：房间里的大象
+
+讨论 LLM 推理优化时，大多数人关注模型权重——量化、蒸馏、剪枝。但在长上下文场景中，**KV Cache 才是真正的内存杀手**。
+
+一个直观的数据：
+
+| 模型 | 权重大小 (FP16) | KV Cache (128K 上下文) | KV / 权重 |
+|------|----------------|----------------------|----------|
+| Llama 3 8B | 16 GB | 8 GB | 0.5x |
+| Llama 3 70B | 140 GB | 40 GB | 0.29x |
+| Llama 3 70B (1M 上下文) | 140 GB | 312 GB | 2.2x |
+
+当上下文达到 1M token 时，KV Cache 是模型权重的 **2.2 倍**。
+
+这就是为什么 Claude 的 200K 上下文和 Gemini 的 2M 上下文在工程上如此有挑战——不是模型不够强，是 KV Cache 放不下。
+
+## KV Cache 的基本结构
+
+每一层 Transformer 的每个注意力头都维护一对 Key/Value 向量序列：
+
+```
+KV Cache 大小 = 2 × num_layers × num_kv_heads × head_dim × seq_len × dtype_size
+```
+
+以 Llama 3 70B 为例：
+
+```
+2 × 80 层 × 8 KV头(GQA) × 128 维 × 128K tokens × 2 bytes(FP16)
+= 2 × 80 × 8 × 128 × 131072 × 2
+= 约 34 GB
+```
+
+每增加 1K token，KV Cache 增长约 **265 MB**。
+
+## 五种压缩方案
+
+### 方案 1: MQA / GQA（模型架构级）
+
+**核心思想**：减少 KV 头的数量。
+
+标准 Multi-Head Attention 中，每个注意力头都有独立的 Q、K、V 投影。KV Cache 大小和注意力头数成正比。
+
+**MQA（Multi-Query Attention）**：所有 Q 头共享同一组 K 和 V。
+
+```
+标准 MHA:  64 个 Q 头 × 64 个 KV 头 → KV Cache = 64 份
+MQA:      64 个 Q 头 × 1 个 KV 头  → KV Cache = 1 份（缩小 64 倍）
+```
+
+**GQA（Grouped-Query Attention）**：折中方案——将 64 个 Q 头分成 8 组，每组共享一个 KV 头。
+
+```
+GQA:      64 个 Q 头 ÷ 8 组 = 8 个 KV 头 → KV Cache = 8 份（缩小 8 倍）
+```
+
+| 方法 | KV Cache 缩小倍数 | 精度损失 | 代表模型 |
+|------|-------------------|---------|---------|
+| MHA | 1x（基线）| 无 | GPT-3 |
+| GQA (8 组) | 8x | <0.5% | Llama 3, Gemma 4 |
+| MQA (1 组) | 64x | 1-3% | Falcon, PaLM |
+
+GQA 是 2026 年的主流选择——几乎所有新模型都默认使用。
+
+### 方案 2: KV Cache 量化（推理级）
+
+**核心思想**：把 KV Cache 的数据类型从 FP16 压缩到 INT8/INT4。
+
+```
+FP16: 每个值 2 bytes  → INT8: 1 byte → INT4: 0.5 byte
+```
+
+#### 精度影响
+
+KV Cache 量化的精度影响比权重量化小得多——因为 KV 值的分布范围较窄且变化平稳。
+
+| 量化方案 | 内存节省 | Perplexity 变化 | 推荐场景 |
+|----------|---------|----------------|---------|
+| FP16 (基线) | 0% | 0 | 精度优先 |
+| INT8 | 50% | <0.1% | 通用推荐 |
+| INT4 (K) + INT4 (V) | 75% | 0.5-2% | 内存受限 |
+| INT8 (K) + INT4 (V) | 62.5% | 0.2-0.5% | 最佳平衡 |
+
+Key 向量对量化更敏感（参与 Softmax 前的内积计算），建议用更高精度。
+
+#### vLLM 中的使用
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="meta-llama/Llama-3-70B",
+    kv_cache_dtype="fp8",  # FP8 量化 KV Cache
+    quantization="awq",     # 权重 AWQ 量化
+)
+```
+
+### 方案 3: PagedAttention（内存管理级）
+
+**核心思想**：用操作系统的分页内存管理思想解决 KV Cache 的碎片问题。
+
+#### 传统方式的问题
+
+传统推理框架为每个请求预分配**最大可能长度**的连续内存：
+
+```
+请求 A: max_tokens=2048, 实际只用了 500 → 浪费 1548 tokens 的内存
+请求 B: max_tokens=2048, 实际只用了 300 → 浪费 1748 tokens 的内存
+```
+
+平均浪费率 **60-80%**。
+
+#### PagedAttention 的解决方案
+
+把 KV Cache 切成固定大小的 **Block**（如每 block 16 tokens），用一个 **Block Table** 管理映射：
+
+```
+请求 A: 500 tokens → 分配 32 个 Block → 只用 32 × 16 × 2 bytes
+请求 B: 300 tokens → 分配 19 个 Block → 只用 19 × 16 × 2 bytes
+
+Block 不需要物理连续 → 无碎片
+用完即释放 → 无浪费
+```
+
+#### 性能数据
+
+| 指标 | 传统（HuggingFace） | PagedAttention（vLLM） |
+|------|--------------------|--------------------|
+| 内存利用率 | 20-40% | 95%+ |
+| 并发吞吐量 | 1x | 2-4x |
+| 最大并发请求 | N | 3-5N |
+
+PagedAttention 是 vLLM 的核心创新，也是它成为 2026 年生产推理引擎首选的原因。
+
+### 方案 4: Sliding Window Attention（序列级）
+
+**核心思想**：只保留最近 W 个 token 的 KV Cache，丢弃更早的。
+
+```
+完整 KV Cache:  [t1, t2, t3, ..., t998, t999, t1000]  → 1000 份
+滑动窗口 (W=256): [                 ..., t745, ..., t1000]  → 256 份
+```
+
+Mistral 7B 原生使用 4096 的滑动窗口。配合 Attention Sink（保留前 4 个 token），内存恒定。
+
+| 方法 | 内存 | 精度 | 适用场景 |
+|------|------|------|---------|
+| 完整 Cache | O(n) | 100% | 短/中上下文 |
+| 滑动窗口 | O(W) | 90-95% | 流式推理 |
+| 滑动窗口 + Sink | O(W+K) | 95-98% | 长文本流式 |
+
+### 方案 5: Token Merging / Eviction（精细级）
+
+**核心思想**：智能地合并或淘汰不重要的 KV 对。
+
+#### H2O（Heavy-Hitter Oracle）
+
+观察发现：注意力权重高度集中——5% 的 token 接收了 80%+ 的注意力。H2O 保留高注意力的"重要 token"和最近的"窗口 token"，淘汰中间的"不重要 token"。
+
+```
+保留策略: Top-K(attention_score) ∪ Recent(window_size)
+```
+
+#### SnapKV
+
+在生成第一个 token 前，用一次注意力计算识别出"关键 token"（KV 对），然后在后续生成中只保留这些关键 KV 对。
+
+```
+原始: 10000 tokens KV Cache
+SnapKV 压缩后: 1000 tokens KV Cache (保留最关键的 10%)
+压缩比: 10x
+精度损失: <2% (在 LongBench 上)
+```
+
+## 组合使用：最佳实践
+
+```
+模型层面:  GQA (训练时确定)           → KV 头数 ÷8
+    ↓
+推理框架:  PagedAttention (vLLM)      → 内存碎片 → 0
+    ↓
+数值精度:  KV Cache FP8/INT8 量化     → 内存 ÷2
+    ↓
+序列策略:  SnapKV / H2O (可选)        → 内存 ÷2-5
+    ↓
+总压缩:   8 × 1 × 2 × 3 = ~48x
+```
+
+以 Llama 3 70B + 128K 上下文为例：
+
+| 配置 | KV Cache 大小 |
+|------|-------------|
+| MHA + FP16 + 传统分配 | 160 GB（含碎片） |
+| GQA + FP16 + 传统分配 | 34 GB |
+| GQA + FP16 + PagedAttention | 20 GB（消除碎片） |
+| GQA + FP8 + PagedAttention | 10 GB |
+| GQA + INT4 + PagedAttention + SnapKV | 3 GB |
+
+从 160 GB 压到 3 GB——**53 倍压缩**。
+
+## 2026 年的推理引擎对比
+
+| 引擎 | PagedAttention | KV 量化 | Token Eviction | 推荐场景 |
+|------|---------------|---------|---------------|---------|
+| vLLM | ✅ | FP8 | ❌ | 高并发在线服务 |
+| SGLang | ✅ | FP8/INT4 | ✅ (RadixAttention) | Agent 场景 |
+| TensorRT-LLM | ✅ | FP8/INT4 | ❌ | NVIDIA GPU 极致性能 |
+| llama.cpp | ❌ | Q4/Q8 | ❌ | 本地/边缘部署 |
+
+## 总结
+
+KV Cache 压缩是 LLM 推理工程中最"务实"的优化方向——不需要重新训练模型，不需要改变应用逻辑，只需要在推理层做配置调整。
+
+2026 年的最佳实践：
+1. **选 GQA 模型**——新模型基本都是 GQA，不需要额外操作
+2. **用 vLLM/SGLang**——PagedAttention 是标配
+3. **开启 KV Cache FP8 量化**——几乎无损地节省 50% 内存
+4. **超长序列加 SnapKV/H2O**——按需选择性压缩

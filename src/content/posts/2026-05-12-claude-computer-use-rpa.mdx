@@ -1,0 +1,280 @@
+---
+title: "Claude Computer Use 构建 RPA：实战可行但成本是传统方案的 45 倍"
+description: "用 Claude 的 Computer Use 能力构建自动化 RPA 工作流——从截图理解到鼠标键盘操作的完整链路，对比传统 RPA（UiPath/Power Automate）的成本、可靠性和维护性，附真实场景的成本核算。"
+column: "workshop"
+tags: ["computer-use", "rpa", "automation", "claude", "cost-analysis"]
+pubDate: 2026-05-12
+featured: false
+tldr: "Claude Computer Use 让 AI 能像人一样操控电脑——看屏幕截图 → 理解界面 → 执行点击/输入操作。用它替代传统 RPA 的优势是零脚本维护（界面变了不用改代码），但成本是传统 RPA 的 45 倍（$4.50/任务 vs $0.10/任务）。适合低频、高变化、需要理解力的自动化场景；不适合高频、固定流程的批量操作。"
+faq:
+  - q: "Claude Computer Use 是什么？"
+    a: "Computer Use 是 Anthropic 推出的一项 API 能力，让 Claude 模型能接收屏幕截图、理解界面内容，并输出鼠标点击坐标和键盘输入指令。它不直接控制你的电脑——你需要编写代码来接收 Claude 的操作指令，然后通过 PyAutoGUI 等工具执行实际操作。本质上是'用视觉理解驱动的 RPA'。"
+  - q: "Computer Use 和传统 RPA 的本质区别是什么？"
+    a: "传统 RPA（如 UiPath）通过 DOM 选择器或图像模板定位界面元素——如果按钮位置移动了 10 像素，脚本就会失败。Computer Use 通过截图理解页面语义——它'知道'那个绿色按钮是'提交'按钮，即使位置、颜色、大小变了也能识别。代价是每次操作都需要调用 LLM API，成本和延迟远高于本地脚本。"
+  - q: "一次 Computer Use 操作大概要多少钱？"
+    a: "一次操作（截图→分析→执行）约消耗 2000-4000 input tokens（主要是截图）+ 100-200 output tokens。以 Claude Sonnet 4.6 计算，每次操作成本约 $0.01-0.02。一个包含 20-30 步操作的完整 RPA 任务约 $0.30-0.60。如果有重试和错误恢复，实际成本可能翻倍到 $0.60-1.20。"
+  - q: "Computer Use 的操作准确率有多高？"
+    a: "在 OSWorld 基准上，Claude 的 Computer Use 准确率约 22%（完整任务完成率）。单步操作的准确率约 85-90%——即每一步有 10-15% 的概率出错。对于一个 20 步的任务，全部正确的概率只有 12-20%。生产环境必须加入检查点、错误检测和自动重试机制来提升端到端成功率。"
+  - q: "什么场景应该用 Computer Use 而不是传统 RPA？"
+    a: "三类场景：1) 界面频繁变化的应用（如每周更新 UI 的 SaaS）——传统 RPA 要反复维护选择器，Computer Use 自适应；2) 操作需要'理解力'的流程——如根据邮件内容判断该填哪个表单字段；3) 一次性或低频自动化——写 RPA 脚本的时间成本 > 手动操作的时间，但 Computer Use 可以零开发直接执行。反之，高频固定流程应该用传统 RPA。"
+author: "YOMXXX"
+---
+
+## 前情提要
+
+Hacker News 上有一篇热帖："Computer Use is 45x more expensive than structured APIs"（Computer Use 比结构化 API 贵 45 倍）。
+
+这不是黑文——这是工程现实。但"贵 45 倍"不意味着"不该用"。本文用实际案例说清楚：什么时候用 Computer Use，什么时候该用传统方案。
+
+## Computer Use 的工作原理
+
+### 完整交互循环
+
+```
+1. 程序截取当前屏幕 → 发送截图给 Claude API
+2. Claude 分析截图 → 理解界面元素和当前状态
+3. Claude 输出操作指令 → { "type": "click", "x": 340, "y": 520 }
+4. 程序执行操作 → PyAutoGUI.click(340, 520)
+5. 等待界面更新 → 重新截图 → 回到步骤 1
+```
+
+每一步都需要一次 API 调用（约 2000+ tokens 的截图 + 响应），这是成本高的根本原因。
+
+### Python 实现
+
+```python
+import anthropic
+import pyautogui
+import base64
+from PIL import ImageGrab
+
+client = anthropic.Anthropic()
+
+def get_screenshot() -> str:
+    """截取屏幕并转为 base64"""
+    screenshot = ImageGrab.grab()
+    screenshot = screenshot.resize((1280, 720))
+    buffer = io.BytesIO()
+    screenshot.save(buffer, format="PNG")
+    return base64.standard_b64encode(buffer.getvalue()).decode()
+
+async def computer_use_step(task: str, screenshot_b64: str) -> dict:
+    """单步 Computer Use 调用"""
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system="你是一个桌面自动化助手。根据截图和任务描述，输出下一步操作。",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": f"任务：{task}\n请输出下一步操作（JSON 格式）。",
+                    },
+                ],
+            },
+        ],
+        tools=[
+            {
+                "type": "computer_20241022",
+                "name": "computer",
+                "display_width_px": 1280,
+                "display_height_px": 720,
+            },
+        ],
+    )
+    return response
+
+def execute_action(action: dict):
+    """执行 Claude 返回的操作"""
+    if action["type"] == "click":
+        pyautogui.click(action["x"], action["y"])
+    elif action["type"] == "type":
+        pyautogui.typewrite(action["text"], interval=0.05)
+    elif action["type"] == "key":
+        pyautogui.hotkey(*action["keys"])
+    elif action["type"] == "scroll":
+        pyautogui.scroll(action["amount"])
+```
+
+### 完整任务循环
+
+```python
+async def run_task(task: str, max_steps: int = 30):
+    for step in range(max_steps):
+        screenshot = get_screenshot()
+        response = await computer_use_step(task, screenshot)
+
+        # 解析 Claude 的工具调用
+        for block in response.content:
+            if block.type == "tool_use":
+                action = block.input
+                execute_action(action)
+                time.sleep(1)  # 等待界面更新
+
+            if block.type == "text" and "任务完成" in block.text:
+                return {"status": "success", "steps": step + 1}
+
+    return {"status": "max_steps_reached", "steps": max_steps}
+```
+
+## 成本对比：冷酷的数字
+
+### 场景：每日报销单填写（20 步操作）
+
+| 方案 | 开发时间 | 单次执行成本 | 月执行成本 (30次) | 维护成本/月 |
+|------|---------|------------|----------------|-----------|
+| 手动操作 | 0 | $0 (10 分钟人工) | $150 (人工成本) | $0 |
+| 传统 RPA (UiPath) | 8 小时 | $0.10 | $3 | $2-4 小时/月 |
+| Computer Use | 0.5 小时 | $0.60 | $18 | ~0 |
+| Browser Use | 0.5 小时 | $0.40 | $12 | ~0 |
+
+### 场景：批量数据录入（100 条/天，每条 15 步）
+
+| 方案 | 单条成本 | 日成本 | 月成本 |
+|------|---------|--------|--------|
+| 传统 RPA | $0.01 | $1 | $30 |
+| Computer Use | $0.45 | $45 | $1,350 |
+
+**批量场景下 Computer Use 贵 45 倍**——这就是 HN 热帖的数据来源。
+
+### 场景：一次性数据迁移（只执行一次）
+
+| 方案 | 开发时间 | 执行成本 | 总成本 |
+|------|---------|---------|--------|
+| 写 Python 脚本 | 4 小时 | ~$0 | $400 (工时) |
+| 传统 RPA | 8 小时 | $0.10 | $800 (工时) |
+| Computer Use | 0 | $5 | $5 |
+
+**一次性任务 Computer Use 碾压**——省了几百美元的开发时间。
+
+## 可靠性对比
+
+### OSWorld 基准测试
+
+OSWorld 是评估 Computer Use 能力的标准基准，包含跨操作系统的真实桌面任务：
+
+| 模型 | 任务完成率 |
+|------|-----------|
+| Claude Sonnet 4.6 (Computer Use) | ~22% |
+| GPT-4o (Computer Use) | ~17% |
+| 人类 | ~72% |
+
+22% 的完成率意味着：**每 5 个任务只有 1 个能完全自动完成**。
+
+但在受控环境（固定应用、固定流程）中，成功率可以显著提升到 60-80%，通过以下手段：
+
+### 提升可靠性的工程策略
+
+```python
+async def reliable_task(task: str):
+    """带检查点和重试的可靠执行"""
+    checkpoints = [
+        "打开报销系统",
+        "填写基本信息",
+        "上传附件",
+        "点击提交",
+    ]
+
+    for i, checkpoint in enumerate(checkpoints):
+        success = False
+        for attempt in range(3):  # 每个检查点最多重试 3 次
+            result = await run_subtask(
+                f"{task} - 当前步骤：{checkpoint}",
+                verify_prompt=f"检查截图，确认'{checkpoint}'是否完成"
+            )
+            if result["verified"]:
+                success = True
+                break
+            else:
+                # 截图保存，供人工排查
+                save_debug_screenshot(f"checkpoint_{i}_attempt_{attempt}")
+
+        if not success:
+            notify_human(f"任务卡在检查点 '{checkpoint}'，请人工接管")
+            return {"status": "escalated", "checkpoint": checkpoint}
+
+    return {"status": "success"}
+```
+
+### 可靠性对比
+
+| 方案 | 单步准确率 | 20步任务完成率 | 界面变化适应性 |
+|------|-----------|-------------|-------------|
+| 传统 RPA | 99.5% | 90% | ❌ 需要维护 |
+| Computer Use | 88% | 8% (无重试) | ✅ 自适应 |
+| Computer Use (带重试+检查点) | 88% | 60-70% | ✅ 自适应 |
+
+传统 RPA 的高可靠性来自"精确匹配"——但一旦界面变化就完全失效。Computer Use 的低可靠性来自"视觉理解"——模糊但鲁棒。
+
+## 什么时候该用 Computer Use
+
+### 适合的场景
+
+1. **一次性任务**——写脚本不值得，但手动太麻烦
+2. **界面频繁变化**——传统 RPA 脚本维护成本太高
+3. **需要"判断力"的操作**——根据内容理解决定下一步
+4. **快速原型**——先用 Computer Use 验证自动化可行性，再决定是否写正式 RPA
+
+### 不适合的场景
+
+1. **高频批量操作**——成本不可接受
+2. **可靠性要求 >99%**——当前准确率达不到
+3. **有 API 可用的场景**——直接调 API 比操控 GUI 快 100 倍、便宜 45 倍
+4. **实时性要求高**——每步 2-3 秒的 API 延迟不可接受
+
+### 决策矩阵
+
+```
+有 API / Structured Output 方案？
+  → 是 → 用 API ✅（成本低、可靠、快）
+  → 否 ↓
+
+固定流程 + 高频（>10次/天）？
+  → 是 → 传统 RPA ✅（UiPath/Power Automate）
+  → 否 ↓
+
+一次性或低频（<5次/天）？
+  → 是 → Computer Use ✅（零开发成本）
+  → 否 ↓
+
+界面频繁变化？
+  → 是 → Computer Use ✅（维护成本为零）
+  → 否 → 传统 RPA ✅
+```
+
+## 和 Browser Use 的对比
+
+| 维度 | Computer Use | Browser Use |
+|------|-------------|-------------|
+| 操控范围 | 整个桌面（任何应用） | 仅浏览器 |
+| 感知方式 | 截图（Vision） | 截图 + DOM 树 |
+| 定位精度 | 低（像素坐标） | 高（CSS 选择器） |
+| 成本 | ~$0.02/步 | ~$0.01/步 |
+| 可靠性 | 较低 | 较高（有 DOM 辅助） |
+| 适用场景 | 桌面应用、非 Web 系统 | 网页操作 |
+
+**如果你的自动化目标是网页应用，优先用 Browser Use**——它有 DOM 树辅助定位，比纯截图的 Computer Use 更准确、更便宜。
+
+Computer Use 的不可替代场景是**非 Web 应用**——桌面软件（SAP、Excel）、原生 App、远程桌面等。
+
+## 总结
+
+Computer Use 是 AI 自动化工具箱中的"最后手段"——当没有 API、没有结构化接口、传统 RPA 维护成本太高时，它是唯一的选择。
+
+核心要点：
+1. **有 API 就用 API**——成本低 45 倍、速度快 100 倍
+2. **高频固定流程用传统 RPA**——可靠性高、成本低
+3. **低频/一次性/高变化场景用 Computer Use**——零开发成本，接受较低可靠性
+4. **网页自动化优先用 Browser Use**——DOM 辅助比纯截图更准确
+
+别被"AI 操控电脑"的酷炫感迷惑——工程选型看的是 **成本 × 可靠性 × 维护性**，不是技术先进性。
