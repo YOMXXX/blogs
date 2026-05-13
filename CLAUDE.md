@@ -18,7 +18,7 @@ Astro 5 + TypeScript + Tailwind CSS 4 + MDX 技术博客，部署在 Cloudflare 
 title: "标题"                    # 8-100 字符
 description: "描述"              # 80-160 字符
 column: "workshop"               # workshop | long-form | paper | tools | weekly
-tags: ["tag1", "tag2"]           # 1-8 个标签
+tags: ["tag1", "tag2"]           # 1-8 个标签，禁止包含 / 等特殊字符
 pubDate: YYYY-MM-DD              # 实际发布日期
 featured: false                  # 慎用，精选文章才设为 true
 tldr: "摘要"                     # 50-300 字符

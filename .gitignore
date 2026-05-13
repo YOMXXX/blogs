@@ -11,6 +11,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 *.log
+logs/
 
 # env
 .env
@@ -29,3 +30,4 @@ docs/superpowers/
 
 # test coverage
 coverage/
+scripts/daily-write.sh
