@@ -4,6 +4,7 @@ import react from '@astrojs/react';
 import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
 import AstroPWA from '@vite-pwa/astro';
+import rehypeExternalLinks from 'rehype-external-links';
 const SITE = 'https://yomxxx.com';
 
 export default defineConfig({
@@ -80,5 +81,8 @@ export default defineConfig({
       theme: 'github-dark-dimmed',
       wrap: true,
     },
+    rehypePlugins: [
+      [rehypeExternalLinks, { target: '_blank', rel: ['nofollow', 'noopener', 'noreferrer'] }],
+    ],
   },
 });

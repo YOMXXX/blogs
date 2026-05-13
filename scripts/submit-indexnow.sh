@@ -1,5 +1,5 @@
 #!/bin/bash
-# 批量提交 URL 到 IndexNow（Bing / Yandex / Seznam / Naver）
+# 批量提交 URL 到 IndexNow（Bing / Yandex）+ 百度推送
 # 用法:
 #   ./scripts/submit-indexnow.sh          # 提交 sitemap 中所有 URL
 #   ./scripts/submit-indexnow.sh --new    # 仅提交今天新增的文章
@@ -27,10 +27,10 @@ KEY=$(cat "$KEY_FILE" | tr -d '[:space:]')
 # ===== 获取 URL 列表 =====
 if [ "${1:-}" = "--new" ]; then
   DATE=$(date +%Y-%m-%d)
-  URLS=$(curl -s "$SITEMAP_URL" | grep -oP '<loc>[^<]+</loc>' | sed 's/<\/?loc>//g' | grep "$DATE")
+  URLS=$(curl -s "$SITEMAP_URL" | sed 's/</\n</g' | sed -n 's/.*<loc>\([^<]*\).*/\1/p' | grep "$DATE")
   echo "仅提交今天 ($DATE) 的新文章"
 else
-  URLS=$(curl -s "$SITEMAP_URL" | grep -oP '<loc>[^<]+</loc>' | sed 's/<\/?loc>//g')
+  URLS=$(curl -s "$SITEMAP_URL" | sed 's/</\n</g' | sed -n 's/.*<loc>\([^<]*\).*/\1/p')
   echo "提交 sitemap 中所有 URL"
 fi
 
@@ -80,10 +80,20 @@ for engine in "${ENGINES[@]}"; do
   esac
 done
 
+# ===== 百度推送 =====
+BAIDU_TOKEN="24zogxFaojNFvmKE"
+echo -n "提交到 百度 ... "
+BAIDU_RESULT=$(echo "$URLS" | curl -s -H 'Content-Type:text/plain' --data-binary @- \
+  "http://data.zz.baidu.com/urls?site=$SITE&token=$BAIDU_TOKEN")
+
+if echo "$BAIDU_RESULT" | grep -q '"success"'; then
+  SUCCESS=$(echo "$BAIDU_RESULT" | sed -n 's/.*"success":\([0-9]*\).*/\1/p')
+  REMAIN=$(echo "$BAIDU_RESULT" | sed -n 's/.*"remain":\([0-9]*\).*/\1/p')
+  echo "成功 ${SUCCESS} 条，今日剩余配额 ${REMAIN}"
+else
+  MSG=$(echo "$BAIDU_RESULT" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+  echo "失败: ${MSG:-$BAIDU_RESULT}"
+fi
+
 echo ""
-echo "完成！Bing/Yandex 通常 24 小时内处理。"
-echo ""
-echo "Google 不支持 IndexNow，请手动操作："
-echo "  1. 打开 https://search.google.com/search-console"
-echo "  2. 站点地图 → 提交 sitemap-index.xml"
-echo "  3. 网址检查 → 逐个提交重点页面"
+echo "完成！"

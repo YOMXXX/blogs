@@ -1,18 +1,19 @@
-const DEFAULT_WPM = 200;
+const CJK_CPM = 500;
+const LATIN_WPM = 200;
 
-/**
- * Estimate reading time in minutes (rounded up).
- * Strips code fences and markdown link syntax before word count.
- */
-export function readingTime(content: string, wpm = DEFAULT_WPM): string {
+export function readingTime(content: string): string {
   const stripped = content
-    .replace(/```[\s\S]*?```/g, '')          // fenced code blocks
-    .replace(/`[^`]+`/g, '')                  // inline code
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')  // markdown links
-    .replace(/[#*_>~-]/g, ' ')                // markdown punctuation
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`]+`/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[#*_>~-]/g, ' ')
     .trim();
 
-  const wordCount = stripped.length === 0 ? 0 : stripped.split(/\s+/).length;
-  const minutes = Math.max(1, Math.ceil(wordCount / wpm));
+  const cjk = stripped.match(/[一-鿿㐀-䶿]/g);
+  const cjkCount = cjk ? cjk.length : 0;
+  const latin = stripped.replace(/[一-鿿㐀-䶿]/g, ' ').trim();
+  const latinCount = latin.length === 0 ? 0 : latin.split(/\s+/).filter(Boolean).length;
+
+  const minutes = Math.max(1, Math.ceil(cjkCount / CJK_CPM + latinCount / LATIN_WPM));
   return `${minutes} min read`;
 }

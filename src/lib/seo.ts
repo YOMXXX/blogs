@@ -35,9 +35,7 @@ export function buildArticleSchema(input: ArticleSchemaInput): ArticleSchema {
     image: input.image,
     mainEntityOfPage: url,
   };
-  if (input.updatedDate) {
-    schema.dateModified = input.updatedDate.toISOString();
-  }
+  schema.dateModified = (input.updatedDate ?? input.pubDate).toISOString();
   return schema;
 }
 

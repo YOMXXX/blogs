@@ -26,8 +26,14 @@ describe('readingTime', () => {
     expect(result).toMatch(/^\d+ min read$/);
   });
 
-  it('honors custom wpm override', () => {
-    const text = Array.from({ length: 600 }, () => 'word').join(' ');
-    expect(readingTime(text, 300)).toBe('2 min read');
+  it('counts CJK characters correctly', () => {
+    const text = '中'.repeat(500);
+    expect(readingTime(text)).toBe('1 min read');
+  });
+
+  it('handles mixed CJK and Latin', () => {
+    const cjk = '中'.repeat(500);
+    const latin = Array.from({ length: 200 }, () => 'word').join(' ');
+    expect(readingTime(cjk + ' ' + latin)).toBe('2 min read');
   });
 });
