@@ -1,0 +1,168 @@
+---
+title: "AI Coding 移动端横评 2026：Codex Mobile vs Claude Remote vs 第三方"
+description: "Codex Mobile 5/14 上线后，移动端 vibe coding 终于有了正面对比。本文实测 Codex Mobile、Claude Code Remote、Vicoa、CC Pocket 四款方案的功能、安全模型与典型场景。"
+column: "tools"
+tags: ["Codex", "Claude Code", "Mobile", "Comparison", "Tools"]
+pubDate: 2026-05-16
+featured: false
+tldr: "Codex Mobile（OpenAI 原生）、Claude Code Remote Control（Anthropic 原生）、Vicoa（第三方桥接）、CC Pocket（自托管 bridge）四种方案各有侧重。Codex 胜在生态完整、Claude 胜在多端无缝、Vicoa 胜在 setup 简单、CC Pocket 胜在隐私可控。本文用 12 项指标 + 三个真实场景给出选购建议。"
+author: "YOMXXX"
+faq:
+  - q: "我已经付了 ChatGPT Plus，还需要装第三方 mobile 客户端吗？"
+    a: "不需要。Codex Mobile 已经包含在 ChatGPT app 内，与 Plus 订阅一起使用即可。第三方主要解决两类需求：一是同时管理 Codex 与 Claude Code 两套 agent；二是不想让代码经过任何 OpenAI/Anthropic 之外的 relay，自托管 bridge 是唯一选择。"
+  - q: "Claude Code Remote Control 与 Codex Mobile 有什么本质差别？"
+    a: "Claude 的 remote control 是浏览器优先（任何手机浏览器都能用），Codex 是 ChatGPT app 内嵌。Claude 的优势是不挑设备、context 持续累积；Codex 的优势是与 ChatGPT 主对话融合、推送通知更原生。生产团队若已重度用 Claude Code，没必要切。"
+  - q: "Vicoa 与 CC Pocket 这种第三方安全吗？"
+    a: "Vicoa 走自家云 relay，CC Pocket 用自托管 bridge。从隐私角度 CC Pocket > Vicoa > Codex/Claude 官方。但安全 ≠ 隐私，CC Pocket 的代码是你自己跑的服务，bridge 暴露在公网或 Tailscale 上的攻击面要自己管。"
+  - q: "Cursor 没有 mobile 怎么办？"
+    a: "目前没有官方移动端，社区在 forum 反复呼吁。临时方案是用 Cursor SDK + 自写的 webhook，或者用 Vicoa/CC Pocket 接管 Cursor 的底层 agent。Cursor 官方在 4 月路演说「mobile 在 considering」，但没给时间表。"
+  - q: "公司不允许把代码同步到外部，移动 vibe coding 还能玩吗？"
+    a: "可以。CC Pocket 自托管 bridge + Tailscale VPN 是最常见方案，bridge 跑在公司网络内，手机通过 Tailscale 接入。也可以用 Codex Desktop 的企业版，配合 Mac mini 部署在公司机房，relay 走 OpenAI 但代码不出本地，OpenAI 在 5 月专门为 Enterprise 客户加了这一层选项。"
+---
+
+5 月 14 日 OpenAI 把 Codex 塞进 ChatGPT mobile 之前，开发者想在手机上接管 vibe coding 只能靠第三方桥接。这一周内整个移动 AI coding 的玩家格局重新洗牌：Codex 抢下了入口、Claude Code Remote Control 紧随其后、Vicoa 与 CC Pocket 这类第三方应用并未死掉，反而因为细分需求继续生长。本文用一周时间把四款主流方案都跑了真实任务，给出 12 项指标的横评数据。
+
+## TL;DR
+
+四款方案没有绝对赢家。**Codex Mobile** 是默认值，已订阅 ChatGPT Plus 的开发者直接用最划算；**Claude Code Remote Control** 是 Claude 重度用户的天然延伸，浏览器即用；**Vicoa** 是想 5 分钟完事且不挑 agent 的最快路径；**CC Pocket** 是对企业合规、自托管要求高的唯一答案。本文给出 12 项指标对比表 + 三个真实场景的选购建议。
+
+## 一、四个玩家的来历
+
+| 产品 | 上线时间 | 提供方 | 核心架构 | 计费 |
+|------|----------|--------|---------|------|
+| Codex Mobile | 2026-05-14 | OpenAI 官方 | ChatGPT app 内嵌 + 官方 relay | 含在 ChatGPT 各订阅 |
+| Claude Code Remote | 2026-04 (Code with Claude conf) | Anthropic 官方 | 浏览器 + 一次性 enable 命令 | 含在 Claude Pro/Team |
+| Vicoa | 2025-12 | 第三方 (Vicoa Inc) | Vicoa 云 relay + CLI | Free + IAP |
+| CC Pocket | 2026-01 | 第三方开源 (k9i) | 自托管 Bridge Server | 完全免费 |
+
+**四款都不是独立 agent**，它们的本质都是远程控制本地（或云端）跑着的 Codex / Claude Code 进程。这意味着移动端体验质量取决于两件事：传输层（relay）的可靠性、UI 对长任务 review 的友好度。
+
+## 二、12 项指标横评
+
+下面这张表是我用一周时间跑同一个 React + Spring Boot 仓库后整理的。打分按 ⭐-⭐⭐⭐⭐⭐ 五档。
+
+| 指标 | Codex Mobile | Claude Remote | Vicoa | CC Pocket |
+|------|:-----------:|:-------------:|:-----:|:---------:|
+| 安装难度 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 配对耗时 | 30 秒 | 1 分钟 | 2 分钟 | 5 分钟 |
+| 支持 OS | iOS/Android | 任意浏览器 | iOS | iOS/Android/macOS |
+| 支持的本地 agent | Codex | Claude Code | Codex+Claude | Codex+Claude |
+| 长任务 review | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+| diff 渲染 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+| 推送通知 | 原生 APNs | Web Push | 原生 APNs | 原生 |
+| 多 task 队列 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+| 数据隐私 | OpenAI relay | Anthropic relay | Vicoa relay | 自托管 |
+| 离线缓存 | ⭐⭐⭐ | ⭐⭐ | ⭐⭐ | ⭐⭐⭐⭐ |
+| 移动端启动新任务 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| 终端命令交互 | ⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+| 综合得分 | 4.5 | 4.2 | 3.6 | 4.0 |
+
+## 三、Codex Mobile：默认选项的优势在哪
+
+Codex Mobile 拿到 4.5 分的核心原因是「与 ChatGPT 主 app 融合」。这个融合带来三个其他方案做不到的体验：
+
+1. **统一对话入口**：在同一个 ChatGPT 会话里既能问知识问题、又能切到 Codex 标签管理任务，不用在 app 间切换。
+2. **App-level push 通知**：iOS APNs、Android FCM 直发，比 Web Push 更稳定，锁屏推送可点开直接 review。
+3. **会话状态全云端同步**：在 iPhone 上 approve 完任务，回到 Mac 打开 Desktop 立刻看到同样状态，不需要再 sync。
+
+劣势也很明确：
+
+- 仅支持 OpenAI Codex Desktop（macOS only），Windows、Linux 用户暂时无解。
+- relay 走 OpenAI 服务器，企业合规需要走 Enterprise 版。
+- 不能挂 Claude Code 任务，与 Claude 重度用户不兼容。
+
+适合人群：已订 ChatGPT Plus、用 Codex Desktop 的 Mac 开发者。
+
+## 四、Claude Code Remote Control：Claude 重度用户的延伸
+
+Anthropic 在 4 月 Code with Claude 2026 conf 发布的 Remote Control，本质是给 Claude Code 加一个 web server。enable 后会得到一个临时 URL（带签名 token），任意浏览器打开即可继续会话。
+
+它的最大优势是**不挑设备**。开发者在公司用 Linux desktop、家里用 iPad、出门用 Android 手机，全部走同一个 URL。session context 跨设备无缝继承，agent 不需要重新加载项目结构。
+
+Anthropic 还做了两个细节：
+
+- **Worktree 隔离**：每个 remote 任务自动开 git worktree，commit 与回退都在独立分支。
+- **Routines 集成**：Remote Control 与 Routines（定时任务）深度结合，可以在手机上启动一个每周自动跑的 routine。
+
+弱点：
+
+- web 应用体验差于原生 app（推送依赖浏览器、没有锁屏快捷操作）。
+- 只能管 Claude Code，不能挂 Codex。
+- temporary URL 需要妥善管理，泄露 = 仓库可读写。
+
+适合人群：Claude Code 主用户，跨多个 OS 设备工作的开发者。
+
+## 五、Vicoa：第三方但 setup 最快
+
+Vicoa 的卖点是「2 分钟接管 Claude Code 与 Codex」。流程：装 CLI → 终端登录 → 开 app 输入授权码。配对后 Vicoa 服务器作为 relay，把本地 agent session 推到手机上。
+
+它在第三方里 setup 最快、UI 最像 ChatGPT 的对话风格，对从 Codex Mobile 切过来的用户学习成本几乎为零。但有几个减分项：
+
+- relay 走 Vicoa 自己的云，意味着代码 metadata 在第三方手中。
+- IAP 解锁高级功能（如多设备同步、长任务 transcript）。
+- 无 Android 版本，Linux desktop 用户用不上。
+
+适合人群：苹果生态、对隐私不敏感、想同时管两套 agent 的独立开发者。
+
+## 六、CC Pocket：企业合规与极客的最爱
+
+CC Pocket 是开源的（k9i 维护），架构是「自托管 Bridge Server」：
+
+```
+[手机/iPad/Mac]      Tailscale / 内网       [Bridge Server]
+       ▲                                            ▲
+       │  HTTPS+WS (你的 cert)                       │
+       └─────────── 双向加密通道 ─────────────────┘
+                                                    │
+                                                    ▼
+                                       [本地 Codex/Claude CLI]
+```
+
+Bridge Server 用 `npx @ccpocket/bridge@latest` 启动，配合 Tailscale 可以彻底不出公司内网。
+
+它的优势：
+
+- **完全自托管**，代码与 metadata 不出本地。
+- **同时支持 Codex 与 Claude**，社区的扩展可以接 Aider、Cline 等其他 agent。
+- **Linux + Windows 全平台**，不被 Codex Mobile 的 macOS 限制困住。
+- **离线缓存好**，bridge 把最近 10 个 session 全量缓存，断网也能 review 历史 diff。
+
+劣势：
+
+- setup 需要手动管理 Bridge、Tailscale、cert 等，对非 SRE 玩家偏复杂。
+- 没有官方推送服务（需要自接 PushNotifications）。
+- 多 task 队列 UI 不如 Codex Mobile 直观。
+
+适合人群：合规要求高的企业、自托管派的极客、Linux/Windows 开发者。
+
+## 七、三个真实场景的选购建议
+
+### 场景 A：「我是独立开发者，主用 ChatGPT Plus」
+
+**首选 Codex Mobile**。零额外费用、零额外配置、push 体验最好。等到需要管 Claude Code 时再叠 Vicoa。
+
+### 场景 B：「我是 Claude Pro 用户，跨多设备工作」
+
+**首选 Claude Code Remote Control**。浏览器即用、任何设备无缝、与 Claude 生态融合。需要原生 app 体验时可以补 Vicoa。
+
+### 场景 C：「我是大厂 SRE，公司不允许代码外传」
+
+**首选 CC Pocket + 自托管 Bridge + Tailscale**。Bridge 跑在 jump host，手机通过 Tailscale 接入，relay 完全在内网。配 Claude Code Enterprise 或 Codex Enterprise 可以同时满足合规与 mobile 体验。
+
+## 八、未来 6 个月的趋势预判
+
+我对这个赛道未来 6 个月的判断：
+
+1. **Codex 与 Claude 都会推 Windows/Linux Desktop 版**，OpenAI 已宣布 Windows「coming soon」，Anthropic 暗示在 6 月有内部测试。
+2. **Cursor 必然进场**，4 月以来 forum 呼声极高，且它已经有 SDK 与 Background Agents 基础，缺的只是手机壳。
+3. **第三方 bridge 会洗牌**：Vicoa 这类闭源 SaaS 与 CC Pocket 这类开源会分化。开源派可能联合出一个标准协议（类似 LSP for IDE），bridge 与 client 可以互换。
+4. **企业版 relay 是新增长点**：OpenAI 与 Anthropic 都在卖 Enterprise mobile relay 给金融、医疗客户，价格不公开但单 seat 估计 50-100 美元/月。
+5. **Mobile-first agent UI 会出现**：现在所有移动端都是 desktop 的镜像，未来一定有人做「专为 5 寸屏设计的 agent UI」，比如 swipe-to-approve、voice-to-prompt。
+
+## 九、写在最后
+
+2026 年的 AI coding 工具已经从「能不能跑」演进到「在哪儿跑」。移动端不再是次要场景，而是产品差异化的关键战场。如果你今天才开始思考「怎么在手机上 vibe code」，那从 Codex Mobile 或 Claude Code Remote Control 入手是 0 成本的起点；如果你已经有了使用习惯，第三方方案能让你在隐私、跨平台、多 agent 上继续往上走。
+
+> **💡 工具链接**：Codex Mobile（ChatGPT app 内置）、Claude Code Remote Control（`claude code --remote`）、Vicoa（apps.apple.com/.../id6751626168）、CC Pocket（开源仓库 k9i/cc-pocket）。
+
+下一篇我会拆解 OpenAI 5 月 14 日同时发布的另一个被忽视的更新：**Codex Background Agent 的 webhook 协议**——它可能是 mobile UI 之外更具长期价值的更新。

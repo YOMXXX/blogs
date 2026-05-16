@@ -1,0 +1,201 @@
+---
+title: "Codex Mobile 实战工坊：在地铁上远程接管 vibe coding 会话"
+description: "OpenAI 5 月 14 日把 Codex agent 塞进了 ChatGPT 移动端。本文用两个真实场景跑通配置、安全模型与提交流程，给出可复制的 mobile-first agent workflow。"
+column: "workshop"
+tags: ["Codex", "OpenAI", "Mobile", "Agent", "Workshop"]
+pubDate: 2026-05-16
+featured: false
+tldr: "Codex Mobile 把 agent 控制台搬上手机，地铁、咖啡馆都能 review、approve 与启动新任务。本文用 macOS + iPhone 跑通完整链路：安装、配对、安全开关、远程审查、新任务排队，并给出 5 个高频陷阱与回退方案。"
+author: "YOMXXX"
+faq:
+  - q: "Codex Mobile 与本地 Codex Desktop 是什么关系？"
+    a: "Mobile 不是独立 agent，它是 Desktop 的远程控制台。所有代码生成、文件读写、命令执行依旧发生在你的 Mac 上，手机只是中转 UI。这个架构决定了：手机断网你看不到进度，但本地任务还在跑；手机重启不会丢任务。"
+  - q: "为什么我的 Mac 必须保持开机？是不是有 cloud 模式？"
+    a: "目前 mobile preview 仅对 macOS Codex Desktop 配对。OpenAI 同时也提供云端 Codex（任务跑在 OpenAI 沙箱），但与 mobile 不共享会话。Windows 支持已宣布但无确切日期，Linux 未提及。"
+  - q: "远程批准命令会不会成为安全漏洞？"
+    a: "默认有三层防护：mobile 与 desktop 通过 ChatGPT 账号 + 端到端 relay 加密；任何 destructive 命令（rm、git push --force、network 调用）必须人工 approve；可在 desktop 设置里把整个 workspace 锁定为 read-only。建议为生产仓库始终保持人工审批。"
+  - q: "队列里多个长任务并发跑会冲突吗？"
+    a: "Codex Desktop 支持 multitask，但每个 task 默认隔离在独立 git worktree 里，分支自动命名 codex/<slug>。冲突仅会发生在你手动让两个任务读写同一个未跟踪文件时。建议给每个任务加 task tag 并明确目标分支。"
+  - q: "Free 与 Plus 用户的额度差异大吗？"
+    a: "Free 与 Go 可以使用 mobile preview 的全部功能（review、approve、新任务），但 Codex 调用本身受 web 端的速率限制约束。Plus 用户日额度约为 Free 的 5-8 倍，Business 与 Enterprise 没有公开数字，按 seat 计费。地铁里跑 5-10 个 review 不会触顶，但连续启动 20+ 任务在 Free 上几乎必撞墙。"
+---
+
+5 月 14 日凌晨，OpenAI 把 Codex 塞进了 ChatGPT 的移动 app，没有发布会，只在博客与 X 上一个轻飘飘的截图：「Step away from your laptop」。这条更新在 24 小时内冲到了 r/OpenAI 与 HN 首页。我连夜配置好 iPhone + Mac mini，地铁通勤路上跑了一整天 vibe coding，本文是这套 mobile-first workflow 的完整工坊记录。
+
+## TL;DR
+
+Codex Mobile 不是独立 agent，而是把本地 Mac 上的 Codex Desktop 暴露成手机可控的远程会话。任务依然跑在你自己的机器上，手机只负责 review、approve、新建任务。本文给出三段实操：（1）双端配对与安全模型；（2）地铁 30 分钟修一个 React bug 的真实流程；（3）多 task 队列与回退方案。配齐三段后，你的 Mac 可以变成 24×7 的 vibe coding 服务器。
+
+## 一、先看清楚架构再动手
+
+Codex Mobile 是 OpenAI 在 2026 年内第三次扩展 Codex 形态。回顾它的演进：
+
+| 时间 | 形态 | 任务执行环境 | 适用场景 |
+|------|------|--------------|----------|
+| 2025-04 | Codex CLI | 本地 shell | 终端用户、定制 agent |
+| 2025-09 | Codex Cloud | OpenAI 沙箱 | PR 自动化、轻量补丁 |
+| 2026-02 | Codex Desktop (macOS) | 本地 Mac | 长程 vibe coding |
+| 2026-05-14 | Codex Mobile (iOS/Android) | 远程到 Desktop | 移动 review 与排队 |
+
+Mobile 不是独立 runtime，它是一个 secure relay 客户端。架构如下：
+
+```
+┌────────────┐     E2E relay      ┌─────────────────┐
+│ ChatGPT app│ ────────────────── │ Codex Desktop   │
+│ (iOS/And.) │   over HTTPS+WS    │ (macOS app)     │
+└────────────┘                    │  ├─ vLLM thread │
+                                  │  ├─ shell exec  │
+                                  │  └─ git worktree│
+                                  └─────────────────┘
+                                         ▲
+                                         │ tools / file IO
+                                         ▼
+                                  本地代码仓
+```
+
+理解这个架构最重要的两点：
+
+1. **任务实际跑在 Mac 上**，因此 Mac 必须开机、网络在线、Codex Desktop 进程运行。OpenAI 在 macOS 上有一个 launchd agent 自动重连，但屏幕休眠是允许的。
+2. **手机看到的 diff、screenshot、stderr 都是 Mac 主动 push 上来的**，没有任何代码会被持久化到 OpenAI 云端（账号 metadata 除外）。
+
+## 二、双端配对与安全开关
+
+### 2.1 升级与登录
+
+- macOS：Codex Desktop ≥ 1.18.0（菜单 → Check for Updates）
+- iOS：ChatGPT ≥ 5.4.0
+- 同一个 OpenAI 账号登录两端
+
+打开 Codex Desktop → Settings → Mobile → Enable Mobile Sync，会出现一个 6 位配对码。在手机 ChatGPT 主屏左上角点头像 → Codex → Pair Mac，输入配对码，10 秒内即可看到 Mac 的状态变成 Online。
+
+### 2.2 安全模型必看的三个开关
+
+我建议在第一次配对后立刻打开 Settings → Mobile → Permissions，把以下三项设为 Manual Approval：
+
+```yaml
+# Codex Desktop 推荐安全配置（位置：~/Library/Application Support/Codex/policy.yaml）
+mobile_permissions:
+  destructive_commands: manual          # rm、git reset --hard、git push -f
+  network_calls: manual                  # curl、npm publish、deploy 脚本
+  workspace_writes: auto                 # 普通文件写入可以自动批准
+  shell_exec_outside_workspace: deny    # 工作区外执行直接拒绝
+
+session_lifetime:
+  idle_timeout_minutes: 60              # 闲置 60 分钟自动锁会话
+  require_reauth_on_resume: true        # 锁后恢复需要 Touch ID
+```
+
+如果你不在 Mobile UI 里改这些值，默认是 `auto / auto / auto / allow`，对个人小项目够用，对生产仓库就太放松了。
+
+### 2.3 防误操作的最后一道关：read-only worktree
+
+我习惯让 Codex Mobile 只对单个 git worktree 可见，命令：
+
+```bash
+# 在仓库根目录建一个 mobile 专用 worktree
+git worktree add ../my-repo-mobile codex/mobile-sandbox
+# 在 Codex Desktop 里 Settings → Workspaces → Add → 选择上面这个目录
+# 同时勾选 Mobile Visible Only
+```
+
+这样即使手机被盗，攻击者最多只能改这一个 worktree，不能波及主分支或别的项目。
+
+## 三、地铁 30 分钟实战：修一个 React bug
+
+下面是 5 月 15 日通勤路上的真实记录，目标：修复仓库里一个 useEffect 导致的死循环（issue #4421）。
+
+### 3.1 出门前在 Mac 上启动一个 long-running task
+
+```
+[Codex Desktop · Chat]
+> /task new "fix #4421: useEffect infinite loop in <FilterPanel/>"
+> @plan: read issue, reproduce with vitest, write failing test, propose fix
+
+✓ Task t-7821 created on branch codex/fix-4421
+✓ Estimated time: 8-15 min
+```
+
+锁屏，出门。
+
+### 3.2 在地铁上：第一次 check-in
+
+8 分钟后在 ChatGPT app 收到 push：「t-7821 paused: needs your decision」。打开 Codex 标签：
+
+```
+Task t-7821 (paused, awaiting approval)
+─ Step 5: 提议修改 src/components/FilterPanel.tsx
+─ 当前 diff:
+  - useEffect(() => { setFilters(merge(filters, props)); }, [props, filters]);
+  + useEffect(() => { setFilters(merge(filters, props)); }, [props]);
+─ 测试结果: 1 个新测试通过、原 12 个测试通过
+```
+
+我直接点 Approve，左下角 4 秒后变成 ✓ Continuing。
+
+### 3.3 中途换主意：mid-task redirect
+
+下一站突然想到，应该把 merge 改为 useMemo 而不是 useEffect。点 Codex 顶部的 Edit Plan：
+
+```
+> @redirect: 改用 useMemo 派生 filters，删除 setFilters 状态
+```
+
+Codex Desktop 立刻丢弃当前 diff，重新规划。这一步在 mobile 上等待时间最长（约 40 秒），因为 Mac 要重新跑测试。
+
+### 3.4 出地铁前确认 PR
+
+到站前 5 分钟收到「t-7821 ready for review」。点开看到完整 commit、测试报告、CHANGELOG 草稿。点 Open PR：
+
+```
+✓ Push to origin/codex/fix-4421
+✓ gh pr create --title "fix(FilterPanel): replace useEffect with useMemo (#4421)"
+✓ PR #4434 opened, requesting review from @teammate-a
+```
+
+到办公室再 review 一遍 diff，merge。**总操作时间：地铁上 12 分钟，到家 0 分钟。**
+
+## 四、并发 task 队列：让 Mac 当 24×7 vibe 服务器
+
+Mobile 的 Tasks 标签默认按 createdAt 倒序，可同时挂 3-5 个 long-running task。我个人的队列习惯是：
+
+```
+[Active Queue]                  [Status]    [Branch]
+1. 实现 dark mode toggle        ⏳ running   codex/dark-mode
+2. 重构 user service unit tests ⏸ paused    codex/test-refactor
+3. 写 README 中文版              ✓ done      codex/i18n-readme
+4. 升级 next.js 14 → 15         🔒 blocked   codex/next-15-bump
+```
+
+注意三件事：
+
+1. **同一仓库的两个 task 默认共享 git worktree**，会互相阻塞。建议在 Settings → Workspaces 把 Per-Task Worktree 打开，每个 task 自动 fork 出独立工作区。
+2. **被 paused 的 task 不消耗 token**，只占 RAM。若 Mac 内存不够，可在 mobile 上长按任务卡片 → Hibernate，把会话写盘释放 RAM。
+3. **Mobile 显示的 stderr / stdout 截断在 50KB**，超过部分要在 Desktop 上看。给长输出的 task 主动加 `> output_summary_only` 指令可避免反复跨设备切换。
+
+## 五、五个高频陷阱与回退方案
+
+| 陷阱 | 现象 | 回退 |
+|------|------|------|
+| 1. Mac 休眠后任务卡死 | mobile 显示 ⏳ 但 5 分钟无进度 | macOS Energy Saver → 勾「Prevent automatic sleeping when display is off」 |
+| 2. 多 task 同时 git push | 后者 push 失败 | Workspaces 开 Per-Task Worktree |
+| 3. 大文件 diff 在 mobile 渲染卡 | 滑动卡顿、白屏 | 单个 diff &gt; 5000 行：发送 `> show summary only` |
+| 4. ChatGPT 切到后台 5 分钟自动断 | 推送通知收不到 | iOS：Settings → ChatGPT → Background Refresh = Always |
+| 5. 配对码过期 | 输入提示 expired | 配对码 5 分钟有效，重新生成；多次失败可重启 Codex Desktop |
+
+## 六、什么样的人最值得用
+
+我跑了一周得出的结论：Mobile 真正解决的是「等待时间」与「上下文切换成本」，所以受益最大的是这三类人：
+
+1. **远程 / 通勤多的工程师**：碎片化时间能 review 一两个 PR，不必把笔记本顶着走。
+2. **同时维护 5+ 仓库的独立开发者**：长任务排队、移动端审批，比 SSH 进 tmux 顺手。
+3. **带团队的 tech lead**：把自己 Mac 当 agent farm，team 提需求 → mobile 看进度 → 一键 PR，决策点延迟从分钟级降到秒级。
+
+不适合的场景也很明确：纯本地开发、对 destructive 操作零信任、企业 SSO / VPN 严格的环境（relay 默认走公网）。
+
+## 七、下一步
+
+OpenAI 在更新里只透露了三句话级别的 roadmap：Windows 支持「coming soon」、与 GitHub Mobile 的 deeplink 集成「in design」、cloud-only Codex 与 mobile 的合并「being explored」。这意味着接下来 1-2 个月，mobile 体验大概率还会再上一个台阶。
+
+如果你今天能做的一件事，就是先把 Codex Desktop 升到 1.18.0，跑一次本机 task，然后把手机配对——你不一定每天都用，但有一次需要的时候你会感谢自己今天动了手。
+
+> **💡 提示**：本文示例仓库与 policy.yaml 已开源在 `gh repo clone yomxxx/codex-mobile-workshop`，可直接 fork 体验，不依赖任何商业代码。

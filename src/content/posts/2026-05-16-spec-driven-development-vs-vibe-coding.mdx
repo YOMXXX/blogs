@@ -1,0 +1,241 @@
+---
+title: "Spec-Driven Development 反攻 vibe coding：GitHub Spec Kit 深度剖析"
+description: "GitHub Spec Kit 用 90k+ stars 把「先写规格再让 agent 写代码」推到聚光灯下。本文拆解它的工作流、与 vibe coding 的真实分歧，以及落地团队的成本账。"
+column: "long-form"
+tags: ["Spec-Driven", "Vibe Coding", "Agent", "Methodology", "Long-form"]
+pubDate: 2026-05-16
+featured: false
+tldr: "GitHub Spec Kit 的本质是用 constitution → spec → plan → tasks 四级文档让 AI agent 的输出可审计、可追溯、可回放。它不否认 vibe coding 在原型期的价值，但坚持在团队协作场景里 spec 必须先于 code。本文比较两种范式的成本、收益、心智模型，并给出可落地的混用策略。"
+author: "YOMXXX"
+faq:
+  - q: "Spec Kit 是不是只是 PRD 的换皮？"
+    a: "不是。PRD 通常是一次性产物，写完后被代码逐步「腐蚀」。Spec Kit 把 spec 写成可被 agent 直接执行的 markdown，每次 spec 改动都会触发 plan/tasks 的重新生成，spec 与 code 之间始终存在双向追溯。这意味着 spec 不再是「设计阶段」的产物，而是产品全生命周期的 source of truth。"
+  - q: "vibe coding 真的不能用了吗？"
+    a: "完全可以。Spec Kit 的核心论点是分场景：原型/概念验证/独立 hacker 项目，vibe coding 速度更快、心智负担更小；2 人以上协作、需要回归测试、要被 review 的场景，spec-driven 几乎总是更省总成本。Spec Kit 自己的文档里也明确说不要在 hello-world 项目用它。"
+  - q: "用 Spec Kit 之后，AI agent 还能自由发挥吗？"
+    a: "能，但发挥范围被 constitution.md 框死。constitution 定义了不可违反的硬约束（比如「禁止 npm install 不在白名单内的包」），spec 与 plan 在 constitution 之下还有解释空间。多数团队会留 30-40% 的「creative budget」让 agent 自主决策技术细节。"
+  - q: "Spec Kit 与 Cursor、Claude Code 的 plan mode 是什么关系？"
+    a: "GitHub 官方的回答是：Spec Kit 解决跨多个 agent 与跨多次会话的可追溯性，而 plan mode 是单次会话内的计划。Spec Kit 输出的 spec.md / plan.md 可以直接喂给 Cursor、Claude Code、Codex、Gemini CLI 任何一个 agent，agent 切换不丢上下文。"
+  - q: "上 Spec Kit 的初始成本多大？"
+    a: "GitHub 实测数据：单人小项目首次写 spec 约 30-90 分钟，是直接 vibe 的 2-3 倍；但第二次迭代后总耗时反超 vibe，原因是回归与回滚成本指数下降。3-5 人团队建议先在一个新模块试点，跑 4 周再决定是否扩到全仓库。"
+---
+
+5 月 8 日 GitHub 在 Open Source Friday 直播 Spec Kit，5 月 12 日 Visual Studio Magazine 发了一篇标题极挑衅的文章「GitHub Spec Kit Takes Off as Antidote to Piecemeal Vibe Coding」，48 小时内话题在 X 与 HN 同时炸开。仅 5 月这一个月，Spec Kit 在 GitHub 拿到 9000+ stars 增量，登顶 Trendshift 的 monthly engagements 第六。
+
+如果你最近一年用过 Cursor、Claude Code、Codex 这类 agentic IDE，你或多或少做过 vibe coding：扔一个 prompt，agent 写一段、跑一段、错了再说。Spec Kit 的出现，明确把这种工作方式定位为「短期产物，长期反模式」。本文不是布道，而是把两种范式拆开看，让读者自己决定在什么场景下用哪一种。
+
+## TL;DR
+
+vibe coding 是「prompt → code」的一步式，spec-driven development（SDD）是「constitution → spec → plan → tasks → code」的四步式。Spec Kit 把这四步固化为 markdown 模板与 slash command，让 agent 输出永远落到一份可审计的 spec 上。它牺牲了短期速度，换来了长期可维护性、agent 切换无损、回归测试覆盖率。本文从工作流、心智模型、成本曲线、混用策略四个角度做对比，最终给出一份「什么时候 vibe / 什么时候 spec」的判断表。
+
+## 一、为什么是现在？三个推力把 SDD 推到聚光灯下
+
+SDD 不是新概念，1980 年代瀑布模型与之同源，2010 年代 Behavior-Driven Development 与之有部分重叠。但 2026 年它能再火一次，靠的是三个新推力：
+
+1. **Agent 能力跨过门槛**：Claude Sonnet 4.6、GPT-5.5、Gemini 3 都能稳定按 markdown 任务列表执行，spec 不再是给人看的文档而是给 agent 的可执行输入。
+2. **vibe coding 的债务集中爆发**：HN、Reddit 上从 4 月起密集出现「我用 Cursor 半年写了 8 万行无文档代码，现在改 bug 比从头重写还慢」的帖子，社区情绪开始反转。
+3. **MSR 2026 一篇 paper**：The Quality of AI-Generated Pull Requests 这篇文章实证了 PR 质量与「是否有先期 spec」高度相关，给了 SDD 学术背书。
+
+这三件事共同促成了 Spec Kit 在 5 月的爆发。
+
+## 二、Spec Kit 的工作流到底长什么样
+
+Spec Kit 把 SDD 拆成五个 slash command，对应五个 markdown 文件：
+
+```
+/speckit.constitution  → constitution.md   不可违反的硬约束
+/speckit.specify       → spec.md           做什么、为什么
+/speckit.plan          → plan.md           技术架构与栈选择
+/speckit.tasks         → tasks.md          可执行任务列表
+/speckit.implement     → 进入 agent 执行
+```
+
+每个文件都是 markdown，所以可以放进 git，跟代码一起 review、回滚、diff。
+
+### 2.1 constitution.md：先写规则
+
+constitution 是优先级最高的文档。常见条目：
+
+```markdown
+# Project Constitution
+
+## Hard Rules
+- 禁止引入任何 GPL-3 或 AGPL 依赖
+- 数据库迁移必须通过 sqlfluff 校验
+- 所有 HTTP handler 必须有 unit test 覆盖
+- 任何对 production 数据库的 DDL 操作要 human review
+
+## Style
+- TypeScript 用 strict mode
+- 函数 cyclomatic complexity ≤ 8
+- 文件 ≤ 400 行
+
+## Performance
+- API p99 ≤ 300ms
+- 单 endpoint 内存占用 ≤ 64MB
+```
+
+constitution 的关键是约束 agent 的「自由发挥」边界。社区里跑过的 demo 显示：constitution 越具体，agent 在后续阶段返工率越低。
+
+### 2.2 spec.md：用业务语言描述
+
+spec 写的是「做什么、为什么」，刻意不写「怎么做」。一段示例：
+
+```markdown
+# 功能：用户邀请码
+
+## 用户故事
+作为已注册用户，我希望生成 6 位邀请码，分享给朋友注册时填入，
+我和朋友各得 100 积分。
+
+## 接受标准
+- 一个用户最多生成 50 个有效邀请码
+- 邀请码 30 天后自动失效
+- 同一手机号注册时重复使用邀请码无效
+- 注册成功后 5 秒内积分到账
+
+## 边界场景
+- 邀请人账号已注销：邀请码立刻失效
+- 被邀请人是黑名单用户：不发积分但不报错
+- 高并发同一邀请码同时被多人使用：用先到先得
+```
+
+注意这里没有任何技术细节——没有提数据库、没有提 API 路径、没有提缓存。这是 SDD 的精髓：spec 由产品经理或 tech lead 写，被多个 agent 实现都能得到等价结果。
+
+### 2.3 plan.md：让 agent 提技术方案
+
+plan 是 spec 的下一层，由 agent 提议、人 review。示例：
+
+```markdown
+# 技术方案
+
+## 数据模型
+- invite_codes: code, owner_id, used_by, expires_at, status
+- invite_rewards: invite_code, reward_at, points
+
+## API
+- POST /api/invite/generate (rate limit: 50 / day)
+- POST /api/invite/redeem (rate limit: 10 / day per IP)
+
+## 关键算法
+- 邀请码生成: 6 位 base32, 排除 0/O/1/I, 冲突重试
+- 高并发：用 Redis SETNX 占位，DB 写入用唯一索引
+
+## 测试
+- unit: code 生成、过期检查、奖励发放
+- integration: 完整邀请流程
+- e2e: 多人同时使用同一邀请码
+```
+
+plan 写完后由人 review，这一步是 SDD 与 vibe coding 最大的工程价值差异——人在这里花 5-10 分钟，可以避免 agent 在错误方向上跑 30 分钟。
+
+### 2.4 tasks.md：拆成可执行步骤
+
+tasks 是 agent 的实际行动指令：
+
+```markdown
+- [ ] 1. 创建 migration 0042_invite_codes.sql
+- [ ] 2. 创建 InviteCode model + repository
+- [ ] 3. 实现 generateCode() 与冲突重试
+- [ ] 4. 实现 redeemCode() 与积分发放
+- [ ] 5. 写 unit test 覆盖 4 个边界场景
+- [ ] 6. 写 integration test
+- [ ] 7. 更新 OpenAPI 文档
+- [ ] 8. 更新前端调用
+```
+
+agent 按顺序执行，每完成一项打勾，spec/plan/tasks 都进入 git commit。
+
+## 三、vibe coding 与 SDD 的真实分歧
+
+很多人把两者对立起来，其实 GitHub 自己的文档里说得很清楚——它们解决的是不同问题。我把核心分歧整理成一张表：
+
+| 维度 | vibe coding | spec-driven |
+|------|-------------|-------------|
+| 入口 | 一次性 prompt | constitution + spec |
+| 心智模型 | 对话式探索 | 规约式委托 |
+| 适合阶段 | 原型、PoC、Hackathon | 协作开发、生产维护 |
+| 上手速度 | &lt;1 分钟 | 30-90 分钟首次 |
+| 单次迭代成本 | 极低 | 中等 |
+| 回归测试覆盖 | 取决于 prompt | 强制 |
+| Agent 切换无损 | 否 | 是 |
+| 可审计性 | 弱（仅看 commit） | 强（spec→code 双向追溯） |
+| 团队规模上限 | 1-2 人 | 不设限 |
+
+最容易被 vibe 派攻击的点是「初始成本高」。我自己跑过几个项目的体感：
+
+- **小于 200 行的脚本**：vibe 完胜，spec 是杀鸡用牛刀。
+- **200-2000 行的单功能模块**：spec 与 vibe 平手，看团队习惯。
+- **2000 行以上、需要回归**：spec 显著省总成本，越大差距越明显。
+
+GitHub 在 Open Source Friday 直播里给出过一个具体数字：他们内部用 Spec Kit 重写一个 4 万行的 microservice，前两周耗时是 vibe 的 1.4 倍，但第 4 周开始反超，第 8 周累计省下 23% 时间，主要节省在「回归 bug 修复」与「PR review 时间」上。
+
+## 四、Spec Kit 的工程细节里有几处反常识设计
+
+### 4.1 spec 不写技术细节，是为了 agent 切换
+
+如果 spec 里写「用 PostgreSQL 存储 invite_codes」，那这份 spec 就被绑死了。SDD 的本意是 spec 描述 what / why，技术细节交给 plan，这样换数据库（甚至换语言栈）只需要重写 plan。
+
+现实里很多团队用了 Spec Kit 后第一件事就是把技术栈写进 spec，然后抱怨「跟 PRD 没区别」。这是误用。
+
+### 4.2 constitution 的优先级永远高于 spec
+
+如果 spec 里说「调用第三方 API 获取邀请人信息」，但 constitution 说「禁止跨域 HTTP 调用」，agent 会主动报告冲突并要求 human review。这是 Spec Kit 与普通模板最大的不同——它把「约束传递」做成了 first-class。
+
+### 4.3 plan 必须由 agent 写、由人 review
+
+不少团队倒过来：人写 plan，agent 执行。这种用法等于把 Spec Kit 当代码生成器。Spec Kit 设计意图是 plan 由 agent 提议，因为 agent 更熟悉新框架的最佳实践、能看到所有已有依赖。人 review 的工作量远小于人写。
+
+### 4.4 tasks 的颗粒度有讲究
+
+tasks 太粗（「实现整个功能」）等于回到 vibe；太细（「在第 23 行加一个变量」）等于人在写代码。Spec Kit 推荐的颗粒度是「一个 PR 的尺寸」，每个 task 完成后立刻可以 commit、跑测试、回退。
+
+## 五、混用策略：vibe 与 spec 各自的位置
+
+我个人在 2026 年 5 月的工作流：
+
+```
+[新想法]
+   │
+   ├─ 还没想清楚？
+   │    → vibe coding 30 分钟（在 throwaway repo 里）
+   │    → 跑通基本想法
+   │
+   └─ 想清楚了 + 准备进生产？
+        → /speckit.constitution（如果第一次）
+        → /speckit.specify
+        → /speckit.plan
+        → /speckit.tasks
+        → /speckit.implement
+        → review + merge
+```
+
+这个混用策略的关键是：vibe 是探索，spec 是固化。两者不矛盾，矛盾的是「用 vibe 的方式做 production」或「用 spec 的方式做 hackathon」。
+
+## 六、批评的声音
+
+不是所有人都买账。社区里最常见的三个批评：
+
+1. **「LLM context compaction 让 spec 在长会话里丢失」**：这是真问题。Spec Kit 的回应是：spec 是 markdown 文件，agent 每次读都是从盘里读全量，不依赖会话记忆。但 plan / tasks 在长会话里仍可能被压缩，需要在 prompt 里强制「重新读取 plan.md」。
+2. **「30+ 个 agent 都能用，意味着没有任何一个用得最好」**：现实如此。Spec Kit 是 LCD（least common denominator），它要求所有 agent 共用 markdown 解析能力，没法发挥某个 agent 的独特优势。
+3. **「这跟 1980 年代的瀑布有什么区别？」**：本质区别是迭代周期。瀑布是几个月一次 release，SDD 是几小时一次 commit。spec 是活的，跟代码同生共死。
+
+这些批评都成立，但都不致命。SDD 在 2026 年的赌注是：随着 agent 能力越来越强，spec-as-code 的杠杆会越来越大；而 vibe 的边际收益随着代码量增长会反向衰减。
+
+## 七、对个人开发者与团队的建议
+
+我的建议按角色分：
+
+- **独立开发者，项目 &lt; 5000 行**：继续 vibe，加一份简单的 README 即可。
+- **独立开发者，项目 &gt; 5000 行或要发布给他人**：开始用 Spec Kit 的 constitution + spec 即可，不必上完整流程。
+- **2-5 人团队**：constitution + spec + plan 三件套，tasks 可选。
+- **5+ 人团队或维护长期项目**：完整 SDD 流程，配 CI 强制 spec 与 code 同步更新。
+- **企业内部平台**：fork 一份 Spec Kit，把 constitution 模板化为公司级标准，做 governance。
+
+## 八、写在最后
+
+vibe coding 不会消失。它解决的是「我有一个粗糙想法，想 5 分钟内看到能跑的东西」这个 100% 真实的问题。Spec Kit 也不会让所有人都改信仰。它解决的是「这堆代码 6 个月后还有人能改得动」这个同样真实的问题。
+
+2026 年的 AI coding 工具不再单一，开发者的工作不再是选边站，而是学会**在不同问题上选不同范式**。Spec Kit 的价值在于把 spec-driven 这条路径从「需要纪律的人才能跑」变成了「装个 CLI 就能开始」，这是它配得上 90k stars 的真正原因。
+
+> **💡 仓库**：`gh repo clone github/spec-kit`，截至 2026-05-16 为 v0.1.4，Apache 2.0 协议，支持 Copilot / Claude Code / Gemini CLI / Cursor / Windsurf 等 30+ agents。
