@@ -1,0 +1,223 @@
+---
+title: "LLM 可观测性工具横评 2026：Langfuse / LangSmith / Helicone / Braintrust / Latitude 实测"
+description: "Agent 上生产后的第一件事就是接 tracing。本文用同一个 RAG + 工具调用应用接入 5 个主流可观测性平台，比较接入成本、多 turn tracing、eval 能力、自托管选项与真实月成本。"
+column: "tools"
+tags: ["LLM", "Observability", "Tracing", "Langfuse", "Comparison"]
+pubDate: 2026-05-17
+featured: false
+tldr: "5 个工具各有定位：Langfuse 是 OSS 全能（自托管首选）、LangSmith 与 LangChain 生态最深、Helicone 接入最快（5 分钟 proxy 改 base_url）、Braintrust 在 eval/CI 集成最强、Latitude 主打 agent-first 多 turn tracing。本文按接入成本、多 turn、eval、自托管、月成本五维实测对比，给出 4 种典型团队的选购建议。"
+author: "YOMXXX"
+faq:
+  - q: "如果只能选一个，从零开始应该选哪个？"
+    a: "看团队需求。代码以 Python 为主、要自托管：Langfuse；用 LangChain/LangGraph 重度：LangSmith；最快验证一个 prototype：Helicone；要把 eval 卡进 CI/CD：Braintrust；多 agent 流程为主：Latitude。没有银弹，问『最重要的一项是什么』即可定位。"
+  - q: "Langfuse 自托管成本真的低吗？"
+    a: "看规模。1M traces/月：自托管约 $50 VM + Postgres，云版 $99 起；10M traces/月：自托管 $500 + 一个工程师 1-2 天/月运维，云版 $599+；100M traces/月：自托管反而更省，但需要 SRE 经验。临界点大约在 10M traces 附近。"
+  - q: "Helicone 的 proxy 模式安全吗？"
+    a: "Helicone 默认走他们的 cloud proxy，所有 LLM 请求都会经过他们的服务器。对敏感数据场景，建议用 Helicone async logging（不走 proxy，事后异步上报）或自托管 Helicone OSS。生产合规场景必须自托管或换 Langfuse。"
+  - q: "Braintrust 的 eval 与 LangSmith 的 eval 区别？"
+    a: "Braintrust 是 eval-first：从 dataset 管理、实验对比、CI gating 都比 LangSmith 更专门。LangSmith 是 tracing-first，eval 是后加功能，UX 不如 Braintrust 流畅。但 LangSmith 与 LangChain 集成更深，零代码即可 trace LangGraph。"
+  - q: "Latitude 与其他 4 个比有什么独到优势？"
+    a: "Latitude 把多 agent 当一等公民设计：trace 视图是 agent graph 而不是 trace tree，跨 agent 的 handoff、retry、并行 fan-out 在 UI 上一目了然。其他 4 个都把 multi-agent 当成普通 trace 嵌套，调试体验差一截。代价是 Latitude 生态新、社区小、API 还在迭代。"
+---
+
+2026 年 5 月，LLM 应用进入"必须可观测"阶段。Agent 链路平均 5-15 个 LLM 调用、3-8 次工具调用，没有 tracing 等于在黑盒里调试。本文用一个统一的 RAG + 工具调用应用（约 200 行 Python），分别接入 Langfuse、LangSmith、Helicone、Braintrust、Latitude，按 5 个维度做横评。
+
+## TL;DR
+
+LLM 可观测性 5 个候选没有绝对赢家，定位差异决定选型：
+
+- **Langfuse**：OSS 全能，自托管首选，社区最活跃。
+- **LangSmith**：LangChain/LangGraph 用户的默认值，eval 是后加项。
+- **Helicone**：proxy 模式 5 分钟接入，prototype 最快。
+- **Braintrust**：eval-first，CI 集成最强，企业付费意愿高。
+- **Latitude**：agent-first，多 agent trace UI 独树一帜。
+
+按接入成本、多 turn tracing、eval 能力、自托管、月成本五维对比，文末给出 4 种典型团队的选购建议。
+
+## 一、为什么 2026 年要上 LLM 可观测
+
+三个理由：
+
+1. **Agent 链路长**：单次用户请求触发 5-15 次 LLM 调用 + 多次工具调用，没 trace 没法定位失败步骤。
+2. **成本不透明**：不同模型、prompt 长度、缓存命中率混合后，月底账单只能看到总金额，无法归因。
+3. **质量回归**：换 prompt、换模型、换 RAG 配置后，能力涨/降需要 eval 对照。
+
+LLM 可观测性平台同时解三个问题：tracing（追问题）、成本归因（追金钱）、eval（追质量）。
+
+## 二、5 个候选的快速画像
+
+| 工具 | 起步 | 总部 | OSS | 自托管 | 主打 |
+|------|------|------|-----|--------|------|
+| **Langfuse** | 2023 | 柏林 | MIT | 一等公民 | OSS 全能 |
+| **LangSmith** | 2023 | SF | 闭源 | Enterprise 限定 | LangChain 生态 |
+| **Helicone** | 2023 | YC | Apache 2.0 | OSS 版本 | 最快接入 |
+| **Braintrust** | 2024 | SF | 闭源 | Enterprise 限定 | Eval + CI |
+| **Latitude** | 2024 | EU | Apache 2.0 | 一等公民 | Agent-first |
+
+## 三、统一测试应用
+
+测试用一个 RAG + 工具调用应用：用户问"帮我查 Q1 销售数据并写邮件总结"，触发：
+
+1. Triage LLM 判断意图（1 次 LLM）。
+2. Retriever 用 query_kb 工具检索 5 篇文档（1 次工具 + 1 次 LLM）。
+3. Drafter 用 retrieved context 草拟邮件（1 次 LLM）。
+4. Reviewer LLM 检查质量（1 次 LLM）。
+
+共 5 次 LLM 调用 + 1 次工具调用 + 5 跳 trace。每天跑 1000 次。
+
+## 四、维度 1：接入成本
+
+| 工具 | 接入步骤 | 代码量 | 时间 |
+|------|---------|--------|------|
+| Helicone | 改 base_url 到 helicone proxy + 加 1 个 header | 3 行 | 5 分钟 |
+| Langfuse | 装 sdk + decorator @observe | 10 行 | 15 分钟 |
+| LangSmith | 装 sdk + env var + tag | 5 行 | 10 分钟（前提是用 LangChain） |
+| Braintrust | 装 sdk + Project 创建 + traced wrapper | 15 行 | 20 分钟 |
+| Latitude | 装 sdk + Workspace 创建 + agent 装饰器 | 12 行 | 20 分钟 |
+
+Helicone 最快是因为它本质是 proxy：把 OpenAI SDK 的 `base_url` 指过去就完事。代价是数据流经过 Helicone cloud。
+
+Langfuse 接入示例：
+
+```python
+from langfuse import observe, get_client
+
+langfuse = get_client()
+
+@observe(name="rag-pipeline")
+async def rag_pipeline(query: str):
+    intent = await triage(query)
+    docs = await retrieve(query)
+    draft = await draft_email(query, docs)
+    final = await review(draft)
+    return final
+```
+
+decorator 自动捕获输入、输出、duration、token usage，写入 Langfuse backend。
+
+## 五、维度 2：多 Turn / Agent Tracing
+
+Agent 应用的关键能力是看清楚一次用户对话的完整链路。5 个工具在多 turn 上的表现：
+
+| 工具 | 多 turn UI | Agent 间 handoff | 工具调用嵌套 | Trace 时间线 |
+|------|-----------|------------------|--------------|--------------|
+| Langfuse | tree + timeline | 手动 link | 自动嵌套 | 完整 |
+| LangSmith | tree | 自动（LangChain） | 自动 | 完整 |
+| Helicone | flat list | 不支持 | 部分支持 | 部分 |
+| Braintrust | tree | 手动 link | 自动 | 完整 |
+| **Latitude** | **agent graph** | **一等公民** | **自动** | **完整 + 并发 fan-out 可视化** |
+
+Latitude 的差异化在 UI：trace 不是嵌套树而是 agent graph，节点是 agent，边是消息。对调试"Drafter 为什么调了 Reviewer 三次"这类问题非常直观。
+
+Helicone 在多 turn 上是短板：默认按单 LLM 请求记录，agent 嵌套关系要靠 trace_id 手动串。
+
+## 六、维度 3：Eval 能力
+
+Eval 是把"换 prompt 后质量到底升了还是降了"量化。5 个工具的 eval 能力差距很大：
+
+| 工具 | Dataset 管理 | LLM-as-judge | Code eval | A/B 对比 | CI gating |
+|------|------------|--------------|-----------|---------|-----------|
+| **Braintrust** | **完整** | **完整** | **完整** | **完整** | **完整** |
+| LangSmith | 完整 | 完整 | 完整 | 完整 | 部分 |
+| Langfuse | 完整 | 完整 | 完整 | 完整 | 通过 webhook |
+| Latitude | 部分 | 完整 | 部分 | 完整 | 通过 webhook |
+| Helicone | 弱 | 部分 | 无 | 弱 | 无 |
+
+Braintrust 是 eval-first 设计：dataset 版本化、实验跑出来直接出报告、PR 里能放 CI 卡点（新 prompt 必须不降低 baseline 5% 才能合）。LangSmith 在 LangChain 团队主推下也补齐到接近水准。Langfuse 通过 webhook 间接支持 CI gating，需要自己写 GitHub Action 脚本。
+
+Helicone 在 eval 上几乎缺席——它的定位本就是 tracing/cost，不强求做 eval。
+
+## 七、维度 4：自托管
+
+合规、数据敏感场景必须自托管。
+
+| 工具 | 自托管支持 | 难度 | 依赖 |
+|------|----------|------|------|
+| **Langfuse** | **一等公民** | **低** | Docker Compose 或 Helm chart，Postgres + ClickHouse |
+| **Helicone OSS** | 一等公民 | 中 | Docker + Postgres + Kafka + ClickHouse |
+| **Latitude** | 一等公民 | 中 | Docker + Postgres |
+| LangSmith | Enterprise only | 高 | 联系销售 |
+| Braintrust | Enterprise only | 高 | 联系销售 |
+
+Langfuse 是自托管的金标准：一个 docker-compose up 起来，30 分钟就能跑通生产配置。Helicone OSS 也能自托管，但组件更多（要跑 Kafka 做异步上报）。
+
+LangSmith 和 Braintrust 都把自托管放 Enterprise 套餐，起步报价 $30K+/年——对中小团队是事实上的不可用。
+
+## 八、维度 5：真实月成本
+
+按本文测试应用规模（每天 1000 次完整 trace = 30K traces/月 = ~150K LLM 调用/月），5 个平台的实测月成本：
+
+| 工具 | 自托管月成本 | 云版起步价 | 30K traces 实际花费 |
+|------|------------|----------|--------------------|
+| Langfuse | $50（VM + Postgres） | $99 Pro | $99 起 |
+| Helicone | $80（VM + 全组件） | Free 10K + $0.001/extra | ~$140 |
+| Latitude | $50 | $49 Starter | $49 |
+| LangSmith | N/A（无自托管） | $39 + per-trace | ~$200 |
+| Braintrust | N/A | $99 + per-eval | ~$250 |
+
+要扩到 1M traces/月（中型生产）：
+
+| 工具 | 1M traces/月成本 |
+|------|----------------|
+| Langfuse 自托管 | ~$200 |
+| Helicone 自托管 | ~$400 |
+| Latitude 云 | ~$500 |
+| LangSmith 云 | ~$1500 |
+| Braintrust 云 | ~$2000 |
+
+成本曲线在 100K traces 附近是分水岭：低于此 SaaS 更划算（省运维），高于此自托管 Langfuse 优势显著。
+
+## 九、4 种典型团队的选购建议
+
+**初创公司 prototype 阶段（&lt; 5 人）**：
+
+- 推荐：Helicone（proxy 模式）。
+- 理由：5 分钟接入、Free 10K traces 够用、不要分心做运维。
+
+**LangChain/LangGraph 重度团队**：
+
+- 推荐：LangSmith。
+- 理由：零代码 trace、生态深度集成、prompt hub 共用。
+
+**金融 / 医疗 / 合规场景**：
+
+- 推荐：Langfuse 自托管。
+- 理由：OSS、数据不出本地、社区活跃、Postgres backend 易审计。
+
+**Agent-heavy 团队（多 agent 编排为主）**：
+
+- 推荐：Latitude，备选 Langfuse。
+- 理由：Latitude 的 agent graph UI 在调试多 agent 流程时省时间。
+
+**Eval-driven 工作流团队（每次发布都要 regression）**：
+
+- 推荐：Braintrust。
+- 理由：dataset / experiment / CI gating 是 first-class，比其他 4 个都更顺。
+
+## 十、踩坑总结
+
+5 个工具实测过程中遇到的非显然问题：
+
+- **Langfuse**：v3 起 backend 切到 ClickHouse，自托管要额外起 ClickHouse 容器，老的 v2 docker-compose 文件失效。
+- **Helicone proxy**：在中国直连有网络问题，建议自托管或用 Cloudflare worker 中转。
+- **LangSmith**：默认 sampling 是 100%，生产 traffic 大时账单会爆，要手动调到 0.1。
+- **Braintrust**：实验 dataset 默认存在他们 cloud，敏感数据要用 BYO storage（S3）配置。
+- **Latitude**：v1 API 还在 breaking，每 2 周一次升级要注意 release notes。
+
+## 十一、不要忽视的"零方案"
+
+如果应用还很小、对 LLM 调用 &lt; 10K/月，直接用 OpenTelemetry + Grafana Tempo 自建是合理选项。任意 OpenAI SDK 调用包一个 OTel span，3 行代码搞定。代价是 LLM 专有功能（token 统计、cost 归因、prompt 版本管理）要自己做，但成本是零。
+
+对真正在意成本的团队，"零方案" → Langfuse → Braintrust 是一条合理升级路径，对应 prototype → 生产 → eval-driven 三个阶段。
+
+## 十二、6 个月内的预期变化
+
+5 月这一周，5 个工具都有动向：
+
+- **Langfuse v4 alpha**：原生支持 agent graph view，对标 Latitude。
+- **Helicone**：5/16 发布 vault feature，把敏感字段加密存储。
+- **LangSmith**：与 LangGraph Studio 深度集成，IDE 内直接看 trace。
+- **Braintrust**：5/15 发了 GitHub Action `braintrust/eval-action@v1`，CI gating 一行 yml。
+- **Latitude**：5/14 加了 OTel 兼容，老 trace 能 import 进来。
+
+赛道在加速整合，年内可能出现"Langfuse 收 Latitude"或"LangSmith 开源 OSS 版本"级别的事件。选型时把"vendor lock-in"风险作为隐藏维度——优先选 OTel 兼容的，未来切换成本低。

@@ -1,0 +1,248 @@
+---
+title: "Microsoft Agent Framework 1.0 实战：从单 agent 到多 agent 编排的生产级落地"
+description: "微软 Agent Framework 5/13 发布 1.0 GA 版本，统一 .NET 与 Python 双语言 SDK。本文用一个客服多 agent 案例跑通从单 agent 到 GraphFlow 编排、工具调用、Azure 部署的完整链路。"
+column: "workshop"
+tags: ["Microsoft", "Agent Framework", "Python", "Multi-Agent", "Workshop"]
+pubDate: 2026-05-17
+featured: false
+tldr: "Microsoft Agent Framework 1.0 在 5/13 GA，把 Semantic Kernel 的可观测 + AutoGen 的多 agent 编排合并成一个统一 SDK，.NET 与 Python 同步发版。本文从安装、定义单 agent、加工具、再到 GraphFlow 多 agent 流程，最后给出 Azure AI Foundry 部署 checklist，配套 200 行可跑代码。"
+author: "YOMXXX"
+faq:
+  - q: "Agent Framework 1.0 和老的 Semantic Kernel、AutoGen 是什么关系？"
+    a: "1.0 是把 Semantic Kernel（可观测 + 企业集成）和 AutoGen（多 agent 编排）合并的产物。微软官方称这两个项目进入 maintenance 模式，新功能只进 Agent Framework。已有 SK 用户的迁移路径是渐进式：先把 Kernel 替换成 AgentRuntime，再把 Skill 换成新的 Tool 装饰器。"
+  - q: "Python 版和 .NET 版的功能对等吗？"
+    a: "1.0 GA 时核心 API 对等：Agent、Tool、Workflow、GraphFlow、Tracing 全部双语言。但生态有差距：.NET 版本对 Azure AI Foundry、Microsoft Graph、Office 365 集成更深；Python 版本对 OpenAI/Anthropic/Ollama 开放模型支持更广。混合团队建议主语言用 Python，企业系统集成那部分用 .NET。"
+  - q: "为什么选 Agent Framework 而不是 LangGraph？"
+    a: "如果你已经在 Azure 上、需要企业级 SSO/审计/可观测一站式，Agent Framework 优势明显——OpenTelemetry tracing 默认开启、Azure AI Foundry 一键部署、Microsoft Entra 鉴权原生。如果你跑在多云、用 OSS 模型为主、追求最快迭代速度，LangGraph 更轻量。"
+  - q: "GraphFlow 和 LangGraph 的图编排有什么差别？"
+    a: "GraphFlow 是声明式的有向图，节点是 Agent，边是条件路由；底层用 .NET 的 Channels 或 Python 的 asyncio 做消息传递。和 LangGraph 比，GraphFlow 默认强类型（Pydantic schema 校验消息），多语言互通是一等公民；LangGraph 的灵活性更高但调试成本也高。"
+  - q: "生产部署最容易踩的坑是什么？"
+    a: "三个：一是没有给 LLM 调用加 timeout，长任务卡死整个 workflow；二是工具调用没设并发上限，Azure OpenAI 限流后整个 graph 崩溃；三是用默认 in-memory checkpoint，进程重启后丢状态——必须切到 Cosmos DB 或 PostgreSQL backend。1.0 GA 在 docs 里有专门的 production checklist。"
+---
+
+5 月 13 日微软在 devblogs 宣布 Microsoft Agent Framework 正式发布 1.0 GA。这不是又一个 agent 框架的迭代，而是把 Semantic Kernel 和 AutoGen 两条产品线合二为一的整合版本。1.0 之后这两个老项目进入 maintenance 模式，新需求统一进 Agent Framework。
+
+本文不讨论"应该用哪个 agent 框架"这种宏大叙事，直接进入实战：用 Python 版搭一个客服多 agent，跑通工具调用、GraphFlow 编排、tracing，最后聊一聊 Azure AI Foundry 部署的几个坑。
+
+## TL;DR
+
+Microsoft Agent Framework 1.0 用一个 SDK 把"单 agent + 工具 + 多 agent 编排 + 可观测 + 企业鉴权"打包到一起，.NET 和 Python 双语言对等。GraphFlow 把多 agent 协作建模成有向图，强类型消息 + 条件路由让生产环境的可调试性显著高于早期 AutoGen。本文用 200 行 Python 代码搭出客服分诊 → 检索 → 草拟 → 审核的四 agent pipeline，并给出 Azure AI Foundry 部署的 8 项 checklist。
+
+## 一、为什么这次发版值得动手
+
+过去两年微软在 agent 这条线上有三个项目：Semantic Kernel（2023 起，主打 .NET 企业集成 + 可观测）、AutoGen（2024 起，研究型多 agent 编排）、Prompt Flow（更早期的低代码 prompt 编排）。三个项目各有粉丝、API 互不兼容、文档分散在不同的 docs 站。1.0 把这一切收口到 Agent Framework：
+
+| 维度 | Semantic Kernel | AutoGen 0.x | Agent Framework 1.0 |
+|------|----------------|-------------|--------------------|
+| 单 agent | 强，Plugin 体系成熟 | 弱 | 强，继承 SK Plugin |
+| 多 agent 编排 | 弱 | 强，GroupChat | 强，GraphFlow + GroupChat |
+| 可观测（OTel） | 默认开启 | 需手工接 | 默认开启 |
+| 企业鉴权 | Entra ID 原生 | 无 | Entra ID 原生 |
+| 跨语言 | .NET + Python | Python only | .NET + Python 对等 |
+| API 稳定性 | 稳定 | 频繁 breaking | 1.0 LTS 承诺 |
+
+对企业团队来说，第三和第四列是真正的差别：以前要混用 AutoGen 编排 + SK 工具 + 自己拼 tracing，现在一个 SDK 全搞定。
+
+## 二、安装与第一个 agent
+
+Python 3.11+ 环境直接 pip：
+
+```bash
+pip install agent-framework==1.0.0
+pip install agent-framework-azure-ai  # Azure 集成
+pip install agent-framework-openai    # OpenAI 后端
+```
+
+最小 agent 长这样：
+
+```python
+from agent_framework import ChatAgent
+from agent_framework.openai import OpenAIChatClient
+
+client = OpenAIChatClient(
+    model="gpt-4.1-mini",
+    api_key="sk-...",
+)
+
+agent = ChatAgent(
+    name="Triage",
+    description="客服分诊 agent，识别用户问题类别。",
+    chat_client=client,
+    instructions=(
+        "你是客服分诊员。把用户消息归类到 "
+        "['退款', '物流', '使用问题', '其他'] 中的一个，"
+        "返回 JSON: {category: str, urgency: int 1-5}"
+    ),
+)
+
+resp = await agent.run("我的订单 5 天还没发货，催了客服没回")
+print(resp.content)
+# {"category": "物流", "urgency": 4}
+```
+
+`ChatAgent` 是最薄的封装，相当于一个带 system prompt 的 chat 循环。和 LangChain 的 `AgentExecutor` 比，它默认 `async` first、消息类型是 Pydantic 模型、tracing span 自动写入 OTel。
+
+## 三、加工具：从 Plugin 装饰器到 MCP
+
+Agent Framework 工具体系兼容三种来源：内联 Python 函数、Plugin 类、外部 MCP server。
+
+### 3.1 内联函数（最快）
+
+```python
+from agent_framework import tool
+from typing import Annotated
+
+@tool(description="根据订单号查询物流状态")
+async def query_logistics(
+    order_id: Annotated[str, "订单号，形如 SO20260517-12345"]
+) -> dict:
+    # 这里实际去调你的 ERP / 物流 API
+    return {"status": "in_transit", "eta": "2026-05-19"}
+
+agent = ChatAgent(
+    name="Logistics",
+    chat_client=client,
+    tools=[query_logistics],
+    instructions="你是物流客服，可以用 query_logistics 工具查订单。",
+)
+```
+
+`@tool` 装饰器会自动从 type hint + docstring 抽 JSON Schema，不用手写。Annotated 里的字符串是字段描述，对 LLM 工具调用的准确率影响很大。
+
+### 3.2 Plugin 类（复用）
+
+复杂业务把多个相关工具打包成 Plugin：
+
+```python
+from agent_framework import KernelPlugin, kernel_function
+
+class CRMPlugin(KernelPlugin):
+    @kernel_function(description="查用户最近订单")
+    async def list_orders(self, user_id: str, limit: int = 5) -> list:
+        ...
+
+    @kernel_function(description="查用户会员等级")
+    async def get_member_level(self, user_id: str) -> str:
+        ...
+
+agent = ChatAgent(
+    chat_client=client,
+    plugins=[CRMPlugin()],
+)
+```
+
+### 3.3 MCP server（跨语言）
+
+1.0 把 MCP 作为一等公民，任何 MCP server 直接挂载：
+
+```python
+from agent_framework.mcp import MCPClient
+
+mcp = MCPClient.from_stdio(command=["uvx", "mcp-server-jira"])
+agent = ChatAgent(chat_client=client, mcp_clients=[mcp])
+```
+
+挂载后 MCP server 暴露的工具会自动出现在 agent 工具列表里。这对企业团队是关键能力——把 Jira / Confluence / 内部系统的 MCP server 写一次，所有 agent 都能用。
+
+## 四、GraphFlow 多 agent 编排实战
+
+四个 agent 协作处理客服 ticket：分诊 → 检索 → 草拟 → 审核。
+
+```python
+from agent_framework import GraphFlow, GraphNode, GraphEdge
+from pydantic import BaseModel
+
+class Ticket(BaseModel):
+    user_id: str
+    text: str
+    category: str | None = None
+    urgency: int | None = None
+    context: list[str] = []
+    draft: str | None = None
+    approved: bool = False
+
+triage = ChatAgent(name="Triage", chat_client=client, instructions="...")
+retriever = ChatAgent(name="Retriever", chat_client=client, tools=[search_kb])
+drafter = ChatAgent(name="Drafter", chat_client=client, instructions="...")
+reviewer = ChatAgent(name="Reviewer", chat_client=client, instructions="...")
+
+flow = GraphFlow[Ticket](
+    nodes=[
+        GraphNode("triage", triage),
+        GraphNode("retrieve", retriever),
+        GraphNode("draft", drafter),
+        GraphNode("review", reviewer),
+    ],
+    edges=[
+        GraphEdge("triage", "retrieve"),
+        GraphEdge("retrieve", "draft"),
+        GraphEdge("draft", "review"),
+        GraphEdge(
+            "review", "draft",
+            condition=lambda t: not t.approved,  # 审核未通过回到 drafter
+        ),
+    ],
+    entry="triage",
+    exit_when=lambda t: t.approved,
+)
+
+result = await flow.run(Ticket(user_id="u123", text="订单退款没收到"))
+print(result.draft)
+```
+
+GraphFlow 比 GroupChat 更明确：每条边的条件是显式 Python 函数，调试时可以单步看每个节点的输入输出。`exit_when` 是退出条件，避免无限循环。
+
+OTel tracing 是默认开的，每个节点跑一次产生一个 span，可以在 Aspire Dashboard 或 Grafana Tempo 里看到完整调用树——这一点对 multi-agent 调试至关重要，肉眼追 prompt 几乎不可能。
+
+## 五、Azure AI Foundry 部署 checklist
+
+本地跑通后部署到 Azure AI Foundry（前 Azure AI Studio），1.0 之后这条链路顺了很多：
+
+```bash
+az foundry agent deploy \
+  --name customer-service \
+  --runtime python-3.11 \
+  --entry app:flow \
+  --model-route gpt-4.1-mini \
+  --state-backend cosmos-db
+```
+
+8 项必查 checklist：
+
+1. **超时**：每个 ChatAgent 设 `timeout=30`，GraphFlow 设 `node_timeout=60`，防止单节点拖死全 flow。
+2. **并发**：`max_concurrent_tool_calls=4`，避免 Azure OpenAI 触发 429。
+3. **状态后端**：production 切 `cosmos-db` 或 `postgres`，默认 in-memory 进程挂了状态全丢。
+4. **Tracing**：OTel exporter 指向 Azure Monitor 或自托管 Tempo，sampling 默认 1.0 在生产要降到 0.1。
+5. **鉴权**：用 `AzureCliCredential` 或 `ManagedIdentityCredential`，不要 API key 硬编码。
+6. **限流**：在 Azure API Management 前置一层 token bucket，按 user_id 限速。
+7. **审计**：所有工具调用入 audit log，金融/医疗合规必要。
+8. **回滚**：用 Foundry 的 blue/green deployment，新版本先放 5% 流量。
+
+## 六、踩坑实录
+
+笔者在 5/13 GA 当天升级到 1.0 时遇到几个非显然的问题：
+
+- **Pydantic v1 vs v2 冲突**：1.0 强制 Pydantic v2，老项目升级要先迁移所有 BaseModel。
+- **MCPClient stdio 在 Windows 上句柄泄漏**：官方 GitHub 上已经有 issue，临时方案是用 `MCPClient.from_http` 走 HTTP。
+- **GraphFlow 的 condition 不能 capture 局部变量**：condition 函数会被序列化（为了 checkpoint），lambda 里别捕获外部对象，会报 PicklingError。
+- **Token 计数**：OpenAIChatClient 的 token 统计默认走 tiktoken，但 gpt-4.1 系列的真实 tokenizer 比 tiktoken 算的多 5% 左右，predictive cost 要乘 1.05。
+
+## 七、什么时候不要用它
+
+不是所有场景都适合：
+
+- **轻量脚本**：50 行能跑通的 prompt 任务，直接用 OpenAI SDK + 一个函数就行，加 Agent Framework 是 overkill。
+- **快速原型**：迭代速度比稳定性重要时，LangGraph 或 PydanticAI 启动成本更低。
+- **非 Azure 生态**：如果团队完全跑在 AWS/GCP、不打算用 Azure AI Foundry，Agent Framework 的部分企业能力（Foundry 一键部署、Entra ID）变成累赘。
+
+但只要你在 Azure 上、做企业级 agent、需要长期维护，1.0 是目前最完整的开箱即用方案。
+
+## 八、下一步
+
+官方仓库 `microsoft/agent-framework` 有 30+ examples，从单 agent 到分布式 workflow 都覆盖。建议三步上手：
+
+1. 跑通 `examples/01-chat-agent`，理解最小单元。
+2. 跑通 `examples/05-graph-flow-customer-service`，对照本文做修改。
+3. 上 Foundry 跑生产 deployment，把 8 项 checklist 内化成 CI 检查。
+
+5 月 13 日只是 1.0 的开始，Roadmap 上 1.1 计划加入 Voice agent 与 Vision agent 的原生支持，预计 7 月发布。

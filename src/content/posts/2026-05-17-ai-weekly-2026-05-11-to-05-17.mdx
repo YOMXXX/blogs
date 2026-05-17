@@ -1,0 +1,180 @@
+---
+title: "AI 周报 2026-05-11 ~ 05-17：DeepSeek V4 开源、MS Agent Framework 1.0、Cola DLM、Gemini Omni 泄露"
+description: "本周 AI 最大事件是 DeepSeek V4 把 1M 原生上下文打到开源。同期 Microsoft Agent Framework 1.0 GA、Cola DLM 论文、Gemini Omni 泄露、MolmoAct2 机器人模型集中发布。5 条要点 + 选型影响。"
+column: "weekly"
+tags: ["Weekly", "DeepSeek", "Microsoft", "Gemini", "Diffusion"]
+pubDate: 2026-05-17
+featured: false
+tldr: "本周 5 件大事：DeepSeek V4 开源（1.6T Pro + 284B Flash，原生 1M 上下文）、Microsoft Agent Framework 1.0 GA（SK + AutoGen 整合）、Cola DLM 论文（连续潜空间扩散语言模型）、Gemini Omni 在 I/O 前泄露、MolmoAct2 开源 VLA 机器人模型。综合影响是开源 1M 上下文成事实、Agent 框架进入 1.0 LTS 阶段、扩散语言模型重回视野。"
+author: "YOMXXX"
+faq:
+  - q: "本周最值得关注的发布是哪个？"
+    a: "DeepSeek V4。它把『1M token 原生上下文』从 SaaS 黑盒（Claude / Gemini）打开成 MIT license 的开源工程方案。对私有部署、合规场景、长文档/长代码任务的影响是颠覆性的——这是开源生态第一次有真正可比拼 Anthropic Opus 4.7 的长上下文能力。"
+  - q: "Microsoft Agent Framework 1.0 对 LangGraph 是威胁吗？"
+    a: "对 Azure 生态团队是。1.0 把 Semantic Kernel + AutoGen 合并、强企业鉴权、Azure AI Foundry 一键部署，是 Azure 用户的默认选择。对非 Azure 团队、追求灵活性的研究/原型团队，LangGraph 仍然更轻量。两者长期会分占企业向 / 开发者向两块市场。"
+  - q: "Cola DLM 会替代自回归 LLM 吗？"
+    a: "不会，至少 12 个月内不会。Cola 当前只有 1.4B，工程生态（vLLM/SGLang）零支持。它的真正意义是把扩散语言模型从『研究 demo』推进到『可比较的第三选项』，长期对多模态统一生成有意义。"
+  - q: "Gemini Omni 泄露说明什么？"
+    a: "Google 准备在 5/20 的 I/O 上发布一个统一图像+视频+音频+文本的多模态模型。从 UI 字符串泄露看，定位与 Sora、Veo 3 竞争视频生成市场。如果真的发布，将是首个由 Hyperscaler 推出的『一个模型一切模态』产品，对 Stability、Runway、Luma 这类专用视频模型公司是直接冲击。"
+  - q: "MolmoAct2 对开源机器人意味着什么？"
+    a: "MolmoAct2 是 Allen AI 第二代 VLA（视觉-语言-动作）模型，开放权重 + 数据集 + 代码。比 RT-2、OpenVLA 更进一步：用 flow matching 替代离散动作 tokenization、引入 adaptive depth reasoning。对开源机器人栈是当前最强 baseline，预计 3 个月内会被各大学和创业团队 fine-tune 到具体硬件平台。"
+---
+
+5 月的第三周是 AI 圈密度极高的一周。开源大模型、Agent 框架、扩散语言模型、机器人模型、多模态泄露——五个不同方向各自给出标志性事件。本期周报按"事件 → 数据 → 影响"三段记录每条。
+
+## TL;DR
+
+| 序号 | 事件 | 类型 | 关键影响 |
+|------|------|------|---------|
+| 1 | DeepSeek V4 开源 | 模型 | 1M 原生上下文成开源现实 |
+| 2 | Microsoft Agent Framework 1.0 GA | 框架 | Azure 企业 agent 默认值 |
+| 3 | Cola DLM 论文 | 论文 | 扩散语言模型重回视野 |
+| 4 | Gemini Omni 泄露 | 产品 | I/O 前的多模态预热 |
+| 5 | MolmoAct2 发布 | 模型 | 开源 VLA 机器人新 baseline |
+
+## 一、DeepSeek V4 开源：1M 原生上下文进入 MIT license
+
+### 事件
+
+5 月中旬 DeepSeek-AI 发布 V4 系列，两个 size：
+
+- **V4-Pro**：1.6T 总参数 / ~37B 激活，288 expert，原生 1M 上下文。
+- **V4-Flash**：284B 总参数 / ~14B 激活，128 expert，原生 1M 上下文。
+
+权重直接放 Hugging Face（MIT license），技术报告同期发出。
+
+### 关键数据
+
+| 指标 | V4-Pro | V4-Flash | Llama 4 405B | Claude Opus 4.7 |
+|------|--------|----------|--------------|-----------------|
+| 上下文 | 1M | 1M | 256K | 1M |
+| SWE-bench Verified | 78% | 65% | 56% | 82% |
+| NIAH 1M 单针 | 98% | 96% | 87% | 99% |
+| NIAH 1M 多针 | 89% | 81% | 41% | 92% |
+| 部署门槛 | 22×H100 (FP8) | 8×H100 (FP8) | 16×H100 | API only |
+| License | MIT | MIT | Llama 4 | Anthropic |
+
+### 影响
+
+三层：
+
+1. **能力层**：开源生态第一次有真正可比 Opus 4.7 的长上下文能力，差距控制在 3-5%。
+2. **生态层**：vLLM-Ascend 与 SGLang 已支持 Flash，TensorRT-LLM 6 月跟进，Llama.cpp 已有 Flash 量化版。
+3. **架构层**：V4 论文提的 mHC（残差稳定）、CSA/HCA（混合注意力）、Muon（优化器）三件套被 Mistral、Meta 等团队 reference 到下一代规划中。
+
+详见本站同日发布的[DeepSeek V4 架构深度解析](/posts/2026-05-17-deepseek-v4-mhc-hybrid-attention-architecture-deep-dive)。
+
+## 二、Microsoft Agent Framework 1.0 GA
+
+### 事件
+
+5 月 13 日微软 devblogs 宣布 Agent Framework 1.0 正式发布，.NET 和 Python 双语言同步。这是 Semantic Kernel + AutoGen 两条产品线的合并版本，1.0 之后老项目进入 maintenance。
+
+### 关键特性
+
+- 单 SDK 覆盖单 agent、多 agent 编排（GraphFlow / GroupChat）、工具调用、MCP 集成。
+- OpenTelemetry tracing 默认开启。
+- Azure AI Foundry 一键部署。
+- API 稳定承诺：1.x LTS 至少 2 年。
+- 模型支持：Azure OpenAI / OpenAI / Anthropic / Ollama / 本地。
+
+### 影响
+
+对 Azure 生态团队：默认选择已定，老 SK 与 AutoGen 项目应规划迁移路径。对 LangGraph、CrewAI 等竞争者：在 Azure 内会被压缩空间，在非 Azure 仍有差异化（更轻、迭代快）。
+
+3 个月内预期：CrewAI 或 LangGraph 会发"Microsoft Agent Framework 对照表"反向营销；Anthropic 可能发 Claude Agent SDK v2 强化 Python 生态。
+
+详见本站同日发布的[Microsoft Agent Framework 1.0 实战](/posts/2026-05-17-microsoft-agent-framework-1-0-workshop)。
+
+## 三、Cola DLM 论文：扩散语言模型新范式
+
+### 事件
+
+5 月初 arXiv 2605.06548《Continuous Latent Diffusion Language Model》登 Hugging Face Daily Papers，作者用三段式架构（Text VAE + 潜空间扩散 + 条件解码）把扩散语言模型在 1.4B 规模拉到与 GPT 相差 3% PPL。
+
+### 关键数据
+
+| 指标 | GPT-2 1.4B | Cola DLM 1.4B |
+|------|-----------|---------------|
+| WikiText-103 PPL | 17.6 | 18.2 |
+| Distinct-2 | 0.71 | 0.83 |
+| Self-BLEU | 0.34 | 0.21 |
+| 推理 batch=8 L=512 | 4.2 s | 2.1 s |
+
+### 影响
+
+短期：研究方向标杆。中期：如果 7B 版本（论文承诺中）能 scale，会成为多模态统一生成的候选基座。长期：可能改变 OpenAI、Anthropic 的研究路线——把扩散从图像/视频扩展到文本是一个值得长期下注的方向。
+
+工程团队 6 个月内基本不会用 Cola，但应该 watch。详见本站同日发布的[Cola DLM 论文精读](/posts/2026-05-17-cola-dlm-continuous-latent-diffusion-language-model-paper)。
+
+## 四、Gemini Omni 泄露：I/O 2026 多模态预热
+
+### 事件
+
+5 月 11 日 Gemini app 视频生成 tab 的 UI 字符串中泄露"Omni"模型名，引发对 Google 在 5/20 I/O 上发布全模态模型的猜测。媒体（mashable、imini）汇总信号：
+
+- Omni 可能统一视频 + 图像 + 音频 + 文本生成。
+- 与 Sora 2 / Veo 3 直接竞争。
+- Workspace 集成（Docs / Slides 直接调用）。
+
+### 推断
+
+如果属实，Gemini Omni 是 Google 试图把"Hyperscaler + AI 模型 + 生产力套件"三件事打包的核心武器。对独立视频模型公司（Stability、Runway、Luma）是直接威胁——同样的能力 + 全套 Workspace 集成，市场逻辑变了。
+
+观察点：5/20 I/O 主 keynote、Gemini API 文档更新、Vertex AI 多模态 SKU 上线。
+
+## 五、MolmoAct2：开源 VLA 机器人新 baseline
+
+### 事件
+
+5 月 Allen AI 发布 MolmoAct2，第二代视觉-语言-动作（VLA）开源模型，附带：
+
+- 7B / 32B 两个 size，开放权重。
+- 4 个新数据集（家庭、工厂、户外、操作）。
+- 完整训练代码（含 RL 阶段）。
+
+### 关键改进
+
+| 项 | MolmoAct (v1) | MolmoAct2 |
+|----|---------------|-----------|
+| 动作表示 | 离散 token | 连续 flow matching |
+| 视觉 backbone | CLIP | Molmo2（开源 VLM） |
+| 深度推理 | 固定步数 | adaptive depth |
+| RT-1 操作成功率 | 71% | 84% |
+
+### 影响
+
+VLA 开源生态在过去一年由 RT-2（Google，闭源）、OpenVLA（开源）撑场。MolmoAct2 把开源 baseline 拉到接近 RT-2 水平，对学术界与机器人创业团队的影响是直接的——预计 3 个月内会看到大量"MolmoAct2 + 我家机器人"的论文与产品。
+
+值得关注的下游：人形机器人创业（Figure、1X）、工业机器人厂商（Yaskawa、KUKA）是否会用 MolmoAct2 替代自研。
+
+## 六、本周其他值得注意
+
+- **Causal Forcing++ 论文**（arXiv 2605.15141）：清华 + UC 提出实时交互视频生成蒸馏方案，把扩散视频从 50 步压到 4 步，FPS 翻 12 倍。
+- **DeepSeek V3.2 退役**：V4 发布同日 V3.2 进入"长期支持"状态，新需求统一去 V4。
+- **Hugging Face State of OSS**：发布春季报告，2026 春季 OSS 模型下载量第一次超过闭源模型 API 调用量。
+- **Anthropic Opus 4.7 1M context**：Anthropic 把 1M 上下文从 beta 转 GA，定价不变，对企业用户是直接利好。
+- **Mistral 8.1**：Mistral 5/15 发布 8.1 小版本，主要是 fine-tuning API 改进、infra 优化，无新架构。
+- **Reddit r/LocalLLaMA "April 2026 best month ever" 帖**：社区评 4 月是开源模型最好的一个月（V3.2、Llama 4 Maverick、Qwen3.6），5 月 V4 发布把这一势头推到新高。
+
+## 七、本周选型影响
+
+如果你的团队当前在做：
+
+- **长上下文 RAG**：V4-Flash 替换现有方案的窗口期到了。先在 staging 跑 1 周对照。
+- **多 agent 编排（Azure 生态）**：从老 SK / AutoGen 启动 1.0 迁移评估。
+- **多 agent 编排（非 Azure）**：观望 1-2 个月，看 LangGraph 是否有反击动作。
+- **视频生成产品**：评估 5/20 后是否要重新 align 路线，Gemini Omni 的定价会直接影响成本结构。
+- **机器人控制 / 具身智能**：把 MolmoAct2 加进 baseline 评测矩阵。
+- **LLM 可观测**：本周笔者发了[5 平台横评](/posts/2026-05-17-llm-observability-tools-comparison-2026)，可对照选型。
+
+## 八、下周看点
+
+- **5/20 Google I/O**：Gemini Omni 是否真发布、Android XR 进展、Spark Agent 编程产品。
+- **5/22 OpenAI DevDay 预热**：传 OpenAI 会在 6 月初的 DevDay 上发布 GPT-5.5 Codex 特别版。
+- **DeepSeek V4 推理优化**：vLLM PR 是否合并 V4-Pro 支持，TensorRT-LLM 6 月 release notes。
+- **Cola DLM 7B**：作者承诺 6 月放出 7B checkpoint，scaling law 是否成立见分晓。
+
+如果 Gemini Omni 在 I/O 上确认 + V4 推理生态成熟同时发生，5 月会被回头看作"开源 1M + Hyperscaler 全模态"的双轨拐点。
+
+下期周报 5/24 见。
