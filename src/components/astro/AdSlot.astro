@@ -1,18 +1,19 @@
 ---
 interface Props {
   position: string;
+  slot: string;
   format?: 'auto' | 'horizontal' | 'vertical' | 'rectangle';
 }
 
-const { position, format = 'auto' } = Astro.props;
+const { position, slot, format = 'auto' } = Astro.props;
 ---
 
-<div class="ad-slot">
+<div class="ad-slot" data-position={position}>
   <ins
     class="adsbygoogle"
     style="display:block"
     data-ad-client="ca-pub-7299456929245815"
-    data-ad-slot="7743694031"
+    data-ad-slot={slot}
     data-ad-format={format}
     data-full-width-responsive="true"
   ></ins>
