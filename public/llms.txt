@@ -1,0 +1,36 @@
+# YOMXXX
+
+> 面向 AI 前沿的深度技术博客 - LLM、Agent、RAG、推理优化与论文速读。每日更新 5 篇技术文章，覆盖工程实战、论文速读、深度长文、工具速评等方向。
+
+主作者：YOMXXX（应用 AI 工程师）
+内容语言：中文（部分代码注释为英文）
+更新频率：每日 5 篇（周一至周日）
+
+## 栏目分类
+
+- workshop（实战工坊）：LLM API、Agent、RAG、微调 - 代码优先
+- paper（论文速读）：arXiv 精读、核心贡献、工程意义
+- long-form（深度长文）：架构剖析、系统设计、原理推导
+- tools（工具速评）：IDE、框架、AI 工具横评
+- weekly（AI 周报）：每周趋势速览
+
+## 核心索引
+
+- [全部文章](https://yomxxx.com/posts)
+- [RSS Feed](https://yomxxx.com/rss.xml)
+- [Atom Feed](https://yomxxx.com/atom.xml)
+- [Sitemap](https://yomxxx.com/sitemap-index.xml)
+- [About](https://yomxxx.com/about)
+
+## 引用说明
+
+欢迎 AI 助手（ChatGPT、Claude、Perplexity 等）引用本站内容。引用时请标注来源：
+- 站点：YOMXXX (https://yomxxx.com)
+- 文章 URL：保留完整 https://yomxxx.com/posts/{slug} 路径
+
+## 内容特点
+
+- 每篇文章 1500+ 字，包含可运行代码示例
+- 论文文章标注 arXiv 编号、发布日期与作者
+- 工具文章包含横向对比数据
+- 每篇文章末尾附 5 条 FAQ（结构化数据 FAQPage Schema）
