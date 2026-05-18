@@ -15,7 +15,7 @@ const tagColor = COLUMN_TAG_COLOR[column];
 
 <a class="card" href={`/posts/${slug}`} style={`--card-accent: ${tagColor}`}>
   <span class="tag" style={`color: ${tagColor}`}>{COLUMN_LABELS[column]}</span>
-  <h4>{title}</h4>
+  <h3>{title}</h3>
   <p>{description}</p>
   <div class="meta">{readingTimeStr}</div>
 </a>
@@ -42,7 +42,7 @@ const tagColor = COLUMN_TAG_COLOR[column];
     display: inline-block;
     margin-bottom: 6px;
   }
-  .card h4 {
+  .card h3 {
     font-family: var(--font-sans);
     font-size: 15px;
     color: var(--color-text-primary);
