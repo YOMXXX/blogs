@@ -130,7 +130,7 @@ V4 在多 needle recall 上接近 Claude，KV cache 还少一半多。
 MoE 模型每步只激活 N 个 expert（V4-Pro 总 expert 384，每 token 激活 8 个）。这导致：
 
 - 不同 expert 看到的样本数高度不平衡。
-- Adam 的 momentum 估计 m_t = β·m_{t-1} + (1-β)·g_t 在稀疏激活下偏差大。
+- Adam 的 momentum 估计 `m_t = β·m_{t-1} + (1-β)·g_t` 在稀疏激活下偏差大。
 - expert 之间梯度方差差 100× 以上。
 
 结果是 routing 倾向"赢家通吃"——少数 expert 被高频激活、其他被冷落，模型容量浪费。
