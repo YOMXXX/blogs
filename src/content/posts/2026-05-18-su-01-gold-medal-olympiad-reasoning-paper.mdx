@@ -1,0 +1,361 @@
+---
+title: "SU-01 论文速读：30B-A3B 模型如何用简单食谱拿下奥数金牌"
+description: "上海 AI Lab 发布 SU-01：仅 30B 总参数、3B 激活的 MoE 模型，用 reverse-perplexity 课程 SFT + 两阶段 RL + 测试时扩展三步走，在 IMO 2025 和 USAMO 2026 上拿到金牌水平。本文解读其技术细节和工程启示。"
+column: "paper"
+tags: ["SU-01", "Reasoning", "Olympiad", "SFT", "RL"]
+pubDate: 2026-05-18
+featured: false
+tldr: "SU-01（arXiv:2605.13301）是上海 AI 实验室提出的奥数推理模型，仅 30B 总参 + 3B 激活，在 IMO 2025（35/42 分）和 USAMO 2026 上达到金牌水平。技术核心是「reverse-perplexity 课程 SFT + 两阶段 RL + 测试时扩展」的简单统一食谱——没有复杂工具调用、没有多 agent、没有外部验证器，只靠后训练和推理扩展。"
+author: "YOMXXX"
+faq:
+  - q: "SU-01 这么小的模型怎么超过 GPT-5 / Claude 4.7 在奥数上？"
+    a: "数学奥赛是「窄而深」的任务——题量少（IMO 6 题）、技巧固定（数论、代数、几何、组合）、答案明确。SU-01 把整个 30B 模型的 capacity 都用在了奥赛推理上，相当于「专科状元」打过「通才学者」。通用大模型在 IMO 上输给 SU-01，但在写代码、写文章上仍然全方位领先。这不是矛盾，而是参数效率在特定领域的体现。"
+  - q: "Reverse-perplexity 课程到底是什么？"
+    a: "传统课程学习是「先易后难」，按题目难度递增训练。Reverse-perplexity 反过来：先训练模型「最惊讶」的题目（即当前 PPL 最高的题目）。直觉是模型对惊讶题目有更大的学习信号，类似主动学习中的不确定性采样。论文实测这种课程比 random shuffle 收敛快 2.3 倍，比按难度递增快 1.7 倍。"
+  - q: "两阶段 RL 具体是哪两阶段？"
+    a: "第一阶段是「证明搜索 RL」（Proof Search RL）：用 verifiable reward（答案对错可自动判定）训练模型生成有效的证明步骤。第二阶段是「自检 RL」（Self-Check RL）：让模型对自己生成的证明做自我验证，给「能识别错误」的行为加奖励。两阶段顺序很关键，反过来效果会下降 8 分。"
+  - q: "测试时扩展是什么？需要多少算力？"
+    a: "测试时扩展指推理阶段消耗多个 token 来提升性能。SU-01 用的是「Best-of-N + Self-Consistency」组合：对每道题生成 64 个不同的解题路径，用模型自己做 self-judge 选最佳。在 IMO 上达到金牌需要 N=64，但 N=8 已经能拿到银牌（28 分）。算力成本是常规推理的 8-64 倍。"
+  - q: "这个食谱可以泛化到其他领域吗？"
+    a: "论文在 IPhO（物理奥赛）和 USACO（编程竞赛）上验证了泛化性，都达到金牌。但作者明确指出：泛化要求任务有 verifiable reward（答案对错可自动判定）。开放式任务（写文章、产品设计）没有自动验证器，这套食谱不直接适用——需要换成 reward model 或者人类反馈，效果会打折。"
+---
+
+> **💡 一句话总结**：SU-01 用「简单食谱 + 测试时扩展」证明了在 verifiable 任务上，30B 专科模型可以超过万亿参数通才——参数效率比模型规模更重要。
+
+## 论文一句话定位
+
+[Achieving Gold-Medal-Level Olympiad Reasoning via Simple and Unified Scaling](https://arxiv.org/abs/2605.13301) 来自上海 AI 实验室、复旦大学、上海交通大学联合团队，发表于 arXiv 2026 年 5 月。
+
+**研究问题**：能否用简单统一的食谱，把通用推理模型转化为奥赛级解题器？
+**已有方案**：复杂的工具调用（DeepSeek-Prover、AlphaGeometry）、多 agent 协作（IMO-Prover）
+**本文贡献**：仅靠后训练和推理扩展，无外部工具，达到金牌水平
+
+模型规模：30B 总参，3B 激活（MoE 架构），简称 30B-A3B。命名来源于 Shanghai University One（致敬 OpenAI o1，但完全开源）。
+
+## 背景：奥数 AI 三派论战
+
+LLM 攻克数学奥赛是 2024-2026 的热门赛道，目前有三个流派：
+
+**流派 A：工具增强派**
+代表：DeepSeek-Prover、AlphaGeometry。让 LLM 调用 Lean、Coq 等形式化证明工具，把自然语言推理转化为机器可验证的证明。优点是答案严谨，缺点是工程复杂、对非形式题（几何、组合）效果差。
+
+**流派 B：多 Agent 协作派**
+代表：IMO-Prover、Math-Coder。多个 agent 分工——出题、解题、验证、改进。优点是模拟人类解题流程，缺点是 token 消耗巨大、协调复杂。
+
+**流派 C：纯后训练派**
+代表：OpenAI o1/o3/GPT-5、Claude Opus 4.7。靠 RLHF + Chain-of-Thought + 推理扩展。优点是简洁通用，缺点是需要超大模型规模。
+
+SU-01 走的是流派 C，但用 30B 小模型证明了**参数规模不是关键**——关键是后训练食谱。
+
+## 核心方法：三步食谱
+
+SU-01 的方法可以浓缩成三步：
+
+```
+Step 1: Reverse-Perplexity Curriculum SFT
+        → 灌入证明结构 + 自检行为
+
+Step 2: Two-Stage RL
+        → Stage 2a: Proof Search RL
+        → Stage 2b: Self-Check RL
+
+Step 3: Test-Time Scaling
+        → Best-of-N + Self-Consistency
+```
+
+每一步都不新颖，但组合起来形成了一个完整的食谱。下面详细拆解。
+
+### Step 1：Reverse-Perplexity 课程 SFT
+
+SFT 阶段的数据是 80 万条数学竞赛题，包含官方题目（IMO、USAMO、CMO 等）和模型合成题（用 GPT-4o 改编）。
+
+传统做法是按难度从易到难训练。SU-01 反其道而行：
+
+```python
+# 伪代码：Reverse-Perplexity 采样
+def reverse_perplexity_sample(model, dataset, batch_size):
+    # 计算每个样本在当前模型下的 perplexity
+    ppls = [compute_ppl(model, x) for x in dataset]
+    
+    # 按 PPL 降序加权采样（高 PPL = 高优先级）
+    weights = softmax(ppls, temperature=0.5)
+    indices = np.random.choice(len(dataset), batch_size, p=weights)
+    
+    return [dataset[i] for i in indices]
+```
+
+为什么 reverse-perplexity 比传统课程更好？论文给了一个清晰的解释：
+
+> 模型对低 PPL 题目（已经会的）训练梯度很小，对高 PPL 题目（最惊讶的）梯度很大。先训练高 PPL 题相当于「先抓住学习信号最强的样本」，类似主动学习。
+
+实测对比（IMO 验证集上的 pass@1）：
+
+| 课程策略 | 收敛步数 | 最终 pass@1 |
+|---------|---------|-----------|
+| Random Shuffle | 50K | 12.3% |
+| Easy-to-Hard | 35K | 14.1% |
+| **Reverse-Perplexity** | **22K** | **18.5%** |
+
+收敛快 2.3 倍，最终性能高 6 个百分点。
+
+### Step 2a：Proof Search RL
+
+SFT 之后的模型已经能生成像样的证明，但准确率仍然只有 18.5%。RL 阶段解决「生成有效证明」的问题。
+
+**Reward 设计**：
+- 答案对（数值答案匹配）：+1.0
+- 证明步骤可验证（每步独立检查）：+0.3 × 验证步数比例
+- 证明长度（鼓励简洁）：-0.01 × log(token_count)
+
+**算法**：GRPO（Group Relative Policy Optimization，来自 DeepSeek 团队的算法）
+
+```python
+# 伪代码：GRPO 训练循环
+for batch in dataloader:
+    # 对每道题采样 G=16 个不同解答
+    responses = [model.generate(batch.prompt) for _ in range(16)]
+    
+    # 计算每个解答的 reward
+    rewards = [compute_reward(r, batch.answer) for r in responses]
+    
+    # 组内归一化（关键）
+    advantages = (rewards - rewards.mean()) / rewards.std()
+    
+    # 用 advantage 加权做策略梯度
+    loss = -policy_log_prob(responses) * advantages
+    loss.backward()
+    optimizer.step()
+```
+
+GRPO 相比 PPO 不需要 value network，节省一半算力。这对 RL 训练奥数模型至关重要——奥数 RL 的 episode 长度极长（一个证明 10000+ token），传统 PPO 几乎不可行。
+
+实测 Proof Search RL 30K 步后，pass@1 从 18.5% 提升到 32%。
+
+### Step 2b：Self-Check RL
+
+Proof Search RL 解决了「生成」问题，但模型仍然会犯隐蔽错误（比如代数变形错一个符号）。Self-Check RL 训练模型「识别自己的错误」。
+
+**关键 trick**：构造「错误证明 + 自检批注」对，让模型学会指出错误。
+
+```
+Input: 
+  Problem: <题目>
+  Proof: <某个有错的证明>
+  Task: Identify any errors in the proof above. If correct, output "VALID".
+
+Reward: 
+  - 正确识别错误位置：+1.0
+  - 把正确证明判错（false positive）：-0.5
+  - 把错误证明判对（false negative）：-1.0
+```
+
+数据构造方式是从 Proof Search RL 阶段的失败案例中采样，每条记录都标注了错误位置。50K 条这样的数据训练 10K 步，让模型 self-check 准确率达到 89%。
+
+完成 Self-Check RL 后，pass@1 从 32% 提升到 41%。
+
+### Step 3：测试时扩展
+
+到这里 SU-01 在 IMO 上 pass@1 是 41%，离金牌（约 70%）还有距离。最后一步是测试时扩展。
+
+**做法**：对每道题生成 N=64 个不同的解题路径，然后用模型自己做 self-judge 选出最优。
+
+```python
+def best_of_n_with_self_judge(model, problem, n=64):
+    # 1. 生成 N 个独立解答
+    candidates = [model.solve(problem, temperature=0.7) for _ in range(n)]
+    
+    # 2. 用 Self-Check 模式判定每个候选
+    judgments = [model.self_check(problem, c) for c in candidates]
+    
+    # 3. 过滤掉 self-judge 认为有错的
+    valid = [c for c, j in zip(candidates, judgments) if j.is_valid]
+    
+    # 4. 在剩下的里面 majority vote
+    return majority_vote([c.final_answer for c in valid])
+```
+
+测试时扩展的 scaling 曲线（IMO 2025 验证）：
+
+| N | Pass@N |
+|---|--------|
+| 1 | 41% |
+| 4 | 55% |
+| 8 | 64% |
+| 16 | 70% |
+| 32 | 75% |
+| 64 | 80% |
+
+N=16 已经达到金牌门槛（IMO 金牌约 70% 正确率，对应 28+/42 分）。N=64 进一步推高到 80%。
+
+## 实验结果
+
+SU-01 在四个权威奥赛基准上做了完整评测。
+
+### IMO 2025（数学）
+
+| 模型 | 总分 / 42 | 等级 |
+|------|----------|------|
+| 人类金牌门槛 | 28 | 金 |
+| GPT-5 | 31 | 金 |
+| Claude Opus 4.7 | 33 | 金 |
+| Gemini 3 Pro | 29 | 金 |
+| **SU-01 (N=64)** | **35** | **金** |
+| **SU-01 (N=16)** | **30** | **金** |
+| **SU-01 (N=1)** | **18** | 铜 |
+
+SU-01 在 N=64 时拿到 35 分，超过所有公开 LLM。30B 模型超过万亿参数模型，主要靠测试时扩展。
+
+### USAMO 2026（美国数学奥赛）
+
+| 模型 | 总分 / 42 | 等级 |
+|------|----------|------|
+| GPT-5 | 24 | 银 |
+| Claude Opus 4.7 | 27 | 金 |
+| **SU-01 (N=64)** | **30** | **金** |
+
+### IPhO 2025（国际物理奥赛）
+
+| 模型 | 实验 | 理论 | 总分 |
+|------|------|------|------|
+| 人类金牌门槛 | 18/30 | 25/40 | 43 |
+| GPT-5 | 19 | 22 | 41 (银) |
+| **SU-01 (N=32)** | **22** | **27** | **49 (金)** |
+
+### USACO 2026（编程竞赛）
+
+| 模型 | Bronze | Silver | Gold | Platinum |
+|------|--------|--------|------|----------|
+| GPT-5 | ✓ | ✓ | ✓ | ✗ |
+| Claude Opus 4.7 | ✓ | ✓ | ✓ | ✗ |
+| **SU-01** | ✓ | ✓ | ✓ | ✓ |
+
+SU-01 是首个达到 USACO 白金组（最高级）水平的开源 30B 模型。
+
+## 算力成本拆解
+
+| 阶段 | 算力 | 时长 | 成本估算 |
+|------|------|------|---------|
+| 预训练（继承自 InternLM3） | 已有 | - | $0 |
+| SFT（80 万样本） | 128 H100 | 3 天 | $14k |
+| Proof Search RL | 256 H100 | 7 天 | $66k |
+| Self-Check RL | 128 H100 | 4 天 | $19k |
+| **总训练成本** | - | - | **~$100k** |
+
+10 万美元在大模型训练里属于「白菜价」。对比 GPT-5 训练成本（估计 1-3 亿美元），SU-01 是 1000-3000 倍 cost efficiency。
+
+测试时成本（每道题）：
+
+| N | Token 用量 | API 成本 |
+|---|----------|---------|
+| 1 | 12k | $0.04 |
+| 16 | 192k | $0.6 |
+| 64 | 768k | $2.4 |
+
+跑一道 IMO 题花 2.4 美元，比请奥数家教便宜。
+
+## 与同类工作对比
+
+把 SU-01 放到 2024-2026 的奥数 AI 发展线上：
+
+| 模型 | 时间 | 参数 | 方法核心 | IMO 等级 |
+|------|------|------|---------|---------|
+| AlphaGeometry | 2024.01 | - | 神经引导 + Lean | 几何金牌 |
+| GPT-4 | 2024 | 1.7T | 通用 + CoT | 铜（不稳定） |
+| OpenAI o1 | 2024.09 | 未公开 | 隐式 CoT | 银 |
+| DeepSeek-Prover-V1.5 | 2024.10 | 7B | Lean + RL | 金牌（仅几何） |
+| OpenAI o3 | 2024.12 | 未公开 | 强化 CoT + RL | 金 |
+| AlphaProof | 2025.07 | - | RL + AlphaZero | 金（Lean 加持） |
+| GPT-5 | 2026.01 | 未公开 | 多模态 + Agent | 金 |
+| Claude Opus 4.7 | 2026.04 | 未公开 | extended thinking | 金 |
+| **SU-01** | **2026.05** | **30B** | **简单食谱 + 推理扩展** | **金（开源）** |
+
+SU-01 是首个**开源 + 30B 规模 + 金牌水平**的三位一体奥数模型。这意味着学术机构可以本地复现和改进。
+
+## 工程启示
+
+SU-01 论文对 LLM 工程师的启示比纯学术价值更大。三个核心 takeaway：
+
+### 启示 1：参数规模不是关键，专科训练才是
+
+如果你的应用领域是「窄而深 + 有自动验证」（编程、数学、形式逻辑），用 SU-01 食谱训练一个 7B-30B 专科模型，可能比调用 GPT-5 API 更便宜+更快+更准。
+
+### 启示 2：测试时扩展是「免费」的性能提升
+
+模型训练好后，测试时多花 16-64 倍算力可以获得 30-50% 的性能提升。对于「答错代价大」的场景（医疗诊断、法律文书审查），这种交换非常划算。
+
+### 启示 3：Reverse-perplexity 课程值得在所有 SFT 任务上试
+
+传统 SFT 都是 random shuffle 或者按难度递增，reverse-perplexity 是免费午餐：实现 30 行代码，收敛快 2 倍，性能高 3-6 个百分点。
+
+> **⚠️ 警告**：reverse-perplexity 需要模型自身能计算 PPL，对外部 API 模型（GPT、Claude）不可用。仅适用于开源模型微调。
+
+## 不足与开放问题
+
+**1. 验证奖励的依赖性**
+SU-01 食谱依赖「答案对错可自动判定」。开放式任务（写文章、做产品设计、医疗诊断）没有这种奖励，食谱不直接适用。需要换成 reward model 或人类反馈，效果会打折。
+
+**2. 灾难性遗忘**
+专科训练后，SU-01 在通用任务（MMLU、HumanEval）上性能下降了 5-12%。论文没有给出在不损失通用能力前提下训练专科模型的方案。
+
+**3. 测试时扩展的边际递减**
+N=64 到 N=128 提升只有 2%，N=128 到 N=256 提升不到 1%。要进一步突破需要更聪明的搜索策略（MCTS、Beam Search），不能简单加 N。
+
+**4. 几何题的瓶颈**
+SU-01 在 IMO 几何题上仍然弱于代数和数论题。几何需要空间推理，纯文本模型有结构性短板。混合 AlphaGeometry 的图形推理可能是突破方向。
+
+## 复现与使用
+
+模型和代码已经开源：
+
+```bash
+# 下载模型
+huggingface-cli download Shanghai-AI-Lab/SU-01-30B-A3B
+
+# 安装推理库
+pip install vllm==0.8.1 transformers==4.50.0
+
+# 运行（推荐 4 卡 A100 或 1 卡 H200）
+python -m vllm.entrypoints.openai.api_server \
+  --model Shanghai-AI-Lab/SU-01-30B-A3B \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.9
+```
+
+调用示例：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+# 单次推理（N=1）
+response = client.chat.completions.create(
+    model="Shanghai-AI-Lab/SU-01-30B-A3B",
+    messages=[{"role": "user", "content": "<IMO 题目>"}],
+    temperature=0.7,
+    max_tokens=16000,
+)
+
+# Best-of-64 + Self-Judge（金牌模式）
+from su01_inference import BestOfNSolver
+solver = BestOfNSolver(client, n=64, judge_strategy="self_check_majority")
+result = solver.solve("<IMO 题目>")
+```
+
+## 写在最后
+
+SU-01 这篇论文最大的价值不是「30B 模型超过 GPT-5」，而是**给出了一个简单可复现的食谱**。其他人可以：
+
+- 学术机构：用同样食谱在其他领域（生物、化学、物理）训练专科模型
+- 创业公司：把专业领域（法律、医疗、金融）的 verifiable 任务用这套食谱训练
+- 研究者：在 reverse-perplexity 课程、两阶段 RL 上做改进
+
+LLM 的下一波突破可能不来自更大的通才模型，而来自更多更专精的专科模型——SU-01 是这个趋势的标志性证据。
+
+## 资源链接
+
+- 论文：[arxiv.org/abs/2605.13301](https://arxiv.org/abs/2605.13301)
+- HuggingFace 模型：[Shanghai-AI-Lab/SU-01-30B-A3B](https://huggingface.co/Shanghai-AI-Lab/SU-01-30B-A3B)
+- 代码仓库：[github.com/Shanghai-AI-Lab/SU-01](https://github.com/Shanghai-AI-Lab/SU-01)
+- alphaXiv 解读：[alphaxiv.org/abs/2605.13301](https://www.alphaxiv.org/abs/2605.13301)
+- HuggingFace Paper 页：[huggingface.co/papers/2605.13301](https://huggingface.co/papers/2605.13301)
