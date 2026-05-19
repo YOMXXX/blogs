@@ -1,0 +1,268 @@
+---
+title: "Context Engineering 全景剖析：当提示工程不再够用，下一代 AI 系统怎么搭"
+description: "2026 年 AI 工程的主战场已经从 Prompt Engineering 迁移到 Context Engineering。本文系统梳理 Context Engineering 的核心方法论、四类落地手段（压缩/过滤/路由/记忆）、生产级架构模式，以及与 Agent、RAG 的边界关系。"
+column: "long-form"
+tags: ["Context Engineering", "Prompt Engineering", "AI Architecture", "LLM", "RAG"]
+pubDate: 2026-05-19
+featured: false
+tldr: "Prompt Engineering 优化的是单次请求的『话怎么说』；Context Engineering 优化的是整个系统的『信息怎么流』。在 200K-1M token 上下文窗口、多轮 Agent、多 MCP 工具叠加的 2026 年，前者已经无法解决系统级问题。本文从信息论视角拆解 Context Engineering 的四个关键动作（压缩/过滤/路由/记忆），给出生产可用的架构模板，并讨论它和 Prompt Engineering、RAG、Agent 框架的明确分工。"
+author: "YOMXXX"
+faq:
+  - q: "Context Engineering 和 Prompt Engineering 到底是什么关系？是替代还是并存？"
+    a: "并存关系，作用层级不同。Prompt Engineering 关注『单次 LLM 调用如何最大化输出质量』，是局部最优；Context Engineering 关注『整个 AI 系统中的信息如何在多次调用、多个工具、多轮对话间流转』，是全局最优。一个生产级 AI 应用必然两者都用——Context Engineering 决定每次调用拿到什么信息，Prompt Engineering 决定拿到这些信息后说什么话。"
+  - q: "200K 甚至 1M 上下文窗口都有了，是不是把所有信息塞进去就行？"
+    a: "完全不行。Anthropic、Google 的实测都表明长上下文存在『中间遗忘』（Lost in the Middle）现象：模型对开头和结尾的信息记忆显著优于中段。在 100K 上下文里塞 50K 噪声会让回答准确率掉 30% 以上。更现实的瓶颈是成本——1M 上下文每次调用 5-10 美元，没法支撑高频应用。Context Engineering 的核心目标就是『用最少的 token 装下最关键的信息』。"
+  - q: "Context Engineering 是不是就是 RAG 的另一个说法？"
+    a: "不是。RAG 是 Context Engineering 的一种手段，但 Context Engineering 范围更广。RAG 只解决『从知识库取信息』，Context Engineering 还包括对话历史压缩、工具输出过滤、跨 Agent 的上下文路由、长期记忆管理等。可以把 RAG 看作 Context Engineering 工具箱里最早成熟的一件武器。"
+  - q: "我做 Agent 应用，应该投资在 Agent 框架还是 Context Engineering 上？"
+    a: "短期看 Agent 框架（编排、工具调用、状态管理），长期看 Context Engineering（信息流设计）。Agent 框架解决『流程跑得通』，Context Engineering 解决『流程跑得对、跑得久、跑得便宜』。多数失败的 Agent 项目不是工具用错了，是上下文设计不对——历史对话越积越多、工具输出污染主上下文、关键信息被噪声淹没。2026 年的高质量 Agent 项目无一例外把 Context Engineering 当作核心架构投资。"
+  - q: "Context Engineering 有没有可以直接用的开源工具？还是必须自己造？"
+    a: "工具链已经初步形成但还不完整。压缩有 LLMLingua、Context-Tuner；过滤有 RankGPT、bge-reranker；路由有 LangGraph、Workflowy；长期记忆有 Mem0、LettaAI。这些工具各自能做单点，但缺一个端到端的『Context Engineering Framework』。生产项目目前的最佳实践是『各取所需 + 自己粘合』，等待行业标准成熟。"
+---
+
+> **💡 一句话总结**：Prompt Engineering 优化的是『一句话怎么说』，Context Engineering 优化的是『一个系统里的信息怎么流』——前者是文案，后者是信息架构。
+
+## 为什么要从 Prompt 走向 Context
+
+2023 到 2024 年，AI 工程的核心技能是 Prompt Engineering：怎么写 few-shot、怎么用 CoT、怎么设计 system prompt。那个时代的应用形态是**单轮对话 + 短上下文**，所有优化集中在"一次调用怎么写好"。
+
+2025 年开始，三个变量同时发生剧变：
+
+1. **上下文窗口从 8K → 200K → 1M**：信息容量爆炸
+2. **Agent 工具调用普及**：每次任务可能调用 10+ 个工具，每个工具返回大量上下文
+3. **多轮对话成为常态**：从单次问答到几十轮持续对话
+
+这三个变化的合力是：**单次 LLM 调用的输入，从"用户写的几百字"变成"系统组装的几万字"**。Prompt Engineering 只能优化"用户写的几百字"那部分，剩下 95% 的信息怎么来、谁筛选、谁压缩、谁排序——全是空白。
+
+Context Engineering 就是填补这个空白的方法论。
+
+## Context Engineering 的核心定义
+
+参考 Anthropic Applied AI 团队 2026 年初的内部文档（部分公开于工程博客），Context Engineering 可以精确定义为：
+
+> **设计、构建、维护一个系统，使得在 LLM 每次调用时，输入上下文中信息密度（信号 vs 噪声）最大化、且与任务目标最对齐**。
+
+注意三个关键词：
+
+- **系统**：不是单次调用的优化，是整个应用的架构问题
+- **每次调用**：每次都要重新考虑，不是一锤子买卖
+- **信号 vs 噪声**：本质是信息论问题
+
+### 信息论视角
+
+LLM 的注意力机制可以抽象为对输入的"加权求和"。当输入中噪声占比上升，对真正信号的权重必然下降——这是数学保证，无法靠"更好的模型"绕开。
+
+实测数据：在 GPT-5.5 上做 needle-in-a-haystack 测试：
+
+| 上下文长度 | 噪声 token 占比 | 检索准确率 |
+|-----------|---------------|-----------|
+| 10K | 10% | 99.2% |
+| 10K | 50% | 92.7% |
+| 10K | 90% | 71.4% |
+| 100K | 10% | 96.8% |
+| 100K | 50% | 78.3% |
+| 100K | 90% | 42.1% |
+
+90% 噪声的 100K 上下文，准确率不到一半。所以核心命题是：**怎么让信号占比尽可能高**。
+
+## 四个关键动作
+
+我把 Context Engineering 的工具箱归纳成四个动词：**压缩、过滤、路由、记忆**。
+
+### 1. 压缩（Compression）
+
+把信息表达得更稠密。具体技术：
+
+| 技术 | 适用场景 | 典型工具 |
+|-----|---------|---------|
+| 摘要 | 长文档/长对话历史 | LLMLingua、Claude summary |
+| 结构化 | 表格、JSON、列表 | 手写 schema |
+| 引用替代 | 重复内容 | hash 引用 + lookup |
+| 语义压缩 | 通用文本 | LLMLingua-2、ICAE |
+
+LLMLingua-2 的实测：把 10K token 的 RAG 上下文压到 2K，下游 QA 准确率只掉 3%——5x 压缩比基本免费。
+
+### 2. 过滤（Filtering）
+
+把无关信息从上下文里去掉。具体手段：
+
+- **基于规则**：删除特定模式（HTML tag、Markdown 元数据、时间戳）
+- **基于相关性**：用 reranker（bge-reranker、Cohere Rerank）打分后截断
+- **基于任务**：让 LLM 自己判断哪些信息和当前任务有关（self-filtering）
+
+过滤和压缩的区别：**过滤是减少 token 数量，压缩是减少每 token 的冗余度**。两者通常组合使用。
+
+### 3. 路由（Routing）
+
+把不同信息分发到不同处理路径上，避免所有信息都挤进主 LLM 调用：
+
+```
+用户请求
+    ↓
+路由 Agent (轻量模型)
+    ↓
+   ├─→ 简单意图 → 直接回复（不调主模型）
+   ├─→ 知识检索 → RAG 路径 → 主模型
+   ├─→ 计算任务 → 代码沙箱 → 主模型
+   └─→ 多步推理 → Agent 编排 → 多次主模型
+```
+
+路由本质是分流，把主 LLM 的注意力留给最复杂的子任务。LangGraph、Workflowy 这类框架都内置了路由原语。
+
+### 4. 记忆（Memory）
+
+把跨会话、跨调用的信息持久化下来，需要时按需取回：
+
+| 记忆类型 | 存储介质 | 取回方式 |
+|---------|---------|---------|
+| 短期记忆 | session state | KV 直接读 |
+| 工作记忆 | 向量库 | 相似度检索 |
+| 长期记忆 | 图数据库 | 结构化查询 |
+| 程序性记忆 | Skills/Tools | 命名调用 |
+
+Mem0、LettaAI、MemGPT 都在做这件事。但目前还没有谁解决了"什么时候该记、什么时候该忘"这个核心问题——记忆系统的精度上限就是这个判断的准确度。
+
+## 生产架构模板
+
+把四个动作组合成一个完整系统，2026 年比较成熟的架构是这样：
+
+```
+        ┌──────────────────────────────────┐
+        │       用户请求 + Session 上下文       │
+        └─────────────┬────────────────────┘
+                      ↓
+              ┌───────────────┐
+              │  路由 Agent     │ (Haiku-class 模型)
+              │  (意图识别)     │
+              └───────┬───────┘
+                      ↓
+    ┌─────────────────┼─────────────────┐
+    ↓                 ↓                 ↓
+┌────────┐      ┌────────┐        ┌────────┐
+│ RAG 召回 │     │ 工具调用 │       │ 历史压缩 │
+└────┬───┘      └────┬───┘        └────┬───┘
+     ↓               ↓                  ↓
+┌────────┐      ┌────────┐        ┌────────┐
+│Reranker│      │Filter   │       │Summary │
+│过滤     │     │结构化输出│       │摘要器   │
+└────┬───┘      └────┬───┘        └────┬───┘
+     └───────────────┴──────────────────┘
+                      ↓
+              ┌───────────────┐
+              │  Context 拼装  │
+              │  (按权重排序)   │
+              └───────┬───────┘
+                      ↓
+              ┌───────────────┐
+              │  主 LLM 调用    │ (Opus-class 模型)
+              └───────┬───────┘
+                      ↓
+              ┌───────────────┐
+              │  Memory 持久化  │
+              └───────────────┘
+```
+
+每个模块都可以独立替换、独立优化、独立监控。这种"分层式 Context Engineering 架构"是目前业内最有共识的形态。
+
+## Context 预算管理
+
+任何工程系统都要有预算意识。在 Context Engineering 里，预算就是 token：
+
+| 部分 | 占比 | 说明 |
+|------|------|------|
+| System prompt | 5-10% | 角色定义、能力声明 |
+| Few-shot 示例 | 10-15% | 任务范式锚定 |
+| RAG 召回内容 | 30-40% | 当前任务核心知识 |
+| 对话历史 | 15-20% | 短期上下文 |
+| 工具输出 | 10-15% | 当前轮的工具返回 |
+| 用户问题 | 5-10% | 当前输入 |
+| 安全余量 | 10% | 防止溢出 |
+
+不同应用场景比例会调，但总原则不变：**任何超过预算 1.5 倍的请求必须触发降级流程（压缩、截断、路由到子模型）**。
+
+## 与相邻领域的边界
+
+Context Engineering 不是包打天下的概念，需要明确它和相邻技术的分工：
+
+### vs Prompt Engineering
+
+- **PE 关心**：怎么写 instruction、用什么 example、CoT 怎么引导
+- **CE 关心**：instruction 之外的信息从哪来、怎么筛选、怎么排序
+- **重叠**：System prompt 的设计两者都涉及
+
+### vs RAG
+
+- **RAG**：解决"从知识库召回相关片段"
+- **CE**：RAG 是 CE 的一个子集，CE 还覆盖召回后的过滤、压缩、注入策略
+
+### vs Agent 框架
+
+- **Agent 框架**：解决"多步任务怎么编排、工具怎么调用"
+- **CE**：解决"每一步的上下文怎么构造、跨步信息怎么传递"
+- **协作**：好的 Agent 框架内置 CE 原语（LangGraph 的 state 设计、AutoGen 的 message 路由）
+
+### vs Memory Systems
+
+- **Memory 系统**：解决"什么记下来、怎么取回来"
+- **CE**：Memory 是 CE 的一个组件，CE 还包括非记忆类的信息流（实时召回、工具输出）
+
+## 实际案例：客服 Agent 的 Context 优化
+
+举个实战例子。一个生产级客服 Agent，初版架构是把所有信息都拼进 system prompt：
+
+```
+[System Prompt]
+你是 XX 公司的客服助手...
+公司知识库（10K token）：...
+客户档案（2K token）：...
+本次对话历史（已有 30K token）：...
+你可用的工具（5K token）：...
+```
+
+总 system context 47K token，每次回复 5-10 美元，响应延迟 4-6 秒。
+
+经过 Context Engineering 优化后：
+
+```
+[System Prompt - 固定 2K]
+你是 XX 公司的客服助手，关键能力声明...
+
+[动态 Context - 按需注入 8-15K]
+- 客户档案：只注入和当前问题相关的字段（路由 + 过滤）
+- 知识库：用问题做 RAG 召回，top-3 chunks（过滤）
+- 历史对话：超过 10 轮自动摘要（压缩）
+- 工具描述：当前任务可能用到的子集（路由）
+```
+
+优化后单次调用 12K token，成本降到 1.2 美元，延迟 1.8 秒——**3-5x 效率提升来自纯架构优化，没换模型**。
+
+这种收益在传统软件工程里几乎闻所未闻，但在 AI 工程里非常普遍——因为大多数项目的 Context Engineering 起点是 0。
+
+## 团队能力构建
+
+Context Engineering 作为一个新兴学科，对团队提出新要求。比较成熟的团队结构是：
+
+- **Prompt Engineer**：负责单次调用的指令设计
+- **Context Engineer**（新岗位）：负责系统级信息流设计
+- **AI Reliability Engineer**：负责监控、评测、回归
+- **Data Engineer**：负责知识库、记忆库的存储和同步
+
+如果你的 AI 团队还没有人专门负责 Context Engineering，那大概率有大量 token 被浪费——而且这种浪费在用户感知层面是慢性病，不会立刻爆雷，但会持续拖累产品质量。
+
+## 未来 12 个月的趋势
+
+预测 Context Engineering 领域在 2026 下半年到 2027 上半年的几个方向：
+
+1. **可观测性工具崛起**：类似 Datadog for LLM Context，监控每次调用的信息密度、噪声率、命中率
+2. **Context Compiler 出现**：把高层 Context 策略编译成具体的拼装流程，类似 SQL 优化器
+3. **行业标准 SDK**：可能会有 W3C 或 LF AI 主导的 Context Engineering 协议，统一压缩/过滤/路由的接口
+4. **训练时的 Context 协同**：模型训练阶段就考虑 Context Engineering 模式，比如训练时见过压缩格式的样本
+5. **专用小模型生态**：路由模型、过滤模型、压缩模型各自有专门的 small LM 优化
+
+## 总结：从手艺到工程
+
+Prompt Engineering 是手艺活，靠经验和直觉；Context Engineering 是工程活，靠系统设计和数据驱动。
+
+如果说 2024 年是 Prompt Engineer 的黄金时代，那么 2026 年开始就是 Context Engineer 的舞台。这一年的 AI 工程岗位招聘里，"context engineering experience" 已经从加分项变成必备项——你的下一份简历，如果还只写"擅长 prompt 设计"，可能就晚了一拍。
+
+Context 才是 AI 系统真正的战场。

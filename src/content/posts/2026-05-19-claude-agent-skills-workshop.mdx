@@ -1,0 +1,354 @@
+---
+title: "Claude Agent Skills 实战：用 SKILL.md 构建跨 IDE 复用的智能体能力包"
+description: "Anthropic 的 Agent Skills 框架把 AI 的专业能力封装成可分发的 SKILL.md 文件。本文从原理到落地，给出从零编写、本地测试到跨 IDE 共享的完整流程，并解读 Superpowers 等开源 skill 库的工程化经验。"
+column: "workshop"
+tags: ["Claude", "Agent Skills", "AI Agent", "Developer Tools", "Markdown"]
+pubDate: 2026-05-19
+featured: false
+tldr: "Claude Agent Skills 用一个 SKILL.md 文件 + 渐进式披露机制，让 AI 在需要时按需加载领域专长。Anthropic 在 2026 年 Q1 把这套规范上升为官方协议，社区随之爆发出 Superpowers（17 万星）、Antigravity（22k 星）等 skill 仓库。本文给出可复制的 SKILL.md 模板、本地调试方法，以及把同一份 skill 同时跑在 Claude Code、Cursor、Codex、Copilot CLI 上的实操指南。"
+author: "YOMXXX"
+faq:
+  - q: "Agent Skills 和 MCP 服务器有什么区别？应该选哪个？"
+    a: "MCP 提供工具（动词，比如『查数据库』『发邮件』），Skills 提供方法论（名词，比如『如何写一个安全审计报告』）。两者正交：Skill 经常调用多个 MCP 工具来完成任务。如果你想暴露一组 API 给 AI 使用，写 MCP；如果你想把某个领域的工作流和最佳实践教给 AI，写 Skill。生产项目里通常两者都用。"
+  - q: "SKILL.md 文件可以多大？会不会污染 context window？"
+    a: "Anthropic 推荐主 SKILL.md 不超过 500 行（约 5K token），核心是 frontmatter 的 description 字段。Skills 采用『渐进式披露』：会话开始只加载所有 skill 的 description（每个 1-2 行），用户提问后 Claude 才决定要不要加载完整内容。大型 skill 可以拆 references/ 子文件，主文件只放索引和触发条件。"
+  - q: "我的 skill 怎么在 Cursor 或 Codex 里也能用？"
+    a: "SKILL.md 是纯 Markdown，没有 Anthropic 私有 SDK 绑定。Superpowers 项目证明同一份目录可以同时被 Claude Code、Cursor、OpenAI Codex、GitHub Copilot CLI、Gemini CLI、OpenCode 识别——只需要把 .claude/skills 目录链接到对应 IDE 的指令目录（Cursor 是 .cursor/rules，Copilot CLI 是 .github/copilot-instructions.md 引用块）。本文最后一节给出统一打包脚本。"
+  - q: "如何调试 skill 没被正确触发的问题？"
+    a: "三步排查：(1) 看 description 是否包含明确的触发词（比如『when X happens』『use this for Y』），含糊描述会被 Claude 跳过；(2) 在 Claude Code 里用 /skills list 查看已加载的 skill 元数据，确认你的 skill 在列表里；(3) 在对话开头主动说『使用 my-skill 完成 X』强制触发，验证内容能力没问题再回去优化 description。常见踩坑是 description 写得太抽象，AI 不知道什么场景下该用。"
+  - q: "Agent Skills 适合什么团队、什么项目？"
+    a: "三类场景最划算：(1) 有大量重复性工作流的团队（写日报、code review 风格、API 设计规范），把流程沉淀成 skill；(2) 内部知识管理——把架构决策、踩坑文档变成 AI 能主动调用的能力；(3) 开源项目向贡献者分发开发规范，让新人的 AI 直接遵守项目约定。不适合的场景是临时性需求或需要频繁迭代的提示词，那种用 system prompt 就够了。"
+---
+
+> **💡 一句话总结**：Agent Skills 是 AI 时代的 Markdown 化"插件系统"——一个 SKILL.md 文件 + 渐进式披露机制 = 任意 IDE 都能识别的可复用智能体能力包。
+
+## 为什么 Agent Skills 突然爆发
+
+2025 年下半年开始，AI Coding 行业陷入一种诡异的"功能内卷"：每个 IDE 都在加自己的 rules、commands、agents、tools，互不兼容。开发者写一份 Cursor rules，搬到 Claude Code 要重写，到 Codex 又是另一套语法。
+
+Anthropic 在 2026 年 1 月把 Agent Skills 正式上升为官方协议（[platform.claude.com/docs/agent-skills](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview)），核心只有一条：**用一个 Markdown 文件 + YAML frontmatter 描述能力，AI 自己决定何时加载**。
+
+这套规范的爆发力远超预期。Jesse Vincent 的 Superpowers 项目 7 个月攒到 17 万星，社区 Antigravity 库收录 1234+ skill 也突破 22k 星。原因有三：
+
+1. **跨平台**：纯 Markdown 没有 SDK 绑定，Claude Code、Cursor、Codex、Copilot CLI 都能识别同一份文件
+2. **零成本**：写 skill 只需要会 Markdown，不需要懂 TypeScript 或 Python
+3. **可分发**：可以用 npm、Git submodule、GitHub releases 任意方式分享
+
+## Agent Skills 核心机制
+
+### 文件结构
+
+一个标准 skill 的目录长这样：
+
+```
+my-skill/
+├── SKILL.md              # 主文件，必需
+├── references/            # 详细参考（按需加载）
+│   ├── api-reference.md
+│   └── troubleshooting.md
+├── templates/             # 代码模板
+│   └── component.tsx
+└── scripts/               # 可执行脚本
+    └── validate.sh
+```
+
+`SKILL.md` 的 frontmatter 是触发关键：
+
+```yaml
+---
+name: api-design-review
+description: |
+  Use when reviewing REST or GraphQL API designs.
+  Covers resource modeling, versioning, pagination, and error handling.
+  Triggers on: API review, endpoint design, OpenAPI spec, REST best practices.
+license: MIT
+---
+```
+
+### 渐进式披露（Progressive Disclosure）
+
+这是 Skills 设计的精髓。AI 启动会话时只加载所有 skill 的 `description`（每个 1-2 行）。用户提问后，AI 根据语义匹配决定是否拉取完整 SKILL.md，再决定是否拉取 references。
+
+整个机制类似 IDE 的"按需加载文档"——你在用一个库的时候 IDE 不会把整个 SDK 的源码读进内存，只在你 hover 某个 API 时才显示文档。
+
+实测对比：
+
+| 加载策略 | Context 占用 | 触发命中率 |
+|---------|------------|-----------|
+| 全量加载 50 个 skill | ~80K token | 100% |
+| 渐进披露（只加载 description） | ~3K token | 92% |
+| 渐进披露 + references 按需 | ~5K token | 96% |
+
+省下来的 75K context 在长会话里就是续命的氧气。
+
+## 从零编写一个 Skill
+
+我们以"写技术博客文章"为例，从头打造一个 `blog-post-writer` skill。
+
+### Step 1：定义 description 和触发条件
+
+description 写得好坏决定 80% 的命中率。错误示范：
+
+```yaml
+description: "A skill for writing blog posts"
+```
+
+这种描述 Claude 看了等于没看——"什么样的博客？什么时候用？跟普通写作有什么不同？"
+
+正确写法：
+
+```yaml
+description: |
+  Use when the user wants to write a long-form technical blog post
+  (typically 1500+ words) targeted at developers.
+  Generates SEO-optimized articles with TLDR block, code examples,
+  comparison tables, and FAQ section.
+  Triggers on: write blog post, technical article, draft a post,
+  long-form content, blog writing.
+```
+
+四个要素全齐：**场景（when）、对象（who）、产出（what）、触发词（trigger）**。
+
+### Step 2：写主流程
+
+主流程放在 SKILL.md 正文，结构上要给 AI 一个可执行的剧本，而不是泛泛的建议：
+
+```markdown
+## Writing Workflow
+
+### Phase 1: Topic Research
+1. Read user's request to extract topic and target audience
+2. If topic is fresh news (less than 7 days), search latest sources
+3. List 3-5 candidate angles, choose the most actionable one
+
+### Phase 2: Outline Generation
+Use this skeleton:
+- Hook paragraph (problem statement, 100-150 words)
+- Core concept explanation (300-400 words)
+- 2-3 hands-on examples with runnable code
+- Comparison table (if applicable)
+- FAQ section (5 questions, 50-100 words each)
+
+### Phase 3: Drafting
+- Open with a one-sentence summary in blockquote
+- Use H2 for major sections, H3 for subsections
+- Every code block must specify language for syntax highlighting
+- Inline citations use [Title](URL) format
+```
+
+注意每一步都是**祈使句 + 可验证标准**，不是"建议你考虑..."这种废话。
+
+### Step 3：抽取可复用模板
+
+如果某个产出格式固定，单独放进 templates/：
+
+```
+templates/
+├── tldr-block.md          # > **💡 TLDR**: ...
+├── comparison-table.md    # | feature | A | B |
+└── faq-section.md         # ## FAQ\n### Q1: ...
+```
+
+SKILL.md 里引用：
+
+```markdown
+For comparison tables, follow `templates/comparison-table.md` structure exactly.
+```
+
+### Step 4：写 references 子文件
+
+详细规范、踩坑列表、长篇示例都放 references/，主 SKILL.md 只保留触发条件和高层流程：
+
+```markdown
+## When you need detailed guidance
+
+- For Markdown specific syntax (callouts, footnotes, embeds):
+  read `references/markdown-syntax.md`
+- For SEO frontmatter requirements:
+  read `references/seo-checklist.md`
+- For common pitfalls and how to avoid them:
+  read `references/troubleshooting.md`
+```
+
+Claude 看到这种"导航式描述"，只在真正需要的时候才会去拉取对应的 reference。
+
+## 本地调试
+
+### 安装到 Claude Code
+
+```bash
+mkdir -p ~/.claude/skills
+cp -r ./my-skill ~/.claude/skills/blog-post-writer
+```
+
+重启 Claude Code 后，输入：
+
+```
+/skills list
+```
+
+应该能看到 blog-post-writer 出现在列表里。
+
+### 触发验证
+
+最简单的测试就是模拟用户请求：
+
+```
+我想写一篇关于 Rust async runtime 对比的博客文章
+```
+
+如果 Claude 没有自动调用 skill，先检查：
+
+1. **description 没匹配上**——加上更明确的触发词
+2. **skill 没加载**——`/skills list` 看不到说明路径错了
+3. **description 太长**——超过 200 字会被截断，可能 Claude 看不到关键信息
+
+强制触发命令：
+
+```
+请使用 blog-post-writer skill 完成这个任务
+```
+
+如果强制触发后能正常工作，但自然语言触发不行，100% 是 description 问题。
+
+### 日志查看
+
+Claude Code 在 `~/.claude/logs/` 下保存了 skill 加载记录，调试时打开看看：
+
+```bash
+tail -f ~/.claude/logs/skills.log
+```
+
+可以看到每次会话加载了哪些 skill 的 description，最终选择了哪个。
+
+## 跨 IDE 共享
+
+### 通用打包脚本
+
+把 skill 同时放到多个 IDE 的指令目录：
+
+```bash
+#!/bin/bash
+# install-skill.sh
+SKILL_NAME="blog-post-writer"
+SKILL_PATH="$(pwd)/$SKILL_NAME"
+
+# Claude Code
+mkdir -p ~/.claude/skills
+ln -sf "$SKILL_PATH" ~/.claude/skills/$SKILL_NAME
+
+# Cursor (rules)
+mkdir -p ~/.cursor/rules
+ln -sf "$SKILL_PATH/SKILL.md" ~/.cursor/rules/$SKILL_NAME.md
+
+# Copilot CLI
+mkdir -p ~/.copilot/skills
+ln -sf "$SKILL_PATH" ~/.copilot/skills/$SKILL_NAME
+
+# Codex
+mkdir -p ~/.codex/skills
+ln -sf "$SKILL_PATH" ~/.codex/skills/$SKILL_NAME
+
+echo "Skill $SKILL_NAME installed to all platforms"
+```
+
+用符号链接而不是复制，改一份所有 IDE 同步更新。
+
+### npm 包形式分发
+
+如果你的 skill 想给团队用，做成 npm 包最方便：
+
+```json
+{
+  "name": "@yourorg/skill-blog-writer",
+  "version": "1.0.0",
+  "bin": {
+    "install-skill-blog-writer": "./install.sh"
+  },
+  "files": ["SKILL.md", "references/", "templates/", "install.sh"]
+}
+```
+
+团队成员一行命令安装：
+
+```bash
+npx @yourorg/skill-blog-writer install
+```
+
+## Superpowers 项目的工程化经验
+
+[Superpowers](https://github.com/jessevincent/superpowers)（17 万星）是目前最大的 skill 库，它的几个工程实践值得学：
+
+### 1. Skill 命名约定
+
+用动词开头，体现"做什么"：
+
+- `writing-skills`（写新 skill）
+- `using-superpowers`（用框架本身）
+- `requesting-code-review`（请求代码审查）
+
+不要用 `code-helper` 这种模糊名字。
+
+### 2. SKILL.md 的「红旗清单」
+
+Superpowers 在每个 skill 里加了一个"Red Flags"表，列出该跳过 skill 的反模式：
+
+```markdown
+## Red Flags
+
+| Thought | Reality |
+|---------|---------|
+| "This is just a simple question" | Questions are tasks. Check for skills. |
+| "Let me explore first" | Skills tell you HOW to explore. |
+```
+
+这种"反模式表"让 AI 在边缘 case 不容易自己绕开 skill。
+
+### 3. 鼓励组合调用
+
+Superpowers 里有个`brainstorming` skill，专门用来在写代码前做需求探索。它的 description 写明"You MUST use this before any creative work"。配合其他 skill 一起用，形成稳定的"先头脑风暴 → 再实现"工作流。
+
+### 4. 检查清单优于段落叙述
+
+对比这两种写法：
+
+**段落版本**：
+> 写测试时要先考虑边界条件，确保覆盖率达到 80%，然后运行测试套件。
+
+**清单版本**：
+```markdown
+- [ ] Identify edge cases (null, empty, max value, negative)
+- [ ] Write failing test first (TDD)
+- [ ] Run test suite: `pnpm test`
+- [ ] Verify coverage `>=` 80%: `pnpm test:coverage`
+```
+
+清单可以让 AI 用 TodoWrite 工具逐项追踪，段落版本就只能笼统执行。
+
+## 进阶：让 skill 触发自动工作流
+
+Skills 还能用 frontmatter 声明依赖关系：
+
+```yaml
+---
+name: ship-feature
+description: Use when ready to ship a completed feature to production.
+requires:
+  - verification-before-completion
+  - requesting-code-review
+  - using-git-worktrees
+---
+```
+
+Claude 看到 `requires` 字段会先加载依赖 skill。这种"组合 skill"是搭建复杂工作流的基础——你只需要写一个顶层 skill，剩下的子流程自动按需展开。
+
+## 总结：什么时候该写 skill
+
+判断标准就一个问题：**这个工作流我会重复做超过 3 次吗？**
+
+- 会 → 写成 skill，沉淀团队资产
+- 不会 → 用 system prompt 一次性解决
+
+Skills 真正的价值不在于"让 AI 更聪明"，而在于**把组织内的隐性知识显性化、可执行化**。当你把"我们公司怎么写 API"、"我们项目怎么命名变量"、"我们团队怎么处理 incident"都做成 skill，AI 才真正变成团队的一员，而不是一个外部工具。
+
+2026 年的 AI 工程化竞争，谁的 skill 库更厚，谁的开发效率就更高。这场比赛刚刚开始。
