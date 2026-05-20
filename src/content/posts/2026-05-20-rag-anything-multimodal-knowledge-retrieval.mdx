@@ -1,0 +1,600 @@
+---
+title: "RAG-Anything 实战：用双知识图谱统一多模态文档检索"
+description: "RAG-Anything 基于双知识图谱架构，将图片、表格、公式与文本上下文互联，通过跨模态图谱 + 文本语义图谱的混合检索，解决传统 chunk-based RAG 在多模态文档场景中的根本缺陷。本文给出从安装到多模态查询的完整代码。"
+column: "workshop"
+tags: ["RAG", "多模态", "知识图谱", "LightRAG", "RAG-Anything", "文档解析"]
+pubDate: 2026-05-20
+featured: false
+tldr: "传统 RAG 只能处理纯文本，面对含图表、公式、图片的真实文档时力不从心。RAG-Anything 用双知识图谱（跨模态图谱 + 文本语义图谱）将所有模态连接为统一知识网络，配合结构化导航 + 语义匹配的混合检索策略，在多模态基准测试上显著优于 chunk-based 方法。本文从 pip install 到多模态查询给出完整实战代码，覆盖 PDF 解析、知识图谱构建、VLM 增强查询等核心流程。"
+author: "YOMXXX"
+faq:
+  - q: "RAG-Anything 和传统 chunk-based RAG 的核心区别是什么？"
+    a: "传统 RAG 把文档切成固定大小的文本块，完全丢弃了图片、表格、公式等非文本内容以及它们与文本之间的关联关系。RAG-Anything 用双知识图谱将所有模态的内容建模为互联的知识实体，通过跨模态图谱保留'图 3 展示了表 2 中 A 方法的性能曲线'这种跨模态引用关系，检索时能沿关系路径追踪到完整的多模态证据链。"
+  - q: "RAG-Anything 支持哪些文档格式？"
+    a: "支持 PDF、DOC/DOCX、PPT/PPTX、XLS/XLSX、JPG/PNG/BMP/TIFF/GIF/WebP、TXT/MD 等主流格式。PDF 解析基于 MinerU，Office 文档需安装 LibreOffice，图片格式通过 Pillow 支持。可以通过 pip install raganything[all] 一次性安装所有可选依赖。"
+  - q: "双知识图谱中的跨模态图谱和文本语义图谱分别做什么？"
+    a: "跨模态图谱（Cross-Modal Graph）负责连接不同模态之间的关系，比如一张图片和引用它的段落、一个表格和解释它的文字。文本语义图谱（Text-Based Graph）捕捉纯文本内容中的深层语义关系，如概念层级、因果链条。两个图谱通过实体对齐合并为单一知识网络，检索时同时利用结构关系和语义相似度。"
+  - q: "RAG-Anything 的 LLM 和 VLM 可以换成开源模型吗？"
+    a: "可以。RAG-Anything 通过函数参数传入 LLM 和 VLM 调用函数，只要符合 OpenAI API 兼容格式即可。你可以用 vLLM、Ollama 等工具部署 Qwen2.5-VL、InternVL2 等开源 VLM 替代 GPT-4o，用 Qwen2.5 等替代 GPT-4o-mini 做文本处理，成本可降低 90% 以上。"
+  - q: "处理大规模文档库时有什么性能建议？"
+    a: "三个建议：(1) 使用 process_folder_complete 批量处理并设置 max_workers=4 开启并行；(2) MinerU 解析器配置 device=cuda:0 启用 GPU 加速，大幅提升 PDF 解析速度；(3) 对已有 LightRAG 实例可直接加载复用，避免重复建图。长文档场景下 RAG-Anything 的性能优势尤为明显，因为图谱结构天然适合捕捉跨页面的多模态引用关系。"
+---
+
+> **💡 一句话总结**：真实世界的文档不是纯文本——论文有图表和公式，财报有数据表和趋势图，技术手册有架构图和代码。RAG-Anything 用双知识图谱把这些多模态内容编织成统一的知识网络，让检索不再只看文字。
+
+## 问题：你的 RAG 只能读文字
+
+打开任何一篇学术论文，文字大概占内容的 60%，剩下 40% 是图、表、公式。打开一份财务报告，比例可能更夸张——关键数据全在表格和图表里。
+
+但你把这些文档扔给传统 RAG 管道会发生什么？
+
+```
+传统 chunk-based RAG 的处理方式：
+
+原始 PDF（含图表、公式、表格）
+        ↓
+   文本提取（PyPDF2 / pdfplumber）
+        ↓
+   丢弃所有图片 ❌
+   丢弃所有公式 ❌
+   表格变成乱码 ❌
+        ↓
+   纯文本 chunks
+        ↓
+   向量检索 → 只能找到文本相关的结果
+```
+
+用户问"图 3 的实验结果和表 2 的数据有什么关系"，传统 RAG 直接无能为力——它根本不知道图 3 和表 2 是什么。
+
+这不是向量模型不够好的问题，是**架构层面的根本缺陷**：chunk-based 方法把文档视为线性文本序列，而真实文档是**多模态的、交叉引用的、结构化的知识网络**。
+
+## RAG-Anything 的思路：把多模态内容建模为知识图谱
+
+RAG-Anything 来自香港大学（HKU）HKUDS 团队，论文编号 arXiv:2510.12323，GitHub 已获 20k+ stars。它构建在 LightRAG 之上，核心思路是：
+
+**不要把不同模态的内容当成孤立的数据类型，而是当成互联的知识实体。**
+
+具体来说，它构建两个互补的知识图谱：
+
+### 双知识图谱架构
+
+```
+原始多模态文档
+        ↓
+   ┌─────────────────────────────────────┐
+   │         文档解析（MinerU）            │
+   │  提取：文本、图片、表格、公式         │
+   └────────────────┬────────────────────┘
+                    ↓
+        ┌───────────┴───────────┐
+        ↓                       ↓
+ Cross-Modal Graph        Text-Based Graph
+ (跨模态图谱)             (文本语义图谱)
+ 图片 ←→ 引用段落          概念 ←→ 概念
+ 表格 ←→ 解释文字          实体 ←→ 关系
+ 公式 ←→ 推导上下文        论点 ←→ 证据
+        ↓                       ↓
+        └───────────┬───────────┘
+                    ↓
+            实体对齐 & 合并
+                    ↓
+         统一多模态知识网络
+```
+
+**Cross-Modal Graph（跨模态图谱）**：连接不同模态之间的关系。比如论文中"如图 3 所示，A 方法在 BLEU 指标上领先"这句话，跨模态图谱会建立"图 3"实体和"A 方法 BLEU 性能"实体之间的关系边。
+
+**Text-Based Graph（文本语义图谱）**：捕捉文本内部的深层语义关系——概念层级、因果推理、方法对比等。这和 LightRAG 原有的知识图谱能力一脉相承。
+
+两个图谱通过共享实体对齐合并，形成单一的、丰富连接的知识网络。
+
+## 环境准备
+
+### 安装
+
+```bash
+# Python 3.9+，推荐 3.10+
+# 基础安装
+pip install raganything
+
+# 完整安装（推荐，包含所有可选依赖）
+pip install "raganything[all]"
+
+# 按需安装
+pip install "raganything[image]"   # BMP/TIFF/GIF/WebP 支持
+pip install "raganything[text]"    # TXT/MD 文件处理
+```
+
+当前最新版本为 **1.3.0**（2026-05-06 发布），基于 MIT 协议。
+
+### MinerU 解析器验证
+
+RAG-Anything 依赖 MinerU 做 PDF 解析，安装后需要验证：
+
+```bash
+# 验证 MinerU 版本
+mineru --version
+
+# Python 中验证
+python -c "
+from raganything import RAGAnything
+rag = RAGAnything()
+status = rag.check_parser_installation()
+print('MinerU 就绪' if status else '请检查 MinerU 安装')
+"
+```
+
+### Office 文档支持
+
+如果需要处理 Word/PPT/Excel 文件，需安装 LibreOffice：
+
+```bash
+# macOS
+brew install --cask libreoffice
+
+# Ubuntu/Debian
+sudo apt-get install libreoffice
+
+# CentOS/RHEL
+sudo yum install libreoffice
+```
+
+## 核心代码：端到端多模态 RAG
+
+下面是完整的端到端流程——从 PDF 解析到多模态查询。
+
+### Step 1：配置 LLM 和 VLM
+
+```python
+import asyncio
+from functools import partial
+from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+from lightrag.utils import EmbeddingFunc
+
+API_KEY = "your-api-key"
+BASE_URL = "https://api.openai.com/v1"  # 或兼容 API
+
+# 文本 LLM（用于实体抽取、知识图谱构建、回答生成）
+def llm_model_func(prompt, system_prompt=None,
+                   history_messages=[], **kwargs):
+    return openai_complete_if_cache(
+        "gpt-4o-mini",
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        api_key=API_KEY,
+        base_url=BASE_URL,
+        **kwargs,
+    )
+
+# 视觉 LLM（用于图片理解、图表分析）
+def vision_model_func(prompt, system_prompt=None,
+                      history_messages=[], image_data=None,
+                      messages=None, **kwargs):
+    if messages:
+        # 已有完整 messages，直接传递
+        return openai_complete_if_cache(
+            "gpt-4o", "",
+            system_prompt=None,
+            history_messages=[],
+            messages=messages,
+            api_key=API_KEY,
+            base_url=BASE_URL,
+            **kwargs,
+        )
+    elif image_data:
+        # 单张图片 + 文本提示
+        return openai_complete_if_cache(
+            "gpt-4o", "",
+            system_prompt=None,
+            history_messages=[],
+            messages=[
+                {"role": "system", "content": system_prompt}
+                if system_prompt else None,
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_data}"
+                            },
+                        },
+                    ],
+                },
+            ],
+            api_key=API_KEY,
+            base_url=BASE_URL,
+            **kwargs,
+        )
+    else:
+        return llm_model_func(prompt, system_prompt,
+                              history_messages, **kwargs)
+
+# Embedding 模型
+embedding_func = EmbeddingFunc(
+    embedding_dim=3072,
+    max_token_size=8192,
+    func=partial(
+        openai_embed,
+        model="text-embedding-3-large",
+        api_key=API_KEY,
+        base_url=BASE_URL,
+    ),
+)
+```
+
+> **⚠️ 关于模型选择**：文本 LLM 用 gpt-4o-mini 性价比最高；VLM 必须用支持视觉的模型（如 gpt-4o）。如果用开源方案，可以用 vLLM 部署 Qwen2.5-72B-Instruct 做文本 LLM，Qwen2.5-VL-72B-Instruct 做 VLM，只需修改 model 名称和 BASE_URL。
+
+### Step 2：初始化 RAGAnything 并解析文档
+
+```python
+async def main():
+    # 配置
+    config = RAGAnythingConfig(
+        working_dir="./rag_storage",
+        parser="mineru",               # PDF 解析器
+        parse_method="auto",           # 自动选择解析策略
+        enable_image_processing=True,  # 启用图片处理
+        enable_table_processing=True,  # 启用表格处理
+        enable_equation_processing=True,  # 启用公式处理
+    )
+
+    # 初始化
+    rag = RAGAnything(
+        config=config,
+        llm_model_func=llm_model_func,
+        vision_model_func=vision_model_func,
+        embedding_func=embedding_func,
+    )
+
+    # 处理一篇含图表公式的学术论文 PDF
+    await rag.process_document_complete(
+        file_path="./papers/attention-is-all-you-need.pdf",
+        output_dir="./output",
+        parse_method="auto",
+    )
+    print("文档解析 + 知识图谱构建完成")
+
+asyncio.run(main())
+```
+
+`process_document_complete` 做了什么？整个流程：
+
+1. **MinerU 解析**：提取 PDF 中的文本、图片、表格、公式，保留页面布局和位置信息
+2. **多模态内容理解**：用 VLM 理解图片内容，用 LLM 解析表格结构和公式含义
+3. **双知识图谱构建**：抽取实体和关系，构建跨模态图谱和文本语义图谱
+4. **实体对齐合并**：将两个图谱合并为统一知识网络
+5. **向量索引构建**：同时建立向量索引，支持语义检索
+
+### Step 3：多模态查询
+
+```python
+async def query_demo():
+    # ... 初始化 rag（同上）...
+
+    # 1. 纯文本查询（走混合检索）
+    result = await rag.aquery(
+        "Transformer 的自注意力机制如何计算？",
+        mode="hybrid"
+    )
+    print(result)
+
+    # 2. VLM 增强查询（自动触发，如果提供了 vision_model_func）
+    # 当检索到图片相关内容时，会调用 VLM 理解图片
+    vlm_result = await rag.aquery(
+        "论文中的架构图展示了什么结构？",
+        mode="hybrid",
+        vlm_enhanced=True,  # 显式启用（默认已启用）
+    )
+    print(vlm_result)
+
+    # 3. 带多模态内容的查询
+    multimodal_result = await rag.aquery_with_multimodal(
+        "解释这个注意力公式的含义",
+        multimodal_content=[{
+            "type": "equation",
+            "latex": r"Attention(Q,K,V) = softmax(\frac{QK^T}{\sqrt{d_k}})V",
+            "equation_caption": "Scaled Dot-Product Attention",
+        }],
+        mode="hybrid",
+    )
+    print(multimodal_result)
+
+asyncio.run(query_demo())
+```
+
+**查询模式说明**：
+
+| 模式 | 策略 | 适用场景 |
+|------|------|---------|
+| `hybrid` | 结构化导航 + 语义匹配融合 | 推荐默认使用 |
+| `local` | 聚焦局部实体邻域 | 查特定概念的细节 |
+| `global` | 全局图谱概览 | 需要整体概述时 |
+| `naive` | 纯向量检索 | 快速匹配，不走图谱 |
+
+## 进阶：直接插入多模态内容
+
+如果你已经有解析好的内容（比如用自己的 OCR 管道处理过的），可以跳过文档解析，直接插入内容列表：
+
+```python
+content_list = [
+    {
+        "type": "text",
+        "text": "本文提出了一种新的注意力机制...",
+        "page_idx": 0,
+    },
+    {
+        "type": "image",
+        "img_path": "/absolute/path/to/figure1.jpg",
+        "image_caption": ["图 1：多头注意力架构"],
+        "image_footnote": ["来源：原始论文"],
+        "page_idx": 1,
+    },
+    {
+        "type": "table",
+        "table_body": (
+            "| 模型 | BLEU | 参数量 |\n"
+            "|------|------|--------|\n"
+            "| Transformer | 28.4 | 65M |\n"
+            "| LSTM | 25.1 | 80M |"
+        ),
+        "table_caption": ["表 1：机器翻译性能对比"],
+        "table_footnote": ["WMT 2014 En-De 测试集"],
+        "page_idx": 2,
+    },
+    {
+        "type": "equation",
+        "latex": r"Attention(Q,K,V) = softmax(\frac{QK^T}{\sqrt{d_k}})V",
+        "text": "缩放点积注意力公式",
+        "page_idx": 3,
+    },
+]
+
+await rag.insert_content_list(
+    content_list=content_list,
+    file_path="transformer_paper.pdf",
+    display_stats=True,  # 显示处理统计信息
+)
+```
+
+> **💡 注意**：image 类型的 `img_path` 必须使用绝对路径。
+
+## 批量处理文档库
+
+处理整个文件夹的文档：
+
+```python
+await rag.process_folder_complete(
+    folder_path="./documents",
+    output_dir="./output",
+    file_extensions=[".pdf", ".docx", ".pptx"],
+    recursive=True,     # 递归子目录
+    max_workers=4,       # 并行处理数
+)
+```
+
+对于大规模文档库，建议配置 GPU 加速：
+
+```python
+await rag.process_document_complete(
+    file_path="large_report.pdf",
+    output_dir="./output",
+    parser="mineru",
+    device="cuda:0",      # GPU 加速 PDF 解析
+    lang="ch",            # 中文文档
+    formula=True,         # 启用公式识别
+    table=True,           # 启用表格识别
+    start_page=0,         # 起始页
+    end_page=100,         # 结束页（处理前 100 页）
+    display_stats=True,
+)
+```
+
+## 复用已有 LightRAG 实例
+
+如果你已经有一个 LightRAG 知识库，可以直接加载并增加多模态能力：
+
+```python
+from lightrag import LightRAG
+from lightrag.kg.shared_storage import initialize_pipeline_status
+
+# 加载已有的 LightRAG 实例
+lightrag_instance = LightRAG(
+    working_dir="./existing_lightrag_storage",
+    llm_model_func=llm_model_func,
+    embedding_func=embedding_func,
+)
+await lightrag_instance.initialize_storages()
+await initialize_pipeline_status()
+
+# 用 RAGAnything 包装，添加多模态能力
+rag = RAGAnything(
+    lightrag=lightrag_instance,
+    vision_model_func=vision_model_func,
+)
+
+# 现有数据照常查询
+result = await rag.aquery("查询已有知识库", mode="hybrid")
+
+# 新增多模态文档
+await rag.process_document_complete(
+    file_path="new_multimodal_doc.pdf",
+    output_dir="./output",
+)
+```
+
+## 自定义模态处理器
+
+RAG-Anything 支持扩展自定义模态处理器，处理框架原生不支持的内容类型：
+
+```python
+from raganything.modalprocessors import GenericModalProcessor
+
+class AudioTranscriptProcessor(GenericModalProcessor):
+    """处理音频转写文本的自定义处理器"""
+
+    async def process_multimodal_content(
+        self, modal_content, content_type,
+        file_path, entity_name
+    ):
+        # 自定义分析逻辑
+        enhanced_description = await self.analyze_audio_transcript(
+            modal_content
+        )
+        # 创建实体信息
+        entity_info = self.create_custom_entity(
+            enhanced_description, entity_name
+        )
+        # 写入知识图谱
+        return await self._create_entity_and_chunk(
+            enhanced_description, entity_info, file_path
+        )
+
+    async def analyze_audio_transcript(self, content):
+        # 你的音频转写分析逻辑
+        transcript = content.get("transcript", "")
+        speaker = content.get("speaker", "unknown")
+        return f"Speaker {speaker}: {transcript}"
+```
+
+## 混合检索策略：为什么比 chunk-based 更强
+
+RAG-Anything 的检索分三步，对应论文中的三个核心机制：
+
+### 1. Structural Knowledge Navigation（结构化知识导航）
+
+沿着知识图谱的关系边进行多跳追踪。比如用户问"Transformer 的训练策略对翻译质量有什么影响"，系统会：
+
+```
+"Transformer" 实体
+    → [使用] → "标签平滑"
+    → [对应表格] → "表 3：不同正则化策略对比"
+    → [引用图表] → "图 5：训练曲线"
+```
+
+传统 chunk 方法只能找到包含"Transformer"和"训练"这两个词的文本块，无法跨模态追踪。
+
+### 2. Semantic Similarity Matching（语义相似度匹配）
+
+标准的向量检索，用 embedding 模型计算查询和知识片段的相似度。这保证了"换个说法也能找到"的基本能力。
+
+### 3. Multi-signal Fusion（多信号融合）
+
+将结构化导航得分、语义相似度得分、模态相关性得分加权融合，生成最终排名。
+
+**与传统方法的对比**：
+
+| 维度 | chunk-based RAG | RAG-Anything |
+|------|-----------------|-------------|
+| 内容覆盖 | 仅文本 | 文本 + 图片 + 表格 + 公式 |
+| 跨模态关系 | 无 | 双知识图谱建模 |
+| 检索策略 | 纯向量 / BM25 | 图谱导航 + 语义匹配融合 |
+| 长文档处理 | chunk 碎片化，上下文丢失 | 图谱保留全局结构 |
+| 多跳推理 | 不支持 | 沿关系边多跳追踪 |
+| 适用文档 | 纯文本 | PDF、Office、图片等多格式 |
+
+论文的消融实验表明，**图谱知识表示带来的性能增益最大**——即使在纯文本场景下，图谱方法也优于 chunk-based，因为它保留了段落间的逻辑结构。在多模态场景下优势更加明显，长文档场景中差距尤为显著。
+
+## 真实使用场景
+
+### 场景 1：学术论文分析
+
+```python
+# 批量导入论文
+await rag.process_folder_complete(
+    folder_path="./arxiv_papers",
+    output_dir="./output",
+    file_extensions=[".pdf"],
+    max_workers=4,
+)
+
+# 跨论文查询
+result = await rag.aquery(
+    "对比各论文中 BLEU 指标的实验结果",
+    mode="hybrid",
+)
+# 系统会自动检索多篇论文中的表格和图表
+```
+
+### 场景 2：财务报告分析
+
+```python
+await rag.process_document_complete(
+    file_path="./reports/annual_report_2025.pdf",
+    output_dir="./output",
+    lang="ch",
+    table=True,
+)
+
+result = await rag.aquery(
+    "公司去年的营收增长率和净利润率分别是多少？"
+    "和前年对比趋势如何？",
+    mode="hybrid",
+)
+# 会检索到具体的财务数据表格和趋势图
+```
+
+### 场景 3：技术文档知识库
+
+```python
+# 导入多格式技术文档
+await rag.process_folder_complete(
+    folder_path="./tech_docs",
+    output_dir="./output",
+    file_extensions=[".pdf", ".docx", ".pptx"],
+    recursive=True,
+    max_workers=4,
+)
+
+result = await rag.aquery(
+    "系统架构中消息队列的配置参数有哪些？",
+    mode="hybrid",
+)
+# 会检索到架构图、配置表格和说明文字
+```
+
+## 局限性和注意事项
+
+在投入生产前，需要了解以下限制：
+
+**1. 成本较高**
+
+RAG-Anything 需要 LLM 做实体抽取和关系建模，VLM 做图片理解。处理一篇 20 页的论文大约需要调用 50-100 次 LLM API + 10-20 次 VLM API。用 GPT-4o 系列，单篇文档处理成本约 $0.5-2。大规模文档库建议用开源模型自部署。
+
+**2. 首次建图慢**
+
+知识图谱构建是一次性成本，但首次处理较慢。一篇 20 页论文大约需要 3-5 分钟（取决于 API 响应速度和模态复杂度）。后续查询是毫秒级。
+
+**3. MinerU 安装可能遇到问题**
+
+MinerU 依赖较多（PaddleOCR、PyTorch 等），在某些环境下安装可能遇到冲突。建议使用独立虚拟环境：
+
+```bash
+python -m venv raganything_env
+source raganything_env/bin/activate
+pip install "raganything[all]"
+```
+
+**4. 图片质量影响效果**
+
+VLM 对低分辨率、模糊或手绘图片的理解能力有限。扫描件 PDF 建议先做增强处理。
+
+**5. 语言支持**
+
+MinerU 解析器对中文和英文支持最好，其他语言可能需要额外配置 `lang` 参数。
+
+## 总结
+
+RAG-Anything 解决了一个真实且关键的问题：**让 RAG 系统真正"看懂"多模态文档**。它的双知识图谱架构不是简单的"先 OCR 再检索"，而是从知识建模层面将图片、表格、公式与文本统一为互联的实体网络。
+
+对于处理学术论文、财务报告、技术文档等多模态文档的团队，RAG-Anything 提供了一个开箱即用的端到端方案。安装一个包、配置好 LLM 和 VLM、调用 `process_document_complete`，就能把传统 RAG 无法触及的多模态内容纳入检索范围。
+
+核心收益：
+
+- **不再丢弃非文本内容**：图表、公式、表格都变成可检索的知识实体
+- **保留跨模态关系**：图和文字之间的引用关系、表格和结论之间的支撑关系都被保留
+- **统一查询接口**：一个 `aquery` 就能检索所有模态的内容
+
+项目地址：[github.com/HKUDS/RAG-Anything](https://github.com/HKUDS/RAG-Anything)，论文：[arXiv:2510.12323](https://arxiv.org/abs/2510.12323)。
