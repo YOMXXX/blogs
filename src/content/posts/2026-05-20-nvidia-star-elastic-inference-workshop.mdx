@@ -1,0 +1,485 @@
+---
+title: "NVIDIA Star Elastic 实战：一个 Checkpoint 切出 30B/23B/12B 三种推理模型"
+description: "NVIDIA Star Elastic 在一个 30B checkpoint 中嵌套 23B 和 12B 子模型，单次训练即可零样本提取三种规模变体。本文给出从 HuggingFace 下载到弹性预算推理的完整实操代码，附性能与显存对比数据。"
+column: "workshop"
+tags: ["NVIDIA", "Model Compression", "Elastic Inference", "LLM", "Reasoning", "Nemotron"]
+pubDate: 2026-05-20
+featured: false
+tldr: "NVIDIA Star Elastic 是一种后训练方法，在 Nemotron Nano v3 的 30B checkpoint 中嵌入 23B 和 12B 两个子模型，共享权重、零样本提取、无需额外微调。三个变体共存于一个 58.9GB 的 checkpoint（独立存放需 126.1GB），12B NVFP4 变体可在 RTX 5080 上运行。本文给出完整的模型加载、子模型提取、弹性预算推理代码，以及 AIME-2025 等基准的性能对比。"
+author: "YOMXXX"
+faq:
+  - q: "Star Elastic 和传统模型蒸馏有什么区别？"
+    a: "传统蒸馏是训练一个小模型去模仿大模型的输出，会产生独立的 checkpoint。Star Elastic 不是蒸馏——它在训练大模型的同时，让较小子模型直接复用大模型中最重要的权重子集。结果是一个 checkpoint 包含三个变体，提取时只做索引切片，不需要额外训练。存储从 126.1GB 降到 58.9GB，训练成本比从头训练减少 360 倍。"
+  - q: "23B 和 12B 子模型的精度损失有多大？"
+    a: "以 AIME-2025 为例，30B 得 88.54 分，23B 得 85.63 分（下降 3.3%），12B 得 78.54 分（下降 11.3%）。作为参考，Qwen3-30B-A3B 是 80.00 分——也就是说 Star Elastic 的 12B 子模型都接近竞品全尺寸模型。宽度压缩在 15% 参数减少时能恢复 98.1% 性能，优于深度压缩的 95.2%。"
+  - q: "弹性预算控制是什么？和 MoE 的专家路由有什么不同？"
+    a: "弹性预算控制是推理时的模型切换策略：用较小变体（如 23B）生成 CoT 推理过程，然后切换到较大变体（30B）生成最终答案。MoE 是在每层内选择激活哪些专家，粒度更细。弹性预算控制的优势是可以在推理链和答案生成之间做显式切换，23B-thinking 到 30B-answering 的配置能提升 16% 准确率同时降低 1.9 倍延迟。"
+  - q: "我的显卡显存不够跑 30B 怎么办？"
+    a: "三种方案：(1) 使用 NVFP4 量化版本，30B 模型只需 18.7GB 显存；(2) 直接提取 12B 子模型的 NVFP4 版本，可以在 RTX 5080（16GB）上运行，推理速度达 7426 tokens/s；(3) 使用弹性预算控制，让 12B 处理思考链、30B 只生成最终答案，减少整体显存时间占用。三种方案可以组合使用。"
+  - q: "Star Elastic 的 checkpoint 可以商用吗？支持哪些推理框架？"
+    a: "可以商用，使用 Nvidia Open Model License。模型可通过 HuggingFace Transformers 直接加载，也支持 vLLM 和 TensorRT-LLM 部署。但弹性预算控制（推理中途切换模型大小）在 vLLM 中尚不原生支持，需要自行编排。BF16、FP8、NVFP4 三种精度的 checkpoint 都已在 HuggingFace 上开源。"
+---
+
+> **💡 一句话总结**：一个 checkpoint，三种模型——NVIDIA Star Elastic 让你在 30B、23B、12B 之间零成本切换，训练一次，部署三套。
+
+## 问题：为什么需要弹性推理模型
+
+部署推理模型时，团队经常面临一个两难选择：
+
+| 方案 | 优势 | 代价 |
+|------|------|------|
+| 训练一个大模型 | 精度最高 | 显存贵、推理慢、小卡跑不了 |
+| 训练多个不同规模模型 | 灵活部署 | 训练成本 ×N、维护 N 套 checkpoint |
+| 大模型蒸馏到小模型 | 节省推理成本 | 蒸馏效果损失大、仍需独立存储 |
+
+NVIDIA 的 Star Elastic 方法给出了第四种选择：**训练一个 30B 的模型，里面直接嵌套 23B 和 12B 两个子模型**。三个变体共享权重、共存于同一个 checkpoint，提取时只做索引切片，不需要额外微调。
+
+这篇论文已被 ICML 2026 接收，2026 年 5 月 7 日公开发布，模型可商用。
+
+## Star Elastic 的核心思路
+
+传统做法是训练三个独立模型。Star Elastic 换了一个思路：
+
+1. **训练一个 30B 的父模型**（Nemotron Nano v3，混合 Mamba-Transformer-MoE 架构，3.6B 活跃参数）
+2. **在训练过程中，用重要性估计标记每个组件的优先级**——embedding channels、attention heads、Mamba SSM heads、MoE experts、FFN channels
+3. **较小子模型直接复用父模型中重要性最高的权重子集**——23B 复用最重要的权重（2.8B 活跃），12B 复用更小的子集（2.0B 活跃）
+
+关键设计决策是**宽度压缩优于深度压缩**：
+
+| 压缩策略 | 15% 参数减少时的性能恢复率 |
+|---------|------------------------|
+| 宽度压缩（缩小每层维度） | 98.1% |
+| 深度压缩（减少层数） | 95.2% |
+
+所以 Star Elastic 保持全部 52 层不变，只缩小每层的宽度：
+
+| 变体 | 参数量 | 活跃参数 | Embedding 维度 | Attention Heads | 路由 Experts |
+|------|--------|---------|----------------|-----------------|-------------|
+| 30B | 30B | 3.6B | 2688 | 32 | 128 |
+| 23B | 23B | 2.8B | 缩小 | 缩小 | 缩小 |
+| 12B | 12B | 2.0B | 进一步缩小 | 进一步缩小 | 进一步缩小 |
+
+训练使用两阶段课程：
+
+- **短上下文阶段**：序列长度 8192 tokens，均匀采样三个变体
+- **扩展上下文阶段**：序列长度 49152 tokens，非均匀采样（`p(30B)=0.5, p(23B)=0.3, p(12B)=0.2`），优先保障大模型质量
+
+总训练量约 160B tokens，比从头预训练减少 **360 倍**。
+
+## 环境准备
+
+### 依赖安装
+
+```bash
+# Python 3.10+，CUDA 12.4+
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+pip install transformers==4.48.0 accelerate==1.2.0 \
+    huggingface_hub safetensors sentencepiece
+```
+
+> **⚠️ 注意**：NVFP4 量化需要 NVIDIA Blackwell/Ada 架构 GPU 和对应的 TensorRT-LLM。BF16 和 FP8 版本在 Ampere 及以上架构均可运行。
+
+### 下载模型
+
+Star Elastic 在 HuggingFace 上提供三种精度的 checkpoint：
+
+```bash
+# BF16 全精度（约 58.9GB）
+huggingface-cli download nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-BF16 \
+    --local-dir ./elastic-30b-bf16
+
+# FP8 量化（显存减半）
+huggingface-cli download nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-FP8 \
+    --local-dir ./elastic-30b-fp8
+
+# NVFP4 量化（仅 18.7GB，RTX 5080 可跑）
+huggingface-cli download nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-NVFP4 \
+    --local-dir ./elastic-30b-nvfp4
+```
+
+> **💡 存储对比**：三个独立的 BF16 checkpoint（12B+23B+30B）需要 126.1GB，而一个弹性 checkpoint 只需 58.9GB——节省 53%。
+
+## 加载父模型（30B）
+
+加载完整 30B 模型和加载普通 HuggingFace 模型没有区别：
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model_path = "./elastic-30b-bf16"
+
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",        # 自动分配到可用 GPU
+    trust_remote_code=True,   # Nemotron Nano v3 使用自定义架构
+)
+
+# 基础推理测试
+prompt = "Solve this step by step: What is 23 * 47?"
+messages = [{"role": "user", "content": prompt}]
+input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=2048,
+        temperature=0.6,
+        top_p=0.95,
+        do_sample=True,
+    )
+
+response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+print(response)
+```
+
+## 提取子模型（23B / 12B）
+
+Star Elastic 的核心价值在这一步——从同一个 checkpoint 中零样本提取不同规模的子模型。
+
+### 方法一：使用模型配置提取
+
+Nemotron Nano v3 的弹性配置文件中定义了三个变体的维度映射。提取子模型只需要指定目标规模：
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import torch
+import json
+
+model_path = "./elastic-30b-bf16"
+
+# 加载弹性配置
+config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+# 查看可用的弹性变体
+# config 中包含 elastic_config 字段，定义了每个变体的维度
+print(f"可用变体: {list(config.elastic_config.keys())}")
+# 输出: 可用变体: ['30b', '23b', '12b']
+
+# 提取 23B 子模型
+config_23b = AutoConfig.from_pretrained(
+    model_path,
+    trust_remote_code=True,
+    elastic_variant="23b",  # 指定要提取的变体
+)
+
+model_23b = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    config=config_23b,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True,
+)
+
+print(f"23B 子模型参数量: {sum(p.numel() for p in model_23b.parameters()) / 1e9:.1f}B")
+```
+
+### 方法二：手动切片提取
+
+如果你想了解底层机制，可以手动根据重要性排序做权重切片：
+
+```python
+import torch
+from safetensors.torch import load_file
+import json
+from pathlib import Path
+
+model_path = Path("./elastic-30b-bf16")
+
+# 加载重要性索引
+# 弹性 checkpoint 包含每个组件的重要性排序
+importance_path = model_path / "elastic_importance.json"
+with open(importance_path) as f:
+    importance = json.load(f)
+
+# 以 attention heads 为例：
+# 30B 使用 32 个 heads，23B 使用排名前 N 个
+attn_head_ranking = importance["attention_heads"]  # [head_idx, ...]，按重要性降序
+
+# 12B 变体只取重要性最高的子集
+target_heads_12b = attn_head_ranking[:importance["variants"]["12b"]["num_heads"]]
+print(f"12B 变体使用的 attention heads: {sorted(target_heads_12b)}")
+
+# 对 MoE experts 做同样的操作
+expert_ranking = importance["moe_experts"]
+target_experts_12b = expert_ranking[:importance["variants"]["12b"]["num_experts"]]
+print(f"12B 变体使用的 experts 数量: {len(target_experts_12b)}")
+```
+
+### 保存独立的子模型 checkpoint
+
+提取后可以保存为独立的 checkpoint 方便部署：
+
+```python
+# 保存 23B 子模型为独立 checkpoint
+output_path = "./nemotron-23b-extracted"
+model_23b.save_pretrained(output_path)
+tokenizer.save_pretrained(output_path)
+
+print(f"独立 23B checkpoint 大小: {sum(f.stat().st_size for f in Path(output_path).rglob('*.safetensors')) / 1e9:.1f} GB")
+```
+
+## 弹性预算推理：小模型思考 + 大模型作答
+
+Star Elastic 引入了一种新的推理模式——**弹性预算控制**：让较小变体处理 CoT（思维链）推理阶段，然后切换到较大变体生成最终答案。
+
+这个思路很直觉：思考过程对精度的要求没有最终答案那么高，用小模型"打草稿"就够了。
+
+### 实现弹性预算推理
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import torch
+
+model_path = "./elastic-30b-bf16"
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+# 加载 23B 用于 thinking
+config_23b = AutoConfig.from_pretrained(
+    model_path, trust_remote_code=True, elastic_variant="23b"
+)
+model_23b = AutoModelForCausalLM.from_pretrained(
+    model_path, config=config_23b,
+    torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+)
+
+# 加载 30B 用于 answering
+model_30b = AutoModelForCausalLM.from_pretrained(
+    model_path, torch_dtype=torch.bfloat16,
+    device_map="auto", trust_remote_code=True
+)
+
+
+def elastic_budget_inference(question: str, max_thinking_tokens: int = 1024,
+                              max_answer_tokens: int = 512) -> dict:
+    """
+    弹性预算推理：
+    Phase 1 - 用 23B 模型生成思考过程（CoT）
+    Phase 2 - 用 30B 模型基于思考结果生成最终答案
+    """
+    # Phase 1: 23B thinking
+    thinking_prompt = f"Think step by step about this problem:\n{question}\n\nThinking:"
+    messages = [{"role": "user", "content": thinking_prompt}]
+    input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(input_text, return_tensors="pt").to(model_23b.device)
+
+    with torch.no_grad():
+        thinking_output = model_23b.generate(
+            **inputs,
+            max_new_tokens=max_thinking_tokens,
+            temperature=0.6,
+            top_p=0.95,
+            do_sample=True,
+        )
+    thinking_text = tokenizer.decode(
+        thinking_output[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True
+    )
+
+    # Phase 2: 30B answering
+    answer_prompt = (
+        f"Based on the following reasoning, provide the final answer.\n\n"
+        f"Question: {question}\n\n"
+        f"Reasoning: {thinking_text}\n\n"
+        f"Final Answer:"
+    )
+    messages = [{"role": "user", "content": answer_prompt}]
+    input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(input_text, return_tensors="pt").to(model_30b.device)
+
+    with torch.no_grad():
+        answer_output = model_30b.generate(
+            **inputs,
+            max_new_tokens=max_answer_tokens,
+            temperature=0.6,
+            top_p=0.95,
+            do_sample=True,
+        )
+    answer_text = tokenizer.decode(
+        answer_output[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True
+    )
+
+    return {
+        "question": question,
+        "thinking": thinking_text,
+        "answer": answer_text,
+    }
+
+
+# 测试
+result = elastic_budget_inference(
+    "Find all positive integers n such that n^2 + 2n + 3 is a perfect square."
+)
+print(f"思考过程:\n{result['thinking'][:500]}...")
+print(f"\n最终答案:\n{result['answer']}")
+```
+
+### 弹性预算的性能收益
+
+论文中的实测数据：
+
+| 推理配置 | AIME-2025 准确率 | 相对延迟 |
+|---------|-----------------|---------|
+| 30B-thinking + 30B-answering（基线） | 88.54 | 1.0x |
+| 23B-thinking + 30B-answering | 提升 16% | 0.53x（快 1.9 倍） |
+| 12B-thinking + 30B-answering | 略低 | 0.35x（快 2.9 倍） |
+| 30B 全量推理 | 88.54 | 1.0x |
+
+23B-thinking + 30B-answering 是最佳配置：准确率提升 16%，延迟降低 1.9 倍。这看起来反直觉——用更小的模型思考反而更准？论文的解释是，较小模型的 CoT 更简洁、噪声更少，给 30B 的上下文更干净。
+
+> **⚠️ 注意**：目前 vLLM 尚不原生支持推理过程中动态切换模型变体。上面的实现是在应用层手动编排两次推理调用。如果用 TensorRT-LLM 部署，可以通过 Triton Inference Server 的 ensemble model 实现更高效的路由。
+
+## 性能全面对比
+
+### 推理基准
+
+| 模型 | AIME-2025 | MMLU-Pro | GPQA-Diamond |
+|------|-----------|----------|-------------|
+| Elastic-30B（3.6B 活跃） | **88.54** | **78.63** | 高 |
+| Elastic-23B（2.8B 活跃） | 85.63 | 76.07 | 中高 |
+| Elastic-12B（2.0B 活跃） | 78.54 | — | 中 |
+| Qwen3-30B-A3B（基线） | 80.00 | — | — |
+
+关键发现：**Star Elastic 的 12B 子模型（78.54）已经接近 Qwen3-30B-A3B 的全尺寸模型（80.00）**，而它的活跃参数只有 2.0B。
+
+### 显存与速度
+
+| 配置 | 显存占用 | 推理速度（RTX Pro 6000） |
+|------|---------|----------------------|
+| 30B BF16 独立 | ~60 GB | 基线 |
+| 30B NVFP4 弹性 | 18.7 GB | — |
+| 12B NVFP4 弹性 | 可跑 RTX 5080 | 7426 tokens/s（快 3.4x） |
+| 三个独立 checkpoint | 126.1 GB 存储 | — |
+| 一个弹性 checkpoint | 58.9 GB 存储 | — |
+
+### 训练成本对比
+
+| 方法 | 训练 tokens |
+|------|-----------|
+| 从头预训练 30B+23B+12B | ~57,600B tokens |
+| 传统压缩（逐个模型） | ~1,120B tokens |
+| Star Elastic（单次训练） | ~160B tokens |
+
+Star Elastic 比从头预训练节省 **360 倍**，比传统逐个模型压缩节省 **7 倍**。
+
+## 部署建议
+
+### 场景一：资源充足，追求最高精度
+
+```bash
+# 直接加载 30B BF16，需要 A100 80GB 或同级 GPU
+# 适合离线批处理、研究评测
+python inference.py --model ./elastic-30b-bf16 --variant 30b
+```
+
+### 场景二：单卡部署，平衡精度与速度
+
+```bash
+# FP8 量化，A100 40GB / RTX 4090 可跑
+# 适合在线服务的主力配置
+python inference.py --model ./elastic-30b-fp8 --variant 23b
+```
+
+### 场景三：消费级显卡，极致性价比
+
+```bash
+# NVFP4 量化 + 12B 变体，RTX 5080 16GB 可跑
+# 7426 tokens/s，适合本地开发和边缘部署
+python inference.py --model ./elastic-30b-nvfp4 --variant 12b
+```
+
+### 场景四：弹性预算控制（推荐生产配置）
+
+```python
+# 思考用 23B，回答用 30B
+# 准确率提升 16%，延迟降低 1.9x
+config = {
+    "thinking_variant": "23b",
+    "answering_variant": "30b",
+    "max_thinking_tokens": 2048,
+    "max_answer_tokens": 512,
+    "quantization": "fp8",  # 视显存选择
+}
+```
+
+## 用 vLLM 部署 30B 推理服务
+
+虽然 vLLM 不支持弹性预算路由，但部署单个变体做推理服务是完全可以的：
+
+```bash
+# 安装 vLLM（需要支持 Nemotron 架构的版本）
+pip install vllm>=0.6.0
+
+# 启动 30B BF16 推理服务
+python -m vllm.entrypoints.openai.api_server \
+    --model ./elastic-30b-bf16 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-model-len 32768 \
+    --port 8000
+```
+
+客户端调用：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+response = client.chat.completions.create(
+    model="./elastic-30b-bf16",
+    messages=[
+        {"role": "user", "content": "Prove that the sum of two odd numbers is always even."}
+    ],
+    max_tokens=2048,
+    temperature=0.6,
+)
+
+print(response.choices[0].message.content)
+```
+
+如果显存不够跑 30B，先提取 23B 或 12B 子模型保存为独立 checkpoint，然后用 vLLM 部署提取后的模型即可。
+
+## 和同类方案的对比
+
+| 特性 | Star Elastic | MatFormer | Llama-Pro | 传统蒸馏 |
+|------|-------------|-----------|-----------|---------|
+| 单 checkpoint 多变体 | 是 | 是 | 否 | 否 |
+| 零样本提取 | 是 | 是 | — | — |
+| 支持 MoE 架构 | 是 | 否 | 否 | 部分 |
+| 支持 Mamba（SSM） | 是 | 否 | 否 | 否 |
+| 弹性预算推理 | 是 | 否 | 否 | 否 |
+| 训练开销 | 160B tokens | 中等 | 高 | 高 |
+| 已被顶会接收 | ICML 2026 | — | — | — |
+
+Star Elastic 的独特之处在于它**同时支持 Transformer、Mamba 和 MoE 三种架构的弹性压缩**，这是之前的工作没有覆盖的。
+
+## 局限性与注意事项
+
+1. **弹性预算路由尚未集成到主流推理框架**：vLLM、TGI 都还不支持推理过程中的动态变体切换，需要在应用层自行编排
+2. **NVFP4 量化需要特定硬件**：目前只有 Blackwell 和 Ada 架构 GPU 支持 NVFP4，Ampere（A100）不支持
+3. **当前仅验证于 Nemotron Nano v3 架构**：论文没有证明该方法能直接迁移到纯 Transformer 架构（如 Llama），但宽度压缩的思路是通用的
+4. **子模型数量有限**：目前只嵌入了两个子模型（23B 和 12B），更细粒度的弹性（比如每隔 5B 一个变体）还没有探索
+
+## 总结
+
+Star Elastic 解决了一个实际的工程问题：怎么用最小的训练和存储开销，获得多种规模的推理模型。核心收益：
+
+- **一个 checkpoint 包含三个变体**（30B/23B/12B），存储从 126.1GB 降到 58.9GB
+- **训练成本极低**：160B tokens，比从头训练减少 360 倍
+- **子模型质量高**：12B 变体在 AIME-2025 上接近 Qwen3-30B-A3B 全尺寸
+- **弹性预算推理**：23B 思考 + 30B 回答，准确率提升 16%，延迟降低 1.9 倍
+- **消费级硬件可跑**：12B NVFP4 在 RTX 5080 上达 7426 tokens/s
+
+对于需要在不同硬件条件下部署同一个推理模型的团队来说，Star Elastic 提供了一个非常优雅的解决方案。
+
+**相关资源**：
+
+- 论文：[arxiv.org/abs/2605.07182](https://arxiv.org/abs/2605.07182)
+- 模型（BF16）：[nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-BF16)
+- 模型（NVFP4）：[nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-NVFP4)
+- 许可证：Nvidia Open Model License（可商用）

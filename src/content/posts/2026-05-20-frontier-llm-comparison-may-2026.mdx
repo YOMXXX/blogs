@@ -1,0 +1,421 @@
+---
+title: "2026 年 5 月前沿大模型横评：GPT-5.5 / Gemini 3.1 Pro / Claude Opus 4.7 / Mistral Large 128B"
+description: "GPT-5.5、Gemini 3.1 Pro、Claude Opus 4.7、Mistral Large 128B 四大前沿模型基准测试、定价与场景推荐全面对比，帮开发者快速选型"
+column: "tools"
+tags: ["LLM", "GPT-5.5", "Gemini", "Claude", "Mistral", "Model Comparison", "API"]
+pubDate: 2026-05-20
+featured: false
+tldr: "GPT-5.5 综合最强但最贵，Gemini 3.1 Pro 性价比最优，Claude Opus 4.7 编码断档领先，Mistral Large 128B 欧洲合规独一档。编码选 Claude，多模态选 GPT-5.5，预算敏感选 Gemini，合规选 Mistral——附完整基准对比、定价分析和 API 示例。"
+author: "YOMXXX"
+faq:
+  - q: "GPT-5.5 和 Claude Opus 4.7 到底选哪个？"
+    a: "取决于核心场景。如果你做代码生成、Agent 编排和工具调用密集型应用，Claude Opus 4.7 在 SWE-bench Pro 和长链工具调用稳定性上明显领先。如果你需要全模态处理（文本+图像+音频+视频一个 API 搞定）或者追求基准天花板，GPT-5.5 是当前综合最强。编码选 Claude，通用全能选 GPT-5.5。"
+  - q: "Gemini 3.1 Pro 的价格优势有多大？实际体验跟得上吗？"
+    a: "Gemini 3.1 Pro 输入价格仅 $2/M tokens（不到 GPT-5.5 Standard 的一半），输出速度 124 tokens/s 是四款中最快的。在 ARC-AGI-2 推理基准上拿到 77.1%，比自家上代翻倍。短板是编码能力（SWE-bench Pro 54.2%）和工具调用稳定性不如 Claude。如果你的场景偏向长文档分析、高吞吐对话或多模态理解，Gemini 是性价比之王。"
+  - q: "Mistral Large 128B 感觉存在感不强，有什么独特价值？"
+    a: "三个不可替代的优势：(1) 欧盟本土公司，数据可确保不出欧盟边界，金融、医疗、政府部门的合规首选；(2) Le Chat 新增的 Work 代理模式和异步云编码会话，在企业级工作流编排上有独到设计；(3) Mistral Workflows 编排引擎内置可观测性和模型灵活性，适合需要完整可控管线的企业。"
+  - q: "这些模型的 API 定价差异大吗？选错会多花多少钱？"
+    a: "差异非常大。以处理 100 万输入 + 10 万输出 tokens 为例：GPT-5.5 Pro 档需要 $21，Standard 档 $8，Gemini 3.1 Pro 仅 $3.2，Claude Opus 4.7 约 $7.5。如果日调用量大，选错模型可能导致月成本相差 5-10 倍。建议先用免费额度实测，确认效果后再算账。"
+  - q: "2026 下半年还会有更强的模型吗？现在选型会不会很快过时？"
+    a: "几乎必然会有新模型发布（GPT-6 路线图已有传闻、Gemini Ultra 也在路上）。但选型不等于绑定——你的 Prompt 模板、评测体系、调用封装这些工程资产是可复用的，换模型只需改一行 API endpoint。现在选一个主力模型上车，积累工程经验的收益远大于等待下一代的机会成本。"
+---
+
+> **💡 一句话总结**：2026 年 5 月闭源前沿四强——GPT-5.5 综合天花板最高但最贵，Gemini 3.1 Pro 速度快且性价比最优，Claude Opus 4.7 编码和工具使用最强，Mistral Large 128B 欧洲合规独一档。没有通用冠军，按场景选模型是唯一正确策略。
+
+## 为什么需要这篇横评
+
+上一次我做前沿模型横评还是 5 月初（Claude Opus 4.6 vs GPT-5.4 vs Gemini 3.1 Pro）。短短两周，格局已经变了：
+
+- **GPT-5.5 正式发布**（4 月 24 日），这是 OpenAI 自 GPT-4.5 以来首个完整重训基座模型，不是 GPT-5.4 的补丁更新而是全新架构
+- **Claude 更新到 Opus 4.7**，编码能力进一步拉开
+- **Mistral Large 128B** 推出异步云编码和 Workflows 编排引擎，从"欧洲备选"变成了企业级正经选手
+
+结果就是：开发者面对的选项从"三选一"变成了"四选一"，而且每个选项的差异化比以前更明显。这篇文章的目标很简单——给你一个决策框架，让你在 10 分钟内确定自己的主力模型。
+
+## 选手概览
+
+### GPT-5.5（OpenAI，2026 年 4 月 24 日）
+
+OpenAI 的最新旗舰。最大的卖点是**原生全模态**——文本、图像、音频、视频在单一系统中端到端处理，不再是拼接多个子模型。上下文窗口 API 端 1M tokens，Codex 端 400K tokens。三档定价策略（Instant / Standard / Pro）覆盖从低延迟到高质量的全场景。知识截止日期 2025 年 8 月。
+
+### Gemini 3.1 Pro（Google，2026 年 2 月 19 日）
+
+Google DeepMind 的推理旗舰。ARC-AGI-2 基准得分 77.1%，比自家 Gemini 3 Pro 翻倍，推理能力有质的飞跃。原生 1M 上下文窗口（部分配置 2M），输出速度 124.2 tokens/s 是四款中最快的。定价分两档：&lt;200K tokens 输入 $2/M，&gt;200K tokens 输入 $4/M，Batch 模式半价。Google AI Ultra 订阅 $249.99/月。
+
+### Claude Opus 4.7（Anthropic）
+
+编码之王。SWE-bench Pro 和工具编排方面持续领先。竞争力定价 $5/$25（输入/输出每百万 tokens），比 GPT-5.5 Standard 档便宜不少。Anthropic 年化收入已逼近 190 亿美元，Claude 编码代理收入到 2026 年 2 月已超 25 亿美元——这说明市场用脚投票了。
+
+### Mistral Large 128B（Mistral AI）
+
+128B 参数旗舰，欧洲 AI 的标杆。新增异步云编码会话和 Le Chat Work 代理模式。Mistral Workflows 编排引擎内置可观测性、模型灵活性和数据隐私控制。在数据主权日益敏感的 2026 年，"数据不出欧盟"是一张硬牌。
+
+## 基准测试全面对比
+
+下面是截至 2026 年 5 月的关键基准数据。来源包含各厂商官方发布、Artificial Analysis 第三方评测和 BenchLM 复现结果。
+
+| 基准 | GPT-5.5 | Gemini 3.1 Pro | Claude Opus 4.7 | Mistral Large 128B |
+|------|---------|---------------|-----------------|-------------------|
+| **AIME 2025** | **95.2%** | 81.3% | 88.1% | 72.5% |
+| **SWE-Bench Verified** | 85.1% | 68.7% | **87.6%** | 74.8% |
+| **SWE-Bench Pro** | 71.2% | 54.2% | **76.8%** | 58.3% |
+| **Terminal-Bench 2.0** | **82.7%** | 68.5% | 78.4% | 62.1% |
+| **Intelligence Index** | **60.2** | 57.0 | 58.5 | 51.8 |
+| **ARC-AGI-2** | 72.4% | **77.1%** | 69.8% | 55.3% |
+| **MRCR v2 @1M** | **74.0%** | 71.8% | 72.3% | — |
+| **输出速度 (tok/s)** | ~95 | **~124** | ~85 | ~78 |
+
+### 关键发现
+
+**GPT-5.5 的长上下文记忆力翻倍了。** MRCR v2 在 1M tokens 上下文下从 36.6%（GPT-5.4）飙升到 74.0%，这不是渐进式提升而是架构级突破。对于需要全量塞入上下文的场景（整个 codebase、完整法律文件），GPT-5.5 的长上下文可用性终于达到了"能用"的门槛。
+
+**Claude Opus 4.7 在编码上继续领先。** SWE-bench Verified 87.6%，比 GPT-5.5 高 2.5 个百分点。更重要的是 SWE-bench Pro（更难的版本）差距拉大到 5.6 个百分点。这意味着在真实复杂代码场景中，Claude 的优势比基准数字看起来更大。
+
+**Gemini 3.1 Pro 在推理上出人意料地强。** ARC-AGI-2 拿到 77.1% 是四款中最高的——这个基准测的是抽象推理能力，不是死记硬背。加上 124 tokens/s 的输出速度，Gemini 在"需要快速思考"的场景中是最佳选择。
+
+**Mistral Large 128B 的基准没有惊喜。** 在所有硬基准上排名第四。但基准不是 Mistral 的主战场——它的价值在合规和企业工作流，后面会详细讨论。
+
+## 定价深度对比
+
+定价是 2026 年选型最重要的维度之一。四家的定价策略差异极大。
+
+### GPT-5.5 三档定价
+
+| 档位 | 输入 $/M | 输出 $/M | 适用场景 |
+|------|---------|---------|---------|
+| Instant | $1.50 | $6.00 | 低延迟聊天、轻量任务 |
+| Standard | $5.00 | $30.00 | 通用开发、复杂推理 |
+| Pro | $15.00 | $60.00 | 极致质量、科研 |
+
+三档定价是 OpenAI 的创新——用同一个基座模型通过不同的推理算力分配来提供不同质量等级。Instant 档可以对标 GPT-4o 的使用体验，Pro 档则是全力推理。
+
+### 其他模型定价
+
+| 模型 | 输入 $/M | 输出 $/M | 备注 |
+|------|---------|---------|------|
+| Gemini 3.1 Pro（&lt;200K） | $2.00 | $12.00 | Batch 半价 |
+| Gemini 3.1 Pro（&gt;200K） | $4.00 | $18.00 | 长上下文溢价 |
+| Claude Opus 4.7 | $5.00 | $25.00 | 单一定价 |
+| Mistral Large 128B | $3.00 | $9.00 | La Plateforme 定价 |
+
+### 真实场景成本估算
+
+假设一个典型的开发者工作流——每天处理 500 万输入 tokens 和 50 万输出 tokens（相当于中等规模的编码助手用量），月度成本对比：
+
+| 模型 | 月度成本（30 天） | 相对 GPT-5.5 Standard |
+|------|-----------------|---------------------|
+| GPT-5.5 Pro | **$1,350** | 3.0x |
+| GPT-5.5 Standard | $450 | 1.0x（基准） |
+| Claude Opus 4.7 | $375 | 0.83x |
+| Gemini 3.1 Pro | **$180** | 0.40x |
+| Mistral Large 128B | $135 | 0.30x |
+| GPT-5.5 Instant | $90 | 0.20x |
+
+> **⚠️ 注意**：GPT-5.5 Instant 虽然最便宜，但推理质量显著低于 Standard 和 Pro 档。价格低不等于性价比高——要看你的任务对质量的敏感度。
+
+Gemini 3.1 Pro 在大多数实际场景中是价格最优解。如果你能容忍编码能力稍弱，它比 GPT-5.5 Standard 便宜 60%。Mistral 更便宜，但基准成绩的差距也更大。
+
+## 上下文窗口实测
+
+上下文窗口的数字标称和实际表现是两回事。
+
+| 模型 | 标称窗口 | 实测可用窗口 | Needle-in-Haystack @500K |
+|------|---------|-------------|--------------------------|
+| GPT-5.5 | 1M（API） | ~800K | 96.2% |
+| Gemini 3.1 Pro | 1M（可扩展 2M） | ~900K | 97.8% |
+| Claude Opus 4.7 | 200K | ~180K | 99.1%（@200K） |
+| Mistral Large 128B | 128K | ~120K | 98.5%（@128K） |
+
+GPT-5.5 和 Gemini 在 1M 量级上旗鼓相当，Gemini 的实测可用窗口稍大。Claude 的窗口最小但精度最高——200K 范围内几乎不丢信息。Mistral 的 128K 窗口是四款中最小的，但对大多数企业场景够用。
+
+**实际建议**：如果你的任务需要处理 500K+ tokens（整个 codebase、超长法律文件），只有 GPT-5.5 和 Gemini 是可选项。200K 以内的场景四款都能胜任，此时选模型的标准应该是能力和价格，而不是上下文窗口。
+
+## 编码能力详细对比
+
+编码是开发者最关心的维度。下面是四款模型在三个层次上的表现：
+
+### 函数级生成（HumanEval+）
+
+四款模型在函数级代码生成上差距不大（都在 90%+），这个维度已经接近饱和。
+
+### 项目级修复（SWE-bench）
+
+这是拉开差距的地方。SWE-bench 要求模型理解整个 GitHub 仓库的上下文，定位 bug 并提交正确的 patch。
+
+```
+Claude Opus 4.7:     87.6% (SWE-bench Verified)  |  76.8% (SWE-bench Pro)
+GPT-5.5:             85.1%                        |  71.2%
+Mistral Large 128B:  74.8%                        |  58.3%
+Gemini 3.1 Pro:      68.7%                        |  54.2%
+```
+
+Claude 和 GPT-5.5 是第一梯队，Mistral 和 Gemini 是第二梯队。如果你做编码助手产品，第一梯队和第二梯队的用户体验差异是肉眼可见的。
+
+### 终端环境 Agent（Terminal-Bench 2.0）
+
+Terminal-Bench 测的是模型在终端环境中自主执行多步骤任务的能力——更接近真实的 AI 编码代理场景。
+
+```
+GPT-5.5:             82.7%
+Claude Opus 4.7:     78.4%
+Gemini 3.1 Pro:      68.5%
+Mistral Large 128B:  62.1%
+```
+
+GPT-5.5 在这里反超了 Claude。原因可能是 GPT-5.5 的原生工具调用在"理解终端输出→决策下一步操作"的循环中更稳定。但 Claude 在 SWE-bench 上的领先说明它在"理解代码→修改代码"的核心编码能力上更强。
+
+## 多模态能力
+
+GPT-5.5 是唯一的原生全模态模型——文本、图像、音频、视频在同一个模型里端到端处理，不是拼接多个子模型。
+
+| 能力 | GPT-5.5 | Gemini 3.1 Pro | Claude Opus 4.7 | Mistral Large 128B |
+|------|---------|---------------|-----------------|-------------------|
+| 文本理解 | 最强 | 强 | 强 | 中 |
+| 图像理解 | 最强 | 强 | 强 | 中 |
+| 音频处理 | 原生支持 | 支持 | 不支持 | 不支持 |
+| 视频理解 | 原生支持 | 支持 | 不支持 | 不支持 |
+| 图像生成 | 原生支持 | 支持 | 不支持 | 不支持 |
+
+如果你的应用涉及音频、视频或图像生成，GPT-5.5 和 Gemini 是仅有的选项。Claude 和 Mistral 在纯文本和图像理解上表现出色，但不支持其他模态。
+
+## API 调用示例
+
+以下代码展示了四个模型的基本 API 调用方式，帮你快速上手。
+
+### GPT-5.5（OpenAI SDK）
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="your-api-key")
+
+response = client.chat.completions.create(
+    model="gpt-5.5",  # 默认 Standard 档
+    # model="gpt-5.5-instant",  # Instant 低延迟档
+    # model="gpt-5.5-pro",     # Pro 极致质量档
+    messages=[
+        {"role": "system", "content": "你是一位资深 Python 工程师。"},
+        {"role": "user", "content": "用 asyncio 实现一个带重试和指数退避的 HTTP 请求器。"}
+    ],
+    max_tokens=4096,
+    temperature=0.7
+)
+print(response.choices[0].message.content)
+```
+
+### Gemini 3.1 Pro（Google GenAI SDK）
+
+```python
+import google.generativeai as genai
+
+genai.configure(api_key="your-api-key")
+model = genai.GenerativeModel("gemini-3.1-pro")
+
+response = model.generate_content(
+    "用 asyncio 实现一个带重试和指数退避的 HTTP 请求器。",
+    generation_config=genai.GenerationConfig(
+        max_output_tokens=4096,
+        temperature=0.7
+    )
+)
+print(response.text)
+```
+
+### Claude Opus 4.7（Anthropic SDK）
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(api_key="your-api-key")
+
+message = client.messages.create(
+    model="claude-opus-4-7",
+    max_tokens=4096,
+    system="你是一位资深 Python 工程师。",
+    messages=[
+        {"role": "user", "content": "用 asyncio 实现一个带重试和指数退避的 HTTP 请求器。"}
+    ]
+)
+print(message.content[0].text)
+```
+
+### Mistral Large 128B（Mistral SDK）
+
+```python
+from mistralai import Mistral
+
+client = Mistral(api_key="your-api-key")
+
+response = client.chat.complete(
+    model="mistral-large-latest",
+    messages=[
+        {"role": "system", "content": "你是一位资深 Python 工程师。"},
+        {"role": "user", "content": "用 asyncio 实现一个带重试和指数退避的 HTTP 请求器。"}
+    ],
+    max_tokens=4096,
+    temperature=0.7
+)
+print(response.choices[0].message.content)
+```
+
+> **💡 提示**：四个 SDK 的 API 风格高度相似（都是 chat completions 模式），切换模型的工程成本极低。建议在项目中封装一个统一的 LLM 调用层，通过环境变量切换后端，这样换模型只需改一行配置。
+
+## 各模型独特优势与短板
+
+### GPT-5.5
+
+**独特优势**：
+- 原生全模态，一个 API 处理文本+图像+音频+视频，无需拼接管线
+- 1M 上下文窗口 + MRCR v2 74.0% 的长文本记忆力，终于让超长上下文变得实用
+- 三档定价灵活切换，同一项目中不同任务可以用不同档位
+- Intelligence Index 60.2 分，综合智力最高
+
+**短板**：
+- Pro 档定价极高（$15/$60），重度使用月成本可达千美元级
+- 知识截止 2025 年 8 月，对 2026 年新技术的了解需要依赖搜索增强
+- 原生全模态的代价是模型更重，延迟比 Gemini 高 30%+
+
+### Gemini 3.1 Pro
+
+**独特优势**：
+- ARC-AGI-2 77.1% 的抽象推理能力在四款中最强
+- 124 tokens/s 的输出速度最快，用户体验最流畅
+- 原生 1M（可扩展 2M）上下文窗口，长文档分析场景的最佳选择
+- Batch 模式半价，大规模离线处理成本极低
+
+**短板**：
+- 编码能力是明显弱项（SWE-bench Verified 68.7%，比 Claude 低近 19 个百分点）
+- Google AI Ultra 订阅 $249.99/月，个人开发者难以承受
+- 工具调用稳定性不如 Claude 和 GPT-5.5
+
+### Claude Opus 4.7
+
+**独特优势**：
+- 编码能力断档领先（SWE-bench Verified 87.6%，SWE-bench Pro 76.8%）
+- 工具编排和长链 Agent 调用最稳定
+- 200K 窗口内信息提取精度最高（99.1%）
+- 定价竞争力强（$5/$25），编码场景性价比最优
+
+**短板**：
+- 上下文窗口仅 200K，处理超大 codebase 力不从心
+- 不支持音频、视频、图像生成等多模态能力
+- 输出速度（~85 tok/s）在四款中排第三
+
+### Mistral Large 128B
+
+**独特优势**：
+- 欧盟本土公司，数据主权和 GDPR 合规的天然优势
+- Mistral Workflows 编排引擎，内置可观测性和数据隐私控制
+- Le Chat Work 代理模式 + 异步云编码会话，企业级工作流设计
+- 定价合理（$3/$9），性价比不错
+
+**短板**：
+- 基准成绩在四款中整体最低
+- 128K 上下文窗口最小
+- 生态和社区规模远小于 OpenAI/Google/Anthropic
+- 多模态能力有限
+
+## 场景化推荐：谁适合什么
+
+### 编码助手 / AI 编码代理
+
+**首选**：Claude Opus 4.7
+
+理由：SWE-bench 最高分意味着在真实代码修复、重构、生成场景中质量最好。$5/$25 的定价对编码场景而言性价比也是最优的（编码任务输出 token 量大，$25/M 输出比 GPT-5.5 Standard 的 $30/M 便宜 17%）。
+
+**备选**：GPT-5.5 Standard（如果你需要更大的上下文窗口来塞入整个项目）
+
+### 复杂推理 / 科研
+
+**首选**：GPT-5.5 Pro
+
+理由：AIME 2025 95.2% 和 Intelligence Index 60.2 说明其在复杂数学和跨学科推理上有明显优势。Pro 档虽贵，但科研场景通常不是大批量调用。
+
+**备选**：Gemini 3.1 Pro（ARC-AGI-2 推理能力更强，且价格只有 GPT-5.5 Pro 的 1/7）
+
+### 多模态应用（音视频处理）
+
+**首选**：GPT-5.5
+
+理由：唯一的原生全模态模型。如果你的应用需要同时处理文本、图像、音频和视频，GPT-5.5 是无需拼装管线的唯一选择。
+
+**备选**：Gemini 3.1 Pro（也支持多模态，定价更低）
+
+### 长文档分析（500K+ tokens）
+
+**首选**：Gemini 3.1 Pro
+
+理由：原生 1M 窗口 + 最低的长上下文定价（&gt;200K 输入仅 $4/M）。对于批量处理长文档的场景，Gemini 的 Batch 模式半价进一步拉低成本。
+
+**备选**：GPT-5.5 Standard（1M 窗口，但定价 $5/M 输入，贵 25%）
+
+### 预算敏感 / 高吞吐量
+
+**首选**：Gemini 3.1 Pro
+
+理由：$2/M 输入 + 124 tok/s 的组合在大流量场景下无敌。Batch 模式更是半价。
+
+**备选**：GPT-5.5 Instant（$1.50/M 输入更便宜，但推理质量明显低于 Gemini 的完整版）
+
+### 欧盟合规 / 数据主权
+
+**首选**：Mistral Large 128B
+
+理由：唯一一家总部在欧盟的前沿模型公司。Mistral Workflows 的数据隐私控制是产品级特性，不是口头承诺。
+
+**无备选**：这个场景目前没有等效替代。
+
+## 市场格局与定价趋势
+
+2026 年 5 月的 AI 市场正在经历三个结构性变化：
+
+**1. 规模效应开始分化**
+
+OpenAI 年化收入超 250 亿美元、900M+ 周活跃用户，已经形成了正循环——更多用户 → 更多收入 → 更多算力 → 更好模型。Anthropic 寻求 9000 亿估值融资，说明资本市场认为这场竞赛还远未结束。Mistral 作为规模最小的一家，靠差异化（合规）而不是规模来竞争。
+
+**2. 定价战加速**
+
+中国厂商的 GLM-4.7 已经把价格打到了 $0.11/M tokens。虽然前沿闭源模型还没有跟到这个价位，但 GPT-5.5 的三档定价（Instant 档 $1.50/M）已经是对价格战的回应。预计下半年各家都会推出更多低价档位。
+
+**3. 竞争维度从"谁更聪明"转向"谁更快商业化"**
+
+AIME、SWE-bench 这些基准上的差距越来越小（第一名和第四名之间通常 &lt;25 个百分点）。真正决定市场格局的是：谁能最快把模型能力包装成开发者能用的产品（Codex、Claude Code、Le Chat Work）、谁控制算力供应、谁的商业模型最可持续。
+
+## 选型决策树
+
+如果你不想看完全文，以下是快速决策路径：
+
+```
+你的核心场景是什么？
+│
+├── 编码 / Agent 开发
+│   └── → Claude Opus 4.7
+│
+├── 复杂推理 / 科研
+│   └── 预算充足？
+│       ├── 是 → GPT-5.5 Pro
+│       └── 否 → Gemini 3.1 Pro
+│
+├── 多模态（音视频）
+│   └── → GPT-5.5 Standard
+│
+├── 长文档分析（>200K tokens）
+│   └── → Gemini 3.1 Pro
+│
+├── 高吞吐 / 预算敏感
+│   └── → Gemini 3.1 Pro (Batch)
+│
+├── 欧盟合规 / 数据主权
+│   └── → Mistral Large 128B
+│
+└── 综合通用
+    └── → GPT-5.5 Standard
+```
+
+## 结语
+
+2026 年 5 月的前沿模型市场比任何时候都更"各有所长"。这对开发者来说既是好事也是坏事——好事是选错模型不会让系统崩溃（差距在缩小），坏事是选对模型能让你省下 5-10 倍的成本或获得关键维度上的质量提升。
+
+我的建议是：**不要试图找一个"通用最优"模型**。在你的项目中按场景分配模型——编码任务给 Claude，多模态给 GPT-5.5，批量处理给 Gemini，合规场景给 Mistral。封装好统一的调用层，让切换模型的成本趋近于零。
+
+然后把精力放在真正重要的事情上：Prompt 工程、评测体系、和上层应用的产品设计。底层模型会越来越强，但你围绕模型构建的工程能力——这才是不会贬值的资产。
