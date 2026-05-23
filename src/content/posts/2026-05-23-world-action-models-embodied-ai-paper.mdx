@@ -1,0 +1,148 @@
+---
+title: 'World Action Models 论文速读：VLA 的下一站，把"预测世界"和"决定动作"合二为一'
+description: '复旦+NUS 14 位作者 5/12 发表 WAMs 综述，首次系统定义"世界动作模型"新范式：具身 AI 联合建模 future state 和 action。本文拆解 cascaded vs joint 分类、数据来源、评测三维度与开放挑战。'
+column: "paper"
+tags: ["World Action Models", "Embodied AI", "VLA", "Robotics", "World Model", "Foundation Model"]
+pubDate: 2026-05-23
+featured: false
+tldr: 'VLA 解决了"看到做什么"，但没解决"做了之后会怎样"——WAMs（World Action Models）就是这个补丁。复旦+NUS 14 位作者 5/12 arxiv 2605.12090 首次系统定义 WAM 范式并给 taxonomy：Cascaded WAM 把 world model 和 policy 串成 pipeline，Joint WAM 塞进一个网络。论文盘点四类数据源、评测三维度、四大开放挑战。综述无新方法，但对 2026 年做具身 AI 是必读概念地图。'
+author: "YOMXXX"
+faq:
+  - q: "WAM 和 VLA 究竟差在哪里？为什么不能直接用 VLA 加一个 world model？"
+    a: 'VLA 学的是 P(action | observation, language)，是个反射式映射。WAM 学的是 P(action, future_state | observation, language)——同时预测下一帧（或下几帧）会变成什么样、自己该做什么动作。差别在于：(1) VLA 没有显式的物理因果模型，遇到新场景容易做出违反物理常识的动作（推抽屉变成穿墙）；(2) VLA 不能做长 horizon 规划，因为没有"想象未来"的能力；(3) WAM 训练时多了一个监督信号（重建未来帧），数据效率更高。直接给 VLA 拼一个独立的 world model 也行，但论文说这是 Cascaded WAM 路线，joint 路线（共享 backbone 同时输出 state 和 action）效果更好。'
+  - q: "Cascaded WAM 和 Joint WAM 哪个更适合现在做产品？"
+    a: 'Cascaded 更适合工程落地。Cascaded 的 world model 和 action policy 是两个独立模块，可以单独训练、单独替换、单独 debug。比如 NVIDIA GR00T 1.5 就是 Cascaded 思路：先用 Cosmos 这个独立的 video world model 生成 future frames，再用 VLA 选 action。Joint 更"端到端"但训练复杂，需要联合优化目标，对数据量和算力要求大。学术界 Joint 是主流（论文层面更新更激进），工业界 Cascaded 是主流（更可控、更可监测）。2026 年的产品建议先 Cascaded，等 Joint 的开源 backbone 稳定后再迁移。'
+  - q: "数据从哪里来？做 WAM 的训练数据和做 VLA 一样吗？"
+    a: "WAM 比 VLA 数据要求更高。VLA 主要需要 (obs, action) 对，WAM 需要 (obs_t, action_t, obs_{t+1}, ...) 完整 trajectory。论文识别了四大数据源：(1) teleoperation 真机数据，质量最高但贵（每小时人工 $30-100，1000 小时 才能训一个能用的）；(2) 人类演示视频（Ego4D、EpicKitchens），量大但缺 action 标注，需要逆运动学反推；(3) 仿真数据（IsaacLab、Robosuite），可以无限生成但 sim-to-real gap 是个老问题；(4) 第一视角网络视频（YouTube cooking、how-to），最大规模但 noisy。当前最佳实践是 60% 仿真 + 20% 人类演示 + 15% teleoperation + 5% 网络视频的混合策略。"
+  - q: "WAM 的评测怎么做？看准确率就行了吗？"
+    a: "三个维度缺一不可。(1) 视觉保真度：预测的 future frame 跟实际拍的是否一致，常用 FVD、LPIPS、CLIP-Score；(2) 物理常识：预测的物体运动是否符合重力、摩擦、连接约束，可以用 PhysBench、PhyWorld 这类专门基准；(3) 动作可信度：在仿真里执行预测的 action，看任务完成率（成功率）和路径效率。三者会冲突：视觉保真度高的模型可能违反物理（比如让物体悬浮），物理对的模型可能视觉模糊。所以单看一个指标没意义，必须三个一起报告，论文也强调这是 WAM 评测标准化最大的缺口。"
+  - q: "如果我现在想入门 WAM，最快路径是什么？需要哪些前置知识？"
+    a: '前置：(1) VLA 基础（OpenVLA、RT-2 至少看过 paper）；(2) Video diffusion 或 video autoregressive 模型（SVD、Sora、Cosmos）；(3) Robot policy learning（BC、diffusion policy、ACT）。最快入门路径：先跑 NVIDIA Cosmos + GR00T 1.5 的开源 demo（Cascaded WAM 标杆，有完整 colab）；再读两篇代表 Joint WAM 的论文（UniSim、VPP），理解联合训练的目标函数；最后看 OpenVLA + dreamer 的混合实现。如果你是软件工程师想转具身 AI，直接从 Cosmos + OpenVLA 着手，比从头啃综述效率高。论文本身（2605.12090）作为"概念地图"再读，避免在错误的方向上深挖。'
+---
+
+> **📌 论文一句话**：VLA 是"看到什么做什么"，WAM 是"看到什么 + 想象会发生什么 + 决定做什么"——多了"想象"这一步。
+
+## 为什么 VLA 不够用
+
+过去两年具身 AI 的主流叙事是 VLA（Vision-Language-Action）：把视觉编码器、LLM、action head 拼成一个端到端 policy，学习 `P(action | obs, language)`。OpenVLA、RT-2、Pi-0、MolmoAct 都是这个范式。
+
+VLA 的问题在于它本质上是**反射式**的：
+
+```
+观察 (visual) → 直接预测 → 动作
+```
+
+模型没有显式建模"做了这个动作之后世界会变成什么样"。这导致三个具体问题：
+
+1. **缺乏物理常识**：把杯子推到桌沿，VLA 可能直接预测"继续推"，因为它没"模拟"过会摔下去
+2. **长 horizon 规划弱**：3 步以上的任务（开抽屉 → 取物品 → 放回去）成功率断崖
+3. **数据利用率低**：训练时唯一信号是 action 监督，浪费了视频里大量的"未来帧"信息
+
+复旦 + NUS 14 位作者 2026/05/12 发表的综述（arxiv 2605.12090）给出了答案：**WAMs（World Action Models）**——把世界模型预测和动作生成统一起来，目标是联合分布 `P(action, future_state | obs, language)`。
+
+## 论文做了什么
+
+这是一篇 systematic survey，不提新方法，但做了四件硬活：
+
+1. **形式定义**：第一次把"WAM" 这个概念从其他相关名词（world model、video policy、neural simulator）里精准切出来
+2. **Taxonomy**：分 Cascaded 和 Joint 两大派，每派再按生成模态（visual / token / latent）、条件机制、动作解码策略细分
+3. **数据生态盘点**：四类数据（teleoperation / 人类演示 / 仿真 / 第一视角视频）的优劣对比
+4. **评测三维度**：视觉保真 / 物理常识 / 动作可信度，第一次系统化提出
+
+## 两条路线：Cascaded vs Joint
+
+```
+Cascaded WAM
+─────────────
+   obs ──→ [World Model] ──→ future_state ──→ [Action Policy] ──→ action
+   说明：两个独立网络，串成 pipeline
+
+Joint WAM
+─────────────
+   obs ──→ [Unified Network] ──→ (future_state, action) 共同输出
+   说明：单一 backbone 同时预测未来和动作
+```
+
+### Cascaded WAM 代表
+
+- **NVIDIA GR00T 1.5 + Cosmos**：Cosmos 是独立的 video world model，GR00T 在 Cosmos 生成的 future frames 条件下选 action
+- **DreamerV3 + VLA**：用 Dreamer 系列的潜空间 world model 做 imagination，VLA head 做动作
+
+优点：模块化好，可以单独迭代 world model 或 action policy；可解释性强（你能看到 world model 生成的未来帧）。
+
+缺点：错误会累积（world model 错 → action 也错）；推理慢（要先跑 world model 再跑 policy）。
+
+### Joint WAM 代表
+
+- **UniSim**：把动作 token 化跟视觉 token 混在一起，统一 autoregressive 生成
+- **VPP**（Video Prediction Policy）：共享 backbone，多任务头同时输出 next frame 和 action
+
+优点：参数效率高、推理快（单次 forward）、信号融合更充分。
+
+缺点：训练复杂（联合 loss 调权重要小心）；debug 难（出错说不清是哪一边坏）。
+
+论文的判断是：**Joint 在学术 SOTA 上领跑，Cascaded 在工业落地里占主导**。这和 LLM 历史上"端到端 vs 模块化"的拉锯非常像。
+
+## 数据生态：四派各有死穴
+
+| 数据源 | 规模 | 标注质量 | 成本 | sim-to-real gap |
+|--------|------|---------|------|----------------|
+| Teleoperation 真机 | 小（k 小时级） | 极高 | 极高 | 0（本身就是 real） |
+| 人类演示视频 | 中（10-100k 小时） | 中（需逆运动学） | 低 | 中 |
+| 仿真 (IsaacLab) | 极大（无限） | 高（仿真即真值） | 极低 | 高（sim-to-real 老问题） |
+| 第一视角网络视频 | 极大（YouTube） | 低（噪声大） | 极低 | 中 |
+
+当前 best practice 是**混合训练**：60% 仿真打底（覆盖广）+ 20% 人类演示（学语义）+ 15% teleoperation（学精细动作）+ 5% 网络视频（学常识）。论文指出**没有任何一类数据可以单独把 WAM 训练好**，这是和 VLA（仿真 + teleoperation 就能凑合）的关键区别。
+
+## 评测的三个维度
+
+论文最有价值的部分。WAM 不能像 VLA 一样只看任务成功率，因为成功率本身可能掩盖物理违规：
+
+| 维度 | 关心什么 | 代表指标 |
+|------|---------|---------|
+| 视觉保真 | 预测的下一帧像不像 | FVD、LPIPS、CLIP-Score |
+| 物理常识 | 物体运动符不符合重力/摩擦/约束 | PhysBench、PhyWorld、CausalSim |
+| 动作可信度 | 在仿真里执行能不能完成任务 | Task Success Rate、Path Efficiency |
+
+三者经常冲突：
+
+- 视觉保真度高的模型可能让物体悬浮（视觉对但物理错）
+- 物理对的模型预测帧可能模糊（物理对但视觉差）
+- 动作成功率高的模型可能在仿真里 work、真机崩
+
+论文的呼吁是 **WAM benchmark 必须三维一起报**，单看一个数字会被误导。但坦白说，目前还没有一个统一的三维 leaderboard，这是 2026 年下半年最值得做的开源贡献之一。
+
+## 四大开放挑战
+
+论文列出未来 3-5 年的核心难题：
+
+1. **长 horizon 规划**：当前 WAM 在 5-10 步内表现好，20 步以上仍然退化严重
+2. **Sim-to-real 透明化**：仿真训练的 WAM 迁移到真机的精度损失没有标准化的量化方法
+3. **安全推理**：预测"做这个动作会发生什么"的同时也要预测"这个动作会不会伤人/坏东西"
+4. **跨具身泛化**：在 Franka 机械臂上训的 WAM 能不能 zero-shot 用到 UR5、人形机器人
+
+这四个里，**安全推理**是 2026 年监管即将关注的——欧盟 AI Act 把"高风险机器人"列入第三类，要求显式的安全推理日志。WAM 内置 future-state prediction 反而是安全审计的天然抓手。
+
+## 工程师的实用收获
+
+### 1. 选型
+
+- 要做产品：用 Cascaded WAM（NVIDIA GR00T + Cosmos 是当前最稳的开源栈）
+- 做研究：跟踪 Joint WAM（UniSim、VPP 系列）
+- 做 dataset：投资 hybrid 数据 pipeline，不要赌单一来源
+
+### 2. 评测
+
+- 不要只报任务成功率，必须三维（视觉 / 物理 / 动作）一起报
+- 加 PhysBench 这类物理常识基准入 CI
+
+### 3. 安全
+
+- 把 WAM 的 future-state prediction 落盘做审计日志
+- 在动作执行前加一层 "future-state safety check"（预测帧里有人 / 危险物 → 阻断）
+
+## 结语：综述的意义
+
+这篇 paper 不提新方法、不刷 benchmark、不开源代码——它做的是**给一个混乱的新领域画地图**。2024-2026 年 WAM 相关论文已经超过 200 篇，但术语混乱、taxonomy 不统一、benchmark 各自为战。复旦 + NUS 这篇综述至少让"WAM"这个词有了精确含义，让后续论文有了共同的 baseline 比较框架。
+
+对工程师而言，这是"读综述比读 SOTA 论文更高 ROI"的典型例子：花两小时读完，能避免接下来三个月在错误的方向上深挖。下一篇值得追踪的是 6-9 月即将出现的"统一 WAM benchmark"——一旦三维评测被标准化，这条赛道才会真正进入大规模落地阶段。

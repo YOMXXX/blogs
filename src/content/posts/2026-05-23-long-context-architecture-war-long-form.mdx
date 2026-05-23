@@ -1,0 +1,204 @@
+---
+title: "长上下文架构之争：FlashAttention、子二次方、稀疏 KV、Mamba 谁能笑到最后"
+description: "2026 年 5 月长上下文出现四大流派分庭抗礼：FlashAttention 3 的暴力派、SubQ SSA 的子二次方派、ChunkKV+FibQuant 的稀疏 KV 派、Mamba/RWKV 的线性 SSM 派。本文从计算复杂度、精度、工程成本三个维度横向拆解，给出 2026 年选型决策树。"
+column: "long-form"
+tags: ["Long Context", "LLM Architecture", "Attention Mechanism", "KV Cache", "Mamba", "FlashAttention", "Subquadratic"]
+pubDate: 2026-05-23
+featured: false
+tldr: "2026 年 5 月长上下文赛道形成四大流派：FA3 的暴力派把 O(N²) 常数压到极致；SubQ SSA 的子二次方派用 LSH+routing 砍到 O(log N)；ChunkKV/FibQuant/RocketKV 稀疏 KV 派动态淘汰或量化 cache；Mamba 2/RWKV-7/RetNet 的线性 SSM 派替换 attention。本文给四派复杂度/精度/工程门槛对比和按场景选型决策树。1M 以下 FA3+ChunkKV、1-4M 选 SubQ 或 hybrid、edge 端选 RWKV——hybrid 才是真正未来。"
+author: "YOMXXX"
+faq:
+  - q: "Mamba/SSM 派为什么在 LLM 主流里一直被边缘化？"
+    a: "三个原因。(1) Recall 短板：state space 用固定大小 hidden state 压缩历史，长 context 上 needle-in-haystack 容易漏。Mamba 2 用 SSD 算子缓解但没解决。(2) Pretraining 数据效率：相同 token 量下 Mamba 收敛慢于 Transformer 10-15%，前期成本高。(3) 生态：FA、PagedAttention、vLLM、Triton kernel 等基础设施都围绕 Transformer 构建，Mamba 迁移成本不小。最近的 hybrid（Jamba、StripedHyena）把 Transformer 和 SSM block 交替排列兼得长 context 和 recall，是 SSM 派 2026 最有竞争力的形态。"
+  - q: "ChunkKV、RocketKV 这类稀疏 KV 方法和子二次方派是替代关系还是叠加关系？"
+    a: '叠加关系。稀疏 KV 作用在推理阶段（prefill 完之后把 KV cache 压一压），而子二次方作用在 forward 计算阶段（一开始就少算）。理论上可以叠：先用 SSA 训练一个本身计算量就少的模型，再用 ChunkKV/FibQuant 把推理时的 KV 内存进一步压。但实测里两者叠加并非简单 1+1，因为 SSA 已经天然稀疏，再叠 chunk-level eviction 会触发"稀疏的稀疏"的精度悬崖。目前最稳健的组合是：标准 attention + ChunkKV/RocketKV，或 SSA 单独用，不要叠。'
+  - q: "FlashAttention 3 在 H100/B200 上具体跑多快？1M token 是不是真的不行？"
+    a: "FA3 在 H100 SXM5 上 1M token、batch=1、FP16 推理大约 4.2 秒/token，相当于每输出一个 token 等 4 秒。能跑但用户体感差。B200 上提升到 ~2.5 秒/token，依旧不够好。1M token 的 KV cache 在 70B 模型上约占 80GB 显存，单卡装不下要 TP，bandwidth 又成瓶颈。所以 FA3 在 256K-512K 是甜点区，1M+ 在工程上需要其他手段配合（PagedAttention、SubQ、Mamba hybrid 等）。"
+  - q: "RWKV-7 和 Mamba 2 同属线性 SSM 派，开发者应该选哪个？"
+    a: "看场景。(1) Edge / mobile：RWKV-7 更适合，推理内存占用稳定（不随序列长度增长），且有 GGUF/llama.cpp/MLC 三条移动端推理路径。Mamba 2 的 SSD 算子在边缘硬件上 kernel 支持还不完善。(2) Server 端长 context：Mamba 2 略胜，hybrid 形态（如 Zamba2、Jamba 1.6）已经能在 256K context 上匹敌 Transformer。(3) 中文 / 多语言：RWKV 中文社区更活跃（Bo Peng 团队主导），中文 benchmark 上稍好。但要清楚一点：纯 SSM 模型至今没在 SWE-Bench / MMLU-Pro 这种 reasoning-heavy benchmark 上拿到前沿分数，复杂任务还是 hybrid 或 Transformer。"
+  - q: "如果我要给一个 RAG 应用选 LLM，该按 context window 还是按 NIAH 选？"
+    a: '按 effective context = 标称 context × NIAH 准确率选。Opus 4.7 标称 200K、NIAH @ 200K 是 99.1%、effective ≈ 198K。SubQ 标称 12M、NIAH @ 12M 是 78%、effective ≈ 9.36M。Gemini 3.5 Flash 标称 1M、NIAH @ 1M 约 88%、effective ≈ 880K。RAG 建议把 chunk 总 size 控制在 effective 的 60% 以内，留 40% 给系统 prompt 和对话历史。另外更重要的指标是"长尾召回"——关键信息埋在第 95 百分位还能找出来吗，需要自己用业务数据测 RAGAS。'
+---
+
+> **🎯 这篇要回答的问题**：2026 年想做长上下文产品，到底该选哪条技术路线？
+
+## 时间线：长上下文是怎么走到今天的
+
+```
+2017  Vaswani  Attention is All You Need     O(N²)
+2020  Beltagy  Longformer (sliding+global)   O(N×W)
+2022  Dao      FlashAttention                O(N²) 但 IO-aware
+2023  Gu       Mamba (selective SSM)         O(N) state space
+2024  Sun      RetNet (retention)            O(N) recurrent
+2024  Liu      RingAttention                 O(N²) 分布式拼
+2025  Peng     RWKV-7                        O(N) linear recurrent
+2025  Zamba    Zamba2 (Mamba+Attention)      hybrid
+2025  ChunkKV  KV cache 语义块压缩             post-hoc 稀疏
+2026  RocketKV 两阶段 KV 压缩                  post-hoc 稀疏
+2026  SubQ     SSA (LSH+routing+sparse)      O(N log N) 子二次方
+2026  FibQuant 矢量量化 KV cache               post-hoc 稀疏
+```
+
+从这条时间线能看出三个浪潮：
+
+- **2017-2022**：标准 attention 一统天下，优化集中在 kernel。
+- **2023-2025**：线性派（Mamba、RWKV、RetNet）尝试替换 attention 但 recall 不够。
+- **2025-2026**：稀疏派（ChunkKV、RocketKV、FibQuant）作用在推理后期；混合派（Jamba、StripedHyena、Zamba2）兼得 Transformer 和 SSM；子二次方派（SubQ SSA）声称要终结 O(N²) 时代。
+
+四股力量当前并存，没有任何一派能宣布胜利。本文做横向对比。
+
+## 第一派：暴力派（FlashAttention 3）
+
+代表：FlashAttention 1/2/3、PagedAttention、RingAttention、Tri-stage Tensor Parallel。
+
+哲学：**O(N²) 不动，把常数压到极致。**
+
+优势：
+- 精度无损（标准 attention 数学等价）
+- 工具链最成熟（vLLM、TensorRT-LLM、TGI 全套支持）
+- 软件生态最大（所有 Hugging Face 模型默认这条路径）
+
+短板：
+- 1M token 上仍然要 4 秒/token，B200 上 2.5 秒
+- KV cache 在 70B + 1M 上 80GB，必须 TP，bandwidth 是瓶颈
+- 单 token 推理成本下降幅度有限
+
+适合场景：256K-512K 上下文、对精度无损要求高、有充足硬件预算。这是当前生产主流。
+
+## 第二派：子二次方派（SubQ SSA）
+
+代表：SubQ 1M-Preview（2026/05/05）、Reformer（先驱，已过时）、Microsoft Dynamic Sparse Attention。
+
+哲学：**计算复杂度从 O(N²) 真正打到 O(N log N) 或更低。**
+
+核心机制（以 SSA 为例）：
+1. LSH 把 N 个 key 哈希到 √N 个 bucket
+2. 路由网络为每个 query 选 top-k 个 bucket
+3. 只在选中的 bucket 内算 attention
+
+优势：
+- 1M token 上比 FA3 快 52×（论文数据，未独立验证）
+- 12M context 是当前 SOTA 上限
+- 训练和推理都受益
+
+短板：
+- 短序列（&lt; 32K）反而比 FA3 慢 2-3×
+- LSH bucket assignment 是否真的可微+稳定还有争议
+- 仅 SubQ 一家在做且闭源，社区无法独立复现
+- NIAH @ 12M 仅 78%，长尾召回有挑战
+
+适合场景：1-4M 长上下文、需要在单次推理处理超长文档、能接受闭源 API。
+
+## 第三派：稀疏 KV 派（ChunkKV / RocketKV / FibQuant）
+
+代表：ChunkKV（2025）、RocketKV（2025）、FibQuant（2026/05）、EchoKV（2026）。
+
+哲学：**不动 forward 计算图，专攻推理时的 KV cache 体积。**
+
+| 方法 | 核心思路 | 压缩比 | 精度损失 |
+|------|---------|--------|---------|
+| ChunkKV | 按语义块淘汰，保持完整语义单元 | 4-8× | &lt; 1% (MMLU) |
+| RocketKV | 两阶段：先粗筛 chunk 再细选 token | 8-16× | 1-3% |
+| FibQuant | 矢量量化每个 KV 向量 | 4-6× | &lt; 0.5% |
+| EchoKV | 相似性重构，丢弃后可从邻居恢复 | 6-10× | 1-2% |
+
+优势：
+- 与 attention 实现解耦，可以无侵入叠在 FA3 上
+- 不需要重新训练，开箱即用
+- 对部署成本影响巨大（KV cache 是 long-context 最大显存开销）
+
+短板：
+- 不能加速 prefill（首 token 延迟无改善）
+- 只对 decode 阶段生效
+- 在多轮对话中累积误差需要监控
+
+适合场景：256K-1M 上下文、需要在已有模型（开源 7B-70B）上低成本叠加长上下文能力。**这是 2026 年性价比最高的工程方案**。
+
+## 第四派：线性 SSM 派（Mamba / RWKV / RetNet）
+
+代表：Mamba 2、RWKV-7、RetNet、Hyena、StripedHyena、Zamba2、Jamba 1.6。
+
+哲学：**把 attention 整个替换成 state space 或 retention，O(N²) → O(N)。**
+
+| 模型 | 类型 | 长度上限 | 工程成熟度 |
+|------|------|---------|----------|
+| Mamba 2 | Pure SSM | 256K+ | 中（Zamba2 hybrid 主流） |
+| RWKV-7 | Linear recurrent | 64K-128K | 高（移动端优势） |
+| RetNet | Retention | 验证不充分 | 低 |
+| Jamba 1.6 | Hybrid (Mamba+Attn) | 256K | 高（AI21 商业化） |
+| StripedHyena 2 | Hybrid (Hyena+Attn) | 128K | 中 |
+
+优势：
+- O(N) 推理，无 KV cache（固定 state size）
+- 适合 edge / mobile 部署
+- 训练时长序列内存友好
+
+短板：
+- Recall 上限低于 Transformer，长尾召回弱
+- 推理 throughput 上 hybrid 比纯 Mamba 更稳
+- Reasoning-heavy benchmark（SWE-Bench、MMLU-Pro）至今未触及前沿
+
+适合场景：移动端、边缘设备、流式实时场景；server 端用 hybrid 比纯 SSM 更稳妥。
+
+## 综合对比矩阵
+
+| 维度 | 暴力派 (FA3) | 子二次方派 (SSA) | 稀疏 KV 派 | SSM/Hybrid 派 |
+|------|------------|-----------------|-----------|--------------|
+| 推理复杂度 | O(N²) IO-opt | O(N log N) | O(N²) + 小 cache | O(N) |
+| 精度 | 无损 | 有不确定性 | 1-3% 损失 | 长尾召回弱 |
+| 硬件需求 | 高（GPU 高 bw） | 中 | 中（省显存） | 低（边缘友好） |
+| 工程成本 | 低（生态最全） | 高（自己复现） | 中（lib 化中） | 中（hybrid 主流） |
+| Prefill 加速 | ❌ | ✅ | ❌ | ✅ |
+| Decode 加速 | ✅ | ✅ | ✅✅ | ✅ |
+| Edge 部署 | ❌ | ❌ | 部分 | ✅ |
+| 长尾召回 | ✅✅ | ⚠ 待验证 | ✅ | ⚠ |
+| 开源 | 全 | 闭源 | 全 | 全 |
+
+## 选型决策树
+
+```
+你的场景需要多长 context？
+├── &lt; 256K：FlashAttention 3 + 标准 7B-70B，不要折腾
+│
+├── 256K - 1M：
+│   ├── 在已有开源模型上加长 → 叠 ChunkKV / RocketKV
+│   ├── 训新模型 → Jamba/Zamba2 hybrid
+│   └── 用 API → Gemini 3.5 Flash 性价比最高
+│
+├── 1M - 4M：
+│   ├── 闭源可接受 → SubQ API
+│   ├── 必须开源 → Together AI 的 SSA 复现（6 月）+ FibQuant
+│   └── 折中 → Claude Opus 4.7 + 长 context chunk 路由
+│
+└── 4M+：
+    ├── 真的需要吗？先用 RAG 解决
+    ├── 必须一次性塞 → SubQ 12M（接受 NIAH 降到 78%）
+    └── 训自己的 → 等 6 月 Together AI 复现 + 自训 hybrid
+
+要部署到边缘 / 移动端？
+├── 实时流式（语音、IoT）→ RWKV-7
+└── 离线推理 → Mamba 2 量化版
+```
+
+## 三个常见误区
+
+**误区 1：选 context 最大的就行。**
+12M context 听起来诱人，但 NIAH @ 12M 是 78%，意味着 22% 的关键信息可能丢。effective context 才是真实可用长度。
+
+**误区 2：subquadratic 就是无脑替换。**
+SSA 在 &lt; 32K 上反而比 FA3 慢，路由 overhead 大于收益。短文档应用上不要替换。
+
+**误区 3：long context 就能替代 RAG。**
+即使有 12M context，把 1TB 文档塞进去也是不现实的。RAG 仍然是知识库规模的唯一答案，long context 是 RAG 的补充而非替代。最佳实践是 RAG 粗筛 + long context 精读。
+
+## 写在最后：hybrid 是真正的未来
+
+四大流派各有各的死穴。下一代真正的长上下文架构很可能是**横向 hybrid**：
+
+- **同层 hybrid**：FlashAttention 处理短程依赖 + SSA 处理长程跳跃 + Mamba 处理流式状态
+- **跨层 hybrid**：Jamba/Zamba2 已经验证 Transformer 层 + SSM 层交替排列效果好
+- **推理时 hybrid**：标准 attention + 稀疏 KV，对短上下文无损，对长上下文省显存
+
+2026 下半年最值得关注的不是某一派的胜利，而是 hybrid 的标准化——希望 6 月 Together AI 的 SSA 开源能成为这场标准化的起点。
+
+如果你今天就要选型，记住一句话：**1M 以下 FA3+ChunkKV，1M 以上 hybrid 或 SubQ，edge 端选 RWKV-7。**

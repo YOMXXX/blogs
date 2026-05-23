@@ -1,0 +1,126 @@
+---
+title: "SubQ SSA 论文速读：第一个真正子二次方注意力做到 12M token，FlashAttention 快 52 倍"
+description: "Miami 初创 Subquadratic 5 月发布 SubQ 1M-Preview，首次给出 fully subquadratic sparse attention（SSA）的工程实现，1M token 上比 FA 快 52×，SWE-Bench 81.8。本文拆解 SSA 机制与争议。"
+column: "paper"
+tags: ["SubQ", "Subquadratic Attention", "Long Context", "Sparse Attention", "LLM Architecture", "FlashAttention"]
+pubDate: 2026-05-23
+featured: false
+tldr: "Subquadratic 5/5 出 stealth 发布的 SubQ 1M-Preview 是第一个声称完全子二次方的前沿规模 LLM：1M token 上比 FlashAttention 快 52×、注意力计算量约 1/1000，SWE-Bench Verified 81.8 仅次于 Opus 4.6 和 GPT-5.5。论文核心是 SSA——把 selective routing、layer 稀疏预算、LSH 拧到一起的混合稀疏机制。本文解析 SSA 关键设计、12M 上下文实测、以及社区为何要求独立复现。"
+author: "YOMXXX"
+faq:
+  - q: "SSA 和之前的 linear attention（Performer、Linformer、RetNet）有什么本质区别？"
+    a: '之前的 linear attention 用 kernel trick 或低秩近似把 attention 矩阵从 O(N²) 砍到 O(N)，代价是丢精度——在长序列上往往 perplexity 显著高于 standard attention。SSA 不走低秩近似，而是结合 LSH (Locality-Sensitive Hashing) 选 top-k 关键 token，再叠一层 selective routing 把每个 query 路由到对应的 k 个 key cluster，单个 query 实际计算量是 O(log N) 量级。论文给的 perplexity 在 1M context 上和 standard attention 接近，关键不靠近似而靠"只算重要的"。这是它的卖点也是争议点：top-k 选错了就崩。'
+  - q: "1000x 注意力压缩是怎么算出来的？真的有这么夸张吗？"
+    a: "论文用的对比基准是 1M token 上的 standard attention：N² = 10¹² 个 attention score。SSA 的 LSH bucket size 选 ~64，top-k 选 32，每个 query 实际算 32×64 = 2048 个 score，N×2048 = 2×10⁹。比值约 500×。SubQ 团队公布的 1000x 是叠加了 selective layer routing 之后的（不是每层都跑 attention），所以工程数字是合理的；但学术 benchmark 上要看精度损失，而第三方还在复现中。这就是社区要求独立验证的原因。"
+  - q: "12M 上下文实际能装多少东西？Needle-in-Haystack 表现如何？"
+    a: "12M token 约等于 9000 页 A4、或 60 万行 Python 代码、或 80 部长篇小说。论文公布的 NIAH 在 1M 长度上准确率 99.2%，在 8M 长度上 92.4%，12M 长度上降到 78%——12M 是研究上限，1-4M 才是稳定工作区间。Subquadratic 公开的 demo 是把整个 Linux kernel 源码扔进去做交叉引用查询，但社区已经有人质疑这类查询其实可以靠 RAG 解决，长上下文真正能赢 RAG 的场景仍然有限。"
+  - q: "52× faster than FlashAttention 是在什么硬件、什么 batch size 下测的？"
+    a: "论文 setup 是 8×H100 SXM5，batch size 1，sequence length 1M，FP8 推理。FlashAttention 3 在这个配置下约 4.2 秒/token，SSA 约 0.08 秒/token，比值 52×。但要注意：(1) batch size &gt; 1 时 FlashAttention 能更好分摊 cache miss，SSA 优势会缩到 10-20×；(2) sequence length &lt; 32K 时，SSA 的 LSH overhead 会让它反而比 FlashAttention 慢 2-3×。所以这是个长序列专用架构，短序列上不要替换。"
+  - q: "为什么研究界要求独立复现？现在的争议焦点是什么？"
+    a: "三个争议点：(1) Subquadratic 只放了 1M-Preview 的 API，没开源权重也没开源训练代码，无法独立验证 perplexity 和 NIAH 数据；(2) 论文里 SSA 的 LSH bucket 大小、top-k 数等关键超参没说清楚，复现难度大；(3) 第三方测的 SubQ Code CLI 在真实多文件 refactor 任务上表现不如 SWE-Bench 分数暗示，怀疑 benchmark contamination。SemiAnalysis、Anthropic、Together AI 都公开要求 Subquadratic 提供独立 audit。这是 paper 速读阶段，不是定论阶段。"
+---
+
+> **📌 论文一句话**：第一次有团队声称把 attention 计算复杂度真正打到 sub-linear（每个 query 只算 O(log N) 个 key），并且在前沿规模（SWE-Bench 81.8）上没崩。
+
+## 背景：为什么"真正子二次方"是个 milestone
+
+attention 的 O(N²) 是当代 LLM 长上下文最大的拦路虎。过去五年解决方案大致三派：
+
+1. **暴力派**（FlashAttention 1/2/3）：不改变 O(N²)，但用 IO-aware kernel 把常数项压到极致。1M token 上跑得动但贵。
+2. **低秩派**（Linformer、Performer、Mamba、RetNet）：用 kernel/state space 把矩阵压成 O(N)。理论好看，长序列上精度往往掉。
+3. **稀疏派**（Longformer、BigBird、Reformer）：只算一部分 attention pair。规则手工设计，扩展性差。
+
+Subquadratic 团队的 SSA（Subquadratic Sparse Attention）严格意义上是稀疏派的延伸，但用学习到的稀疏模式而不是手工规则，并且复杂度比 sparse attention 通常号称的 O(N√N) 还要低，论文里给出的工程量级是 **O(N log N)**。
+
+## SSA 的三层结构
+
+论文核心架构图（笔者根据公开 blog post 重构）：
+
+```
+Query token x_i
+      │
+      ▼
+┌──────────────────┐
+│ Step 1: LSH      │  把 12M 个 key 哈希到 ~200K 个 bucket
+│ multi-hash       │
+└──────────────────┘
+      │
+      ▼
+┌──────────────────┐
+│ Step 2: Selective│  路由网络选 top-k 个 bucket (k=32)
+│ Routing          │  per query
+└──────────────────┘
+      │
+      ▼
+┌──────────────────┐
+│ Step 3: Sparse   │  只在选中的 k 个 bucket 内计算 attention
+│ Attention        │  ≈ 2048 个 score per query
+└──────────────────┘
+      │
+      ▼
+   Output o_i
+```
+
+三层每一层都不是新东西——LSH 来自 Reformer（2020），Selective Routing 来自 MoE，Sparse Attention 来自 Longformer——但 SubQ 论文的贡献是**让三层协同训练且端到端可微**。之前的 LSH attention（Reformer）因为 hash bucket assignment 不可微，训练不稳；SubQ 用 Gumbel-Softmax 把 bucket 选择软化成可微操作。
+
+## 关键超参（论文 Table 3 摘要）
+
+| 超参 | 值 | 说明 |
+|------|-----|------|
+| LSH bucket size | 64 | 每个 hash bucket 装 ~64 个 token |
+| 路由 top-k | 32 | 每个 query 选 32 个 bucket |
+| 每层稀疏率 | ~99.97% | 每层只算 ~0.03% 的 attention pair |
+| Layer routing | 64/96 层激活 | 不是每层都跑 attention |
+| 上下文窗口 | 12M | 训练时 1M，推理外推到 12M |
+
+每层稀疏率 99.97% 是关键——意思是 99.97% 的 attention pair 直接跳过不算，所以 1M token 上才有 1000× 的计算量节省。
+
+## 精度数据：声称 vs 实测
+
+论文公开的关键基准：
+
+| 基准 | SubQ 1M-Preview | Opus 4.7 | GPT-5.5 | Gemini 3.5 |
+|------|----------------|----------|---------|------------|
+| MMLU-Pro | 78.4 | 81.2 | 80.1 | 79.8 |
+| SWE-Bench Verified | 81.8 | 80.8 (4.6) | 79.5 | 76.3 |
+| HumanEval+ | 92.1 | 94.7 | 93.8 | 91.5 |
+| LongBench-v3 | 65.9 | 32.2 | 74.0 | 26.3 |
+| NIAH @ 1M | 99.2% | N/A | N/A | N/A |
+| NIAH @ 8M | 92.4% | N/A | N/A | N/A |
+
+LongBench-v3 是 SubQ 的主战场——65.9 仅次于 GPT-5.5 的 74，但碾压 Opus 4.7 和 Gemini 3.5。SWE-Bench 81.8 也是惊人数字，但这就是社区质疑的点。
+
+## 三个争议
+
+### 争议 1：benchmark contamination
+
+SubQ Code CLI 在 SWE-Bench 上 81.8，但 X 上有开发者测试真实多文件 refactor 时表现并不显著优于 Opus 4.6。SemiAnalysis 在 5/12 发文要求 Subquadratic 公开训练数据来源，至今未回应。
+
+### 争议 2：12M 长上下文的真实价值
+
+NIAH @ 12M 78% 不算太低，但远远低于 1M 的 99.2%。如果实际工作场景是 8M+，那 SSA 的稀疏选择可能在长尾上漏掉关键 token。Anthropic 的 Karpathy（兼职）在 X 上指出："selective routing 上限是检索准召，等于在 attention 里嵌了一个 retriever，retriever 的所有问题会重现。"
+
+### 争议 3：闭源
+
+权重、训练代码、关键超参都没开源。论文说"为防止滥用"，但学术界普遍认为这是缺乏独立验证的借口。Together AI 已经宣布要复现 SSA 并开源，预计 6 月发布。
+
+## 工程意义
+
+不管争议如何，SSA 论文给了几个值得记住的工程教训：
+
+1. **Hybrid 才是出路**：纯线性、纯稀疏、纯标准注意力都有死穴，混合（LSH + routing + sparse）才能既快又准。
+2. **可微 LSH 是关键**：Reformer 之后五年没人解决的可微 hash bucket assignment，SubQ 用 Gumbel-Softmax 给出了可工程化的方案。
+3. **layer routing 是 attention 之后的下一站**：不是每层都需要 attention，把 attention 当成稀有资源调度是 MoE 思路在 attention 维度的延伸。
+
+## 复现建议
+
+如果你想尝试在自己的小模型上叠加 SSA 思路，目前最接近的开源实现是：
+
+- **`microsoft/dynamic-sparse-attention`**（2026/04 开源），实现了 SSA 的前两层（LSH + routing），第三层的 sparse kernel 用 FlashAttention 替代。
+- **`stanfordnlp/sparser`**（2026/05 开源），偏研究复现，包含可微 LSH 的官方 PyTorch 实现。
+
+不建议直接在生产上替换 attention：SSA 在短序列（&lt; 32K）上反而比 FlashAttention 慢 2-3×，要按 sequence length 做切换。
+
+## 结语：等 6 月
+
+SubQ 论文目前停留在"工业声明 + 部分基准"阶段，距离学术共识还差几步：开源权重、第三方复现、长尾任务验证。但即使 SSA 最终被证伪 50%，"可微 LSH + selective routing"这条路也已经被验证可走通——这是过去五年长上下文研究里最有信息量的一篇 paper。我们下个月再看 Together AI 和 Anthropic 的复现结果。
