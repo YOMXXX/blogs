@@ -31,3 +31,6 @@ docs/superpowers/
 # test coverage
 coverage/
 scripts/daily-write.sh
+
+# 引流推广文案（本地用，不入 git）
+scripts/promo-templates.md

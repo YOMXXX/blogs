@@ -1,0 +1,278 @@
+---
+title: "Mastra 实战：用 TypeScript 30 分钟搭一个带工具、记忆和工作流的生产级 Agent"
+description: "Mastra 是 Gatsby 团队推出的 TypeScript-first Agent 框架，22K+ 星、周下载量 30 万。本文从 createAgent / createTool / createWorkflow 到部署，给出一份完整的实战手册。"
+column: "workshop"
+tags: ["Mastra", "TypeScript", "AI Agent", "Workflow", "RAG", "Node.js"]
+pubDate: 2026-05-24
+featured: false
+tldr: "Mastra 是 Gatsby 创始团队 2024-10 开源的 TypeScript Agent 框架，2026-01 发 1.0、目前 22K+ 星、周下载 30 万。它把 createAgent / createTool / createWorkflow 三个原语和 Zod schema 绑在一起，开发体验介于 LangChain 和 OpenAI Agents SDK 之间但更 TS-first。本文从一个能查机票、记住用户偏好、跑多步工作流的真实 demo 出发，覆盖工具调用、记忆系统、Workflow 编排和 Cloudflare Workers 部署。"
+author: "YOMXXX"
+faq:
+  - q: "Mastra 和 LangChain.js、OpenAI Agents SDK、Vercel AI SDK 怎么选？"
+    a: "四者定位不同。Vercel AI SDK 是最薄的 LLM 客户端，适合做聊天前端流式输出，不带 Agent/Workflow 抽象。OpenAI Agents SDK 是 OpenAI 官方实现，只支持 OpenAI 模型且 handoff/guardrails 模型偏单一。LangChain.js 历史最久但 API 庞杂、TS 类型层薄。Mastra 的差异化在于：(1) 三个原语 createAgent / createTool / createWorkflow 边界清晰；(2) Zod schema 既做参数校验又做 prompt 描述，类型推导贯穿全链路；(3) 内置 Memory、Eval、Telemetry 一站式。如果你已经在写 TS 后端、想要长期维护的 Agent 应用，Mastra 是最稳的一档。"
+  - q: "Mastra 的 Memory 系统和向量库怎么集成？支持哪些后端？"
+    a: "Mastra 的 Memory 分两层：working memory 管最近 N 轮对话窗口，semantic memory 基于向量检索做长期记忆。working memory 默认 LibSQL 存 message thread，可配 lastMessages: 20 限窗口；semantic memory 接任意 Embedder + Vector Store 组合，官方适配 Pinecone、Qdrant、Chroma、pgvector、Cloudflare Vectorize、Upstash。两者可同时启用，retrieval 自动合并到 context。生产推荐 Upstash + Cloudflare Vectorize，serverless 友好按用量计费。"
+  - q: "createTool 和 createWorkflow 有什么区别？什么时候用哪个？"
+    a: "createTool 是给 Agent 单次调用的原子能力，对应 LLM 工具调用语义（function calling）；createWorkflow 是 deterministic 的多步骤管道，模型只在显式 step 里被调用。判断标准：如果流程逻辑由 LLM 决定（要不要调、调几次、调什么参数），用 createTool；如果流程是固定的 DAG（先 fetch、再 summarize、再 score、再 write_db），用 createWorkflow。两者可以嵌套：Workflow 的一个 step 可以是『跑一个 Agent』，Agent 的一个 tool 可以是『触发一个 Workflow』。生产建议是外层 Workflow + 内层 Agent，保证可观测性和 retry 的颗粒度。"
+  - q: "Mastra 怎么做 evaluation 和回归测试？"
+    a: "Mastra 内置 evals 模块，写法和 vitest 测试用例类似。它把 Eval 抽象成 (input, output, criteria) → score 的函数，官方提供 ToxicityMetric、AnswerRelevancy、FactualConsistency、ContextualPrecision 等开箱评估器。CI 里跑 mastra eval --threshold 0.8 可以在 score 跌破阈值时阻断 PR。配合 Mastra Playground 的 trace UI，可以可视化看每条用例的 LLM call 链路、tool 入参出参、最终 score，定位回归非常快。复杂场景可以用 LLM-as-judge 自己写评估函数，框架不强制。"
+  - q: "Mastra 部署到 Cloudflare Workers / Vercel Edge / 自托管 Node 服务，分别有什么坑？"
+    a: "Mastra 1.0 起官方支持三种部署目标：(1) Node.js Server（mastra deploy --target node 生成 Express/Hono 路由）；(2) Cloudflare Workers（用 Workers AI 或外部 LLM，Memory 必须用 Cloudflare D1 + Vectorize，不能用 SQLite）；(3) Vercel Edge Functions（注意 60s 执行上限，长 Workflow 必须切片）。两个共性坑：动态 import 在 Edge 环境会失败，所有 tool 必须静态注册；Memory 的 storage adapter 选错会导致冷启动慢 2 秒以上，serverless 环境一律用 LibSQL/D1，别用 file-based SQLite。"
+---
+
+> **💡 一句话总结**：Mastra 不是要取代 LangChain，是在 TypeScript 生态里补齐"类型安全 + Agent/Workflow 双原语 + 内置 Memory/Eval"的空缺。如果你是 TS 后端工程师，30 分钟就能跑通一个能上生产的 Agent。
+
+## 为什么是 Mastra，为什么是现在
+
+2024 年下半年我们看着 LangChain.js 的 API surface 一直在膨胀、OpenAI Agents SDK 上线但只锁定自家模型、Vercel AI SDK 始终停留在 LLM 客户端层面。中间这个生态空位被 Mastra 填上了——Gatsby 的创始团队 2024-10 开源，半年攒到 22K+ 星，2026-01 正式发 1.0，现在 npm 周下载量 30 万。
+
+它的设计哲学非常克制：三个核心原语 `createAgent`、`createTool`、`createWorkflow`，全部用 Zod 写参数 schema、自动推导 TypeScript 类型、自动生成给 LLM 的工具描述。开发体验最接近 Next.js 之于 React——别人在拼乐高，它把乐高的边角都磨好了。
+
+## 5 分钟跑通第一个 Agent
+
+```bash
+npm create mastra@latest my-agent
+cd my-agent
+npm install
+```
+
+CLI 会问你要哪些 provider（OpenAI / Anthropic / Google / Groq / Mistral），选完就把对应 SDK 装好，写好 `.env.example` 和 `mastra.config.ts`。
+
+最小 Agent 长这样：
+
+```typescript
+import { createAgent } from "@mastra/core/agent";
+import { anthropic } from "@ai-sdk/anthropic";
+
+export const tripAgent = createAgent({
+  name: "trip-agent",
+  instructions: `你是一个旅行助理，帮用户查机票、推荐目的地、记录偏好。
+保持回答简短，重要数字（价格、时长）用粗体。`,
+  model: anthropic("claude-opus-4-7"),
+});
+
+const result = await tripAgent.generate("帮我查一下 6 月 1 号北京到东京的直飞机票");
+console.log(result.text);
+```
+
+到这一步它和 Vercel AI SDK 没差别。Mastra 真正发挥的地方是后面三块。
+
+## 工具调用：createTool + Zod 一次到位
+
+```typescript
+import { createTool } from "@mastra/core/tools";
+import { z } from "zod";
+
+export const flightSearchTool = createTool({
+  id: "search-flights",
+  description: "查询指定日期和航线的直飞航班，返回价格和时长",
+  inputSchema: z.object({
+    from: z.string().describe("出发城市 IATA 代码，如 PEK"),
+    to: z.string().describe("到达城市 IATA 代码，如 HND"),
+    date: z.string().describe("出发日期，YYYY-MM-DD 格式"),
+  }),
+  outputSchema: z.object({
+    flights: z.array(z.object({
+      flight_no: z.string(),
+      airline: z.string(),
+      depart: z.string(),
+      arrive: z.string(),
+      price_cny: z.number(),
+      duration_min: z.number(),
+    })),
+  }),
+  execute: async ({ context }) => {
+    const { from, to, date } = context;
+    const resp = await fetch(`https://api.skyscanner.dev/flights?from=${from}&to=${to}&date=${date}`, {
+      headers: { Authorization: `Bearer ${process.env.SKYSCANNER_KEY}` },
+    });
+    return await resp.json();
+  },
+});
+```
+
+注意三个细节：
+
+1. **inputSchema 双用途**——既给运行时做参数校验（错的会 throw），又通过 `.describe()` 把字段说明喂给 LLM 当工具描述。再也不用一份 schema 写两份描述。
+2. **outputSchema 强制约束**——execute 返回值不符合会报错，下游 step 拿到的数据有完整 TS 类型。
+3. **context 自动展开**——execute 的第一个参数是 `{ context: InferZodType<inputSchema> }`，不再需要 `(args as any).from`。
+
+把 tool 挂到 Agent 上只要加一行：
+
+```typescript
+export const tripAgent = createAgent({
+  name: "trip-agent",
+  instructions: "...",
+  model: anthropic("claude-opus-4-7"),
+  tools: { flightSearchTool },
+});
+```
+
+## Memory：working + semantic 两层
+
+旅行助理需要记住"用户偏好靠窗、不吃辣、预算 ≤8000"这种长期事实。Mastra 的 Memory 模块开箱就支持：
+
+```typescript
+import { Memory } from "@mastra/memory";
+import { LibSQLStore } from "@mastra/libsql";
+import { fastembed } from "@mastra/fastembed";
+
+const memory = new Memory({
+  storage: new LibSQLStore({ url: "file:./mastra.db" }),
+  embedder: fastembed,
+  options: {
+    lastMessages: 20,            // working memory 窗口
+    semanticRecall: {
+      topK: 3,                   // 检索 3 条最相关历史
+      messageRange: 2,           // 每条带上下文 2 条
+    },
+    workingMemory: {
+      enabled: true,
+      template: `# 用户档案
+- 偏好座位: 
+- 饮食限制: 
+- 常用航线: 
+- 预算上限: `,
+    },
+  },
+});
+
+export const tripAgent = createAgent({
+  name: "trip-agent",
+  instructions: "...",
+  model: anthropic("claude-opus-4-7"),
+  tools: { flightSearchTool },
+  memory,
+});
+
+await tripAgent.generate("我喜欢靠窗，预算 8000 以内", {
+  threadId: "user-123",
+  resourceId: "user-123",
+});
+```
+
+`workingMemory.template` 是 Mastra 1.0 的亮点：LLM 会自动把对话里抓到的事实填到模板对应字段，下次取出来作为系统提示拼到 context 前面。这一招比 LangChain 的 ConversationSummaryBufferMemory 简单太多，因为字段是结构化的，不会被 LLM 随意改写。
+
+## Workflow：deterministic DAG + 嵌套 Agent
+
+如果你的流程是固定的"先查航班 → 比价 → 写入用户邮件 → 发通知"，用 Workflow 比让 Agent 自己决策更稳：
+
+```typescript
+import { createWorkflow, createStep } from "@mastra/core/workflows";
+import { z } from "zod";
+
+const fetchFlights = createStep({
+  id: "fetch-flights",
+  inputSchema: z.object({ from: z.string(), to: z.string(), date: z.string() }),
+  outputSchema: z.object({ flights: z.array(z.any()) }),
+  execute: async ({ inputData }) => {
+    return await flightSearchTool.execute({ context: inputData });
+  },
+});
+
+const rankFlights = createStep({
+  id: "rank-flights",
+  inputSchema: z.object({ flights: z.array(z.any()) }),
+  outputSchema: z.object({ best: z.any(), reason: z.string() }),
+  execute: async ({ inputData }) => {
+    const result = await tripAgent.generate(
+      `按价格和时长综合排序，给出最优航班和理由：${JSON.stringify(inputData.flights)}`,
+    );
+    return JSON.parse(result.text);
+  },
+});
+
+const notifyUser = createStep({
+  id: "notify-user",
+  inputSchema: z.object({ best: z.any(), reason: z.string() }),
+  outputSchema: z.object({ sent: z.boolean() }),
+  execute: async ({ inputData }) => {
+    await sendEmail(inputData);
+    return { sent: true };
+  },
+});
+
+export const flightBookingWorkflow = createWorkflow({
+  id: "flight-booking",
+  inputSchema: z.object({ from: z.string(), to: z.string(), date: z.string() }),
+  outputSchema: z.object({ sent: z.boolean() }),
+})
+  .then(fetchFlights)
+  .then(rankFlights)
+  .then(notifyUser)
+  .commit();
+```
+
+每个 step 的 inputSchema/outputSchema 强制约束让整条链路 type-safe。`.then(...)` 之外还有 `.parallel([...])`、`.branch(condition, stepA, stepB)`、`.dountil(condition, step)` 几种组合子，覆盖 90% 的工作流场景。
+
+跑工作流：
+
+```typescript
+const run = await flightBookingWorkflow.createRun();
+const result = await run.start({
+  inputData: { from: "PEK", to: "HND", date: "2026-06-01" },
+});
+```
+
+如果中间某个 step 挂了，整条 run 进入 `failed` 状态，可以 `run.resume(stepId, newInput)` 从失败点恢复，不用从头跑。
+
+## 评估：mastra eval 写起来像 vitest
+
+```typescript
+// evals/trip-agent.eval.ts
+import { evaluate } from "@mastra/evals";
+import { AnswerRelevancyMetric, FactualConsistencyMetric } from "@mastra/evals/llm";
+import { tripAgent } from "../src/agents/trip";
+
+evaluate("trip-agent answers stay relevant", {
+  agent: tripAgent,
+  cases: [
+    {
+      input: "推荐 3 个适合 6 月去的海岛",
+      criteria: [new AnswerRelevancyMetric({ threshold: 0.8 })],
+    },
+    {
+      input: "我预算 5000 能去日本几天",
+      criteria: [new FactualConsistencyMetric({ threshold: 0.7 })],
+    },
+  ],
+});
+```
+
+CI 里加一行 `mastra eval --threshold 0.8`，所有 case 平均分跌破 0.8 就 fail PR。这套机制比业内绝大多数 LLM 应用的 evals 都成熟。
+
+## 部署：Cloudflare Workers 一条命令
+
+```bash
+mastra build --target cloudflare-workers
+wrangler deploy
+```
+
+Mastra build 会自动：
+
+- 把所有 tool 静态分析后打包，避免 Workers 动态 import 限制
+- 把 LibSQL storage 切换成 D1 binding
+- 把 Memory 的向量存储切换成 Vectorize binding
+- 生成 `wrangler.toml` 模板
+
+生产里别忘了三件事：(1) 在 `wrangler.toml` 配 `usage_model = "unbound"` 解锁 30s CPU 时间；(2) Workers AI 模型选 `@cf/anthropic/claude-3-5-sonnet`（如果用 Cloudflare 自家通路）；(3) Memory 的 `workingMemory.template` 单条不能超 4KB，否则 D1 写入会被限流。
+
+## 一份成本清单（截至 2026-05）
+
+| 后端组合 | 月活 1k 用户 / 每人 50 轮 | 月成本估算 |
+|----------|---------------------------|------------|
+| Vercel Edge + Anthropic Opus 4.7 + Pinecone Starter | 5 万次调用 | $180（LLM）+ $70（Pinecone）+ $20（Vercel）≈ $270 |
+| Cloudflare Workers + Workers AI + Vectorize | 5 万次调用 | $40（Workers）+ $25（Workers AI）+ $5（Vectorize）≈ $70 |
+| 自托管 Node + Ollama 本地模型 + Qdrant | 5 万次调用 | 服务器固定 $80/月 |
+
+中小项目首推 Cloudflare 全家桶，成本最低且 Mastra 适配最丝滑。
+
+## 写在最后：Mastra 不是银弹
+
+它的几个短板要诚实说清楚：
+
+- **没有 LangSmith 那种完整的 trace 数据库**，自带的 Telemetry 只能 export 到 OpenTelemetry，UI 比较薄。
+- **多模态支持仍在迭代**，2026-05 才补上视频 input，VLM 流式输出还有 bug。
+- **国内 LLM 适配（Qwen、智谱、DeepSeek）需要自己封装 provider**，官方 SDK 没覆盖。
+
+但只要你写的是英文场景、用主流 LLM、需求是中型 Agent 应用，Mastra 当下是 TypeScript 生态里综合体验最好的选择。
