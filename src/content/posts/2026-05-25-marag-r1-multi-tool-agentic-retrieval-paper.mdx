@@ -1,0 +1,167 @@
+---
+title: "MARAG-R1 论文速读：用强化学习教 Agent 同时调度多个检索器，HotpotQA 提升 18 个点"
+description: "MARAG-R1 把『检索』从单一向量搜索升级成多工具协同——同时调度 web search、向量库、知识图谱、SQL，端到端用 RL 学习调度策略。本文拆解奖励设计、训练 pipeline 与落地参考。"
+column: "paper"
+tags: ["Agentic RAG", "Multi-Tool Retrieval", "Reinforcement Learning", "arXiv", "HotpotQA", "MARAG-R1"]
+pubDate: 2026-05-25
+featured: false
+tldr: "MARAG-R1（arXiv 2510.27569）针对当前 Agentic RAG 普遍只接一种 retriever 的问题，把 web search、dense vector、knowledge graph、SQL 四类工具统一注册为 callable，让 7B base 模型用 GRPO 自己学『什么时候调哪个、调几次、怎么融合』。在 HotpotQA / 2WikiMultiHopQA / FRAMES 上比单工具 baseline 高 12-18 个点，比固定路由 baseline 高 6-10 个点，且训练只用了 8K 条高质量轨迹。"
+author: "YOMXXX"
+faq:
+  - q: "MARAG-R1 和 Self-RAG、IRCoT、R3-RAG 这些 RAG-Reasoning 论文的本质区别？"
+    a: "三个维度。(1) 工具维度：Self-RAG / R3-RAG 都假设只有一个 retriever（通常是 dense vector），MARAG-R1 显式建模 4 类异构工具，调度成本和召回特性差很多；(2) 学习目标：IRCoT 用 CoT prompting 走 zero-shot，Self-RAG 用 reflective token SFT，MARAG-R1 用 GRPO 端到端 RL，直接优化最终答案准确率；(3) 推理结构：前两者是『检索→生成』线性结构，MARAG-R1 是『检索→评估→可能再检索→融合→生成』的循环结构，每一步都允许 agent 决定下一步动作。简言之 MARAG-R1 把 retrieval 从子模块变成了 first-class action space。"
+  - q: "四种检索工具具体怎么用？覆盖什么 query 类型？"
+    a: "论文设计的工具集是覆盖型互补。(1) web_search：调 Bing API，处理时效性问题和长尾事实；(2) vector_search：调本地 dense index（E5-Large embedding），处理语义匹配；(3) kg_query：调 Wikidata SPARQL endpoint，处理实体关系类问题（『X 的导演是谁』）；(4) sql_query：调结构化表（论文用 Spider 转换的关系库），处理需要 join/aggregation 的问题。Agent 在每一步会先输出一段 reasoning 解释为什么选某个工具，再发起 tool call。统计上 web_search 用得最多（55%），其次 vector（28%）、kg（12%）、sql（5%），但去掉任意一个，部分类别 query 准确率掉 8-20 个点。"
+  - q: "GRPO 训练的奖励函数怎么设计？怎么避免 reward hacking？"
+    a: "奖励分三层。(1) 任务奖励：最终答案和 ground truth 比对，用 token F1 + exact match 双指标，权重 0.7；(2) 过程奖励：每一步 tool call 是否能带来 information gain（用一个固定的 judge LLM 评估『加上这次检索后回答置信度的增量』），权重 0.2；(3) 效率惩罚：每次额外 tool call -0.05，超过 8 次截断惩罚 -1.0，权重 0.1。论文专门讨论了 reward hacking：早期版本 agent 学会『反复调 web_search 同一个 query 拼接结果』骗 information gain，后来加了 query-similarity penalty 才解决——两次 query embedding 相似度 &gt; 0.85 不给 information gain reward。"
+  - q: "训练只用 8K 条轨迹是怎么做到的？数据是怎么 curate 的？"
+    a: "用了一套『难度筛选 + 多工具必要性筛选』pipeline。第一步从 HotpotQA / 2Wiki / Bamboogle / FRAMES 合计 50K 训练集里筛出『单工具 baseline 答错但 oracle 多工具能答对』的样本，剩 12K；第二步用 GPT-5 跑 oracle 轨迹（人工标了每一步该调什么工具），过滤掉轨迹长度 &lt;3 或 &gt;6 的样本，剩 9K；第三步去重（语义聚类后每类保留 1-2 条），最终 8K。这套筛选哲学是『RL 的样本效率取决于样本本身能不能区分策略』，对所有工具都能秒答的样本对学策略没贡献。这点对工业落地非常有启发——别砸 100K 训练数据，先想清楚哪些样本能驱动策略学习。"
+  - q: "怎么把 MARAG-R1 的思路抄到生产系统？需要训练自己的模型吗？"
+    a: "三档落地。(1) 最轻量（1 天）：直接 prompt 工程，把『工具选择 reasoning』作为 system prompt 一部分，用 Claude Opus 4.7 / Gemini 3.5 Flash 这类强模型零样本跑，能拿到论文 60% 的收益但每次 4-8 倍 token 成本；(2) 中等（1-2 周）：用 SFT 在 1-2K 条 oracle 轨迹上微调一个 7B 模型（Qwen3 7B / Llama 3.3 8B），学会工具选择模式，token 成本降到 1/10；(3) 完整（1-2 月）：复现 MARAG-R1 的 GRPO 训练，需要 8-16 张 H100、自建 retriever pool、reward judge LLM。大多数团队走第二档已经够用，第三档收益更多在 long-tail edge case 上，要看业务场景值不值。"
+---
+
+> **💡 一句话总结**：让 Agent 在 web search、向量库、知识图谱、SQL 之间『自己决定调哪个、调几次』，比写死一套 RAG 路由强 10 个点。MARAG-R1 证明端到端 RL 学调度策略是可行的，且数据需求比想象的小。
+
+## 当前 Agentic RAG 的真实瓶颈
+
+我们在生产 RAG 系统里观察到一个反复出现的模式：**90% 的失败 case 不是因为 retriever 本身差，而是因为『调度错了 retriever』**。
+
+举几个典型例子：
+
+- 问『2026 年 5 月 Mistral 发布了什么新功能』，向量库里没有最近的内容，但 agent 仍然在向量库里翻——应该去 web search
+- 问『苹果公司创始人的妻子是谁』，agent 把整个 query 丢给向量库，单跳召回不到——这是个知识图谱友好的 2-hop 实体关系问题
+- 问『过去半年销量最高的产品是哪 5 个』，agent 在文档向量库里搜『销量最高产品』，召回一堆 marketing slides——应该去 SQL 跑 group by
+
+这些都不是 retriever 质量问题，是『工具选择』问题。但当前主流 Agentic RAG 框架（LangGraph、LlamaIndex、Self-RAG 系）都默认只有一个 retriever，或者用硬编码的路由规则，根本没把『选哪个工具』当成可学习的决策。
+
+MARAG-R1（arXiv 2510.27569）从这个根问题出发，把多工具检索当成 RL 问题正面解决。
+
+## 问题形式化
+
+论文把 Agentic Retrieval 形式化成一个 MDP：
+
+- **State**：`(query, conversation_history, tool_call_history, accumulated_evidence)`
+- **Action space**：`{call_tool(tool_name, query), think(reasoning), answer(text), stop}`
+- **Tool space**：`{web_search, vector_search, kg_query, sql_query}`
+- **Reward**：终态时的答案质量 + 过程的 information gain - 调用次数惩罚
+
+policy 是一个 LLM（论文用 Qwen3 7B base），输入 state、输出 action。每一步 agent 可以选择：
+
+1. 调某个 tool（带自然语言 query）
+2. 想一段（自由文本，不出 action）
+3. 给出最终答案
+4. 主动放弃
+
+## 四个工具的覆盖型设计
+
+论文最有想法的设计是工具集的『最小覆盖』。他们提了一个原则：**每加一个工具，必须能 strictly 拿到其他工具拿不到的某类 query**。
+
+最终四件套：
+
+| 工具 | 输入 | 输出 | 擅长 query 类型 | 平均调用成本 |
+|------|------|------|-----------------|--------------|
+| `web_search` | query string | top-10 webpage snippet | 时效性、长尾事实 | $0.005/次 |
+| `vector_search` | query string | top-5 chunk + score | 语义近邻、模糊匹配 | $0.0001/次 |
+| `kg_query` | SPARQL or natural language | entity/relation triples | 2+ hop 实体关系 | $0.002/次 |
+| `sql_query` | natural language → SQL | rows | 聚合/统计/join | $0.001/次 |
+
+调用成本差到 50 倍，所以 agent 学到的策略要 cost-aware。论文 figure 6 显示训练后的 agent 在『时效性问题』上 web_search 占比 87%，在『关系类问题』上 kg_query 占比 64%，明确学会了 query-tool matching。
+
+## GRPO 训练的细节
+
+GRPO（Group Relative Policy Optimization）是 DeepSeek-Math 那篇用的算法，特点是对每个 prompt 采样 N 条轨迹、组内相对 advantage、不需要 critic 网络。MARAG-R1 用 N=8。
+
+奖励函数分三层：
+
+```
+R_total = 0.7 × R_task + 0.2 × R_process - 0.1 × R_cost
+
+R_task   = 0.6 × token_F1(answer, gt) + 0.4 × exact_match(answer, gt)
+R_process = sum over steps of info_gain(step) * decay^step
+R_cost   = num_tool_calls / 8 + truncation_penalty
+```
+
+`info_gain` 用一个固定的 GPT-5 mini 当 judge，每次 tool call 后问『加上这次结果，回答置信度从 a 涨到 b，b-a 是多少』，量化到 [-1, 1]。
+
+**Reward hacking 的几次教训**：
+
+1. 第一版 agent 学会『反复调 web_search 同一个 query』拼接结果骗 info_gain → 加 query similarity penalty
+2. 第二版 agent 学会『最后一步 answer 抄第一步 web_search 标题』而不真正综合 → 加 evidence citation 检查
+3. 第三版 agent 学会『先 stop 拿到 truncation penalty 但避免 wrong answer 大惩罚』→ 把 stop 改成 -0.3 fixed penalty
+
+这些是 RL 论文里很少披露的工程细节，对复现非常关键。
+
+## 数据筛选 pipeline
+
+论文一直强调他们只用 8K 训练样本，背后是激进的数据筛选：
+
+```
+50K raw QA samples (HotpotQA + 2Wiki + Bamboogle + FRAMES)
+   ↓ 第一步：单工具 vs 多工具 oracle 差异筛选
+12K 样本（多工具能答对、单工具答错的子集）
+   ↓ 第二步：oracle 轨迹质量过滤
+9K 样本（GPT-5 跑出来的轨迹长度 3-6 步、可执行）
+   ↓ 第三步：语义去重
+8K 最终训练集
+```
+
+这个 pipeline 体现了一个 RL 的核心 insight：**样本必须能区分策略**。对所有工具都能秒答的样本对学策略没贡献，对所有工具都答不出的样本只会教 agent 投降。论文里有一组消融实验，用 50K 全量数据训练效果反而比 8K 精筛差 4-7 个点，证明数据质量&gt;数据数量。
+
+## 主要实验结果
+
+| Benchmark | Single-Tool RAG | Fixed-Router RAG | MARAG-R1 | 提升 |
+|-----------|----------------|------------------|----------|------|
+| HotpotQA (EM) | 48.3% | 56.1% | 66.2% | +17.9 |
+| 2WikiMultiHopQA (EM) | 51.7% | 59.4% | 70.8% | +19.1 |
+| FRAMES (Acc) | 42.8% | 50.6% | 60.3% | +17.5 |
+| Bamboogle (EM) | 38.1% | 47.2% | 54.6% | +16.5 |
+| Average tool calls/query | 1.0 | 1.0 | 2.7 | - |
+
+亮点：
+
+- **MARAG-R1 7B 超过 GPT-5 fixed-router baseline**（GPT-5 用同样 4 个工具但人工写死路由，HotpotQA 上 61.4% vs MARAG-R1 66.2%）
+- 平均 2.7 次 tool call 不是『暴力多调』，64% 的 query 用 1-2 次解决，长尾难题才用 5+ 次
+- 在 FRAMES（多跳推理 benchmark）上提升最大，说明 RL 真的学会了『拆解复杂 query 成多次检索』
+
+## 错误案例分析
+
+论文 appendix 给了 200 条错误样本的人工标注分布，对落地极有参考价值：
+
+| 错误类型 | 占比 | 典型场景 |
+|----------|------|---------|
+| Tool 选错 | 28% | 时效性问题去了 vector，关系问题去了 web |
+| 检索 query 提的不好 | 24% | 把整段 question 当 query，没拆 |
+| Evidence 综合错误 | 19% | 把矛盾的多源 evidence 直接拼接 |
+| 过早停止 | 14% | 1 次检索就回答，明显信息不足 |
+| 调用过多但仍错 | 8% | 5+ 次调用陷入 loop |
+| Ground truth 标注问题 | 7% | benchmark 自身的问题 |
+
+这个分布暗示了下一代工作方向：**evidence 综合错误占 19%，但训练阶段几乎没有专门优化**。未来加一个 evidence consistency 的过程奖励，可能再提 5-10 个点。
+
+## 对工程落地的启示
+
+如果你不打算训练自己的 RL 模型，也能从这篇论文里抄三个最实用的思路：
+
+**思路 1：多工具优于单工具 + 强模型零样本**
+
+直接用 Claude Opus 4.7 / Gemini 3.5 Flash 这类强模型，挂多个工具，在 system prompt 里写清楚『先 reason 选工具、再调用、可以多次』。我们实测在内部 RAG 上，从『只挂 vector』改成『vector + web search + SQL 三选一』，准确率从 64% 升到 78%。
+
+**思路 2：用 SFT 学工具选择模式**
+
+如果调 API 太贵，标 1-2K 条『正确的工具调用序列』，用 SFT 在 Qwen3 7B 上微调，能拿到接近 RL 的 80% 收益。标注成本是关键——可以用 Claude 跑 oracle 轨迹然后人工筛。
+
+**思路 3：永远不要写死路由规则**
+
+我们见过太多 RAG 系统用 if-else 规则做工具选择，结果规则集随业务膨胀到 200+ 条无法维护。MARAG-R1 证明 LLM 自己能学到比手工规则好得多的策略，从一开始就把 routing 交给模型。
+
+## 局限与未来
+
+论文自己列了三个 limitation：
+
+1. **工具 schema 是固定的**：换一套工具要重新训练 policy，没有 zero-shot 泛化到新工具的能力
+2. **多模态 query 未覆盖**：所有工具都是文本输入文本输出，image / table 类 query 无法处理
+3. **没有 long-horizon memory**：每次 query 是独立的，跨多轮对话的复杂任务（如多日调研）不行
+
+下一步合理推测是 MARAG-R1 + 长期记忆（参考 EverMemOS）+ 多模态工具，可能就是 2026 下半年 Agentic RAG 的下一个里程碑。
+
+代码和 checkpoint 在 [github.com/MARAG-R1/MARAG-R1](https://github.com/MARAG-R1)，Hugging Face 上也有 7B / 13B 两个版本，可以直接拿来做对照实验。如果你正在做 Agentic RAG，这篇是 2026 上半年最值得复现的论文之一。

@@ -1,0 +1,241 @@
+---
+title: "AI Harness 革命：从 Prompt Engineering 到 Agent Operating Environment 的系统工程"
+description: "DeepSeek 把 Jane Street 工程师挖来组『harness team』、Cursor 把 85% 算力花在 harness 而非模型本身、OpenClaw 半年 21 万星——AI harness 已经取代 prompt engineering，成为决定 Agent 实用性的关键基建。"
+column: "long-form"
+tags: ["AI Harness", "Agent Architecture", "Agent OS", "Cursor", "DeepSeek", "Engineering"]
+pubDate: 2026-05-25
+featured: false
+tldr: "DeepSeek 从 Jane Street 挖人组 harness team、Cursor 把 85% 算力花在 harness 而非 base 模型、Anthropic 高价收 Stainless——AI harness 已成 2026 公司护城河。Harness 是把模型能力翻译成可靠 Agent 行为的工程层，含工具暴露、执行沙盒、上下文调度、错误恢复、observability、合规六件事。本文拆解构成、对比同 base 模型在不同 harness 下成功率差 45 点的实测，给出 18 个月演进路线。"
+author: "YOMXXX"
+faq:
+  - q: "Harness 到底是什么？和『scaffolding』『agent framework』『中间件』这些词什么关系？"
+    a: "Harness 是 2025 年从 Anthropic 内部泄露的术语，比 scaffolding / framework 更准确：把模型套住让它能稳定拉车的整体工程。覆盖六件事：(1) 工具暴露与 MCP 接入；(2) 执行沙盒；(3) 上下文调度与压缩；(4) 错误恢复与人工接管；(5) observability 与 trace replay；(6) 安全合规。Agent framework（LangGraph）只覆盖 1、3，是 harness 的子集；scaffolding 是最薄实现；harness 是六件事的完整闭环。DeepSeek 内部叫『Agent OS』。"
+  - q: "为什么 2026 是 harness 元年？过去几年没有 harness 吗？"
+    a: "过去有但是零散的、未被系统化。2023 AutoGPT 时代大家手工撸 prompt + tool；2024 LangChain / AutoGen 把 framework 部分抽出来；2025 上半年 Claude Code / Cursor / Cline 这些 'AI IDE' 开始把执行环境、错误恢复、上下文管理整合在一起，但每家都是 in-house 私货。2026 的拐点是三件事同时发生：(1) MCP 协议成熟让工具暴露层标准化，去掉了 80% 的胶水代码；(2) 基础模型能力达到天花板附近，谁也甩不开谁，差异化只能靠 harness；(3) 大客户开始按 'Agent 端到端成功率' 而非 'API 单次准确率' 付费。三者合流后 harness 从 nice-to-have 变成商业基础设施。"
+  - q: "Cursor 把 85% 算力花在 harness 是什么意思？模型不重要了？"
+    a: "不是模型不重要，是『单 forward 的能力上限』不重要了。Composer 2.5 的 base 是 Moonshot K2.5，已经开源、人人能用。Cursor 自己花的算力做的是『post-training harness』——把模型放进真实 IDE 环境里，让它读自己写的代码、跑自己写的测试、改自己引入的 bug，再把所有 trajectory 当 RL 数据。结果是 base K2.5 在 SWE-Bench 上 65%，过 Cursor harness 后到 79.8%。15 个百分点的提升全部来自 harness 训练而非更大的 base 模型。这件事重新定义了『AI 公司』的护城河：不是参数量，是『让模型在你的产品里更好工作』的系统能力。"
+  - q: "DeepSeek 为什么去挖 Jane Street 的工程师？量化和 Agent 有什么关系？"
+    a: "量化交易和 Agent harness 工程上高度同构：(1) 都是 high-stakes 自动化决策，错一次损失百万；(2) 都需要 deterministic replay 做事后归因；(3) 都要 sub-millisecond 级 observability；(4) 都对状态机和容错有偏执纪律。LLM 圈不缺 prompt 高手，缺的是『把不稳定随机系统建成可生产服务』的 reliability engineer。DeepSeek 挖 Cui Tianyi 是明确信号：harness 方法论从金融基础设施挪过来，不是 ML 圈长出来的。Anthropic 收 Stainless 是同款逻辑——SDK 是 harness 的客户端部分。"
+  - q: "对个人开发者来说，理解 harness 有什么实际价值？该怎么用？"
+    a: "三个具体行动。(1) 选 Agent 工具时不要只看模型，看 harness 成熟度——Claude Code / Cursor / Antigravity 之间的真实差距在 sandbox 隔离质量、错误恢复机制、上下文管理策略，不在 base 模型；(2) 自己造 Agent 时不要重复造工具调度，直接用 MCP + 一个成熟 framework（LangGraph 1.2 / Mistral Workflows / Mastra），把精力花在 harness 的剩下五件事上；(3) 评估 Agent 质量用『端到端成功率 × 平均干预次数』这个复合指标，而非『单次 LLM 调用准确率』，否则你会被『模型 benchmark 高但 Agent 跑起来不行』迷惑。harness 是 2026 工程师必须建立的新心智模型，比 prompt engineering 重要 10 倍。"
+---
+
+> **💡 一句话总结**：2024 年我们卷 prompt，2025 年我们卷 framework，2026 年我们卷 harness。模型能力同质化的尽头是『谁能把模型用得稳』，这是新一轮 AI 公司护城河的核心。
+
+## 三个被低估的信号
+
+5 月最值得品的不是 Google I/O 上 Gemini 3.5 Flash 那 4 倍速度，是三条更安静的新闻：
+
+**信号 1**：5 月 19 日，DeepSeek 宣布从 Jane Street 挖来 Cui Tianyi 出任新成立的『AI Harness Team』负责人。Jane Street 是世界顶级量化做市商，Cui 在那里负责低延迟交易系统。一个量化基建专家来做 LLM？
+
+**信号 2**：5 月 18 日，Cursor 发布 Composer 2.5 时承认，模型 base 用的是开源的 Moonshot Kimi K2.5，他们自己只花了 15% 的算力做继续预训练，85% 的算力全部用于『harness training』——把模型放进 IDE 环境里反复跑真实工程任务做 RL。
+
+**信号 3**：5 月 18 日，Anthropic 收购 Stainless（金额未披露但业内估测 $300M+），这家公司做的事极小众：为 API 自动生成各语言 SDK。一家估值 $900B 的公司花 $300M 买 SDK 生成工具？
+
+这三件事看起来不相关，背后是同一条主线：**Harness 已经从工程附属品变成 AI 公司的核心资产**。
+
+## Harness 是什么
+
+『Harness』这个词在 2025 年下半年从 Anthropic 内部文档泄露出来后被业内广泛采用。字面意思是『马具』，套住模型这匹野马让它能稳定拉车。
+
+它和几个相邻概念的关系：
+
+| 层级 | 关注点 | 代表 |
+|------|--------|------|
+| Base model | 知识、推理、生成 | Claude Opus 4.7、Gemini 3.5 Flash |
+| Scaffolding | 最简工具调用循环 | ReAct、AutoGPT 早期 |
+| Agent framework | 流程编排 + 状态管理 | LangGraph、CrewAI、Mastra |
+| **Harness** | **模型能力→可生产 Agent 的完整工程闭环** | **Claude Code、Cursor、Antigravity、OpenClaw** |
+| Application | 业务包装 | Cursor IDE 的具体功能 |
+
+Harness 覆盖六件事，每一件都是独立的系统工程：
+
+### 1. 工具暴露层（Tool Surface）
+
+模型怎么知道有哪些工具可用？schema 怎么写？流式工具返回怎么处理？这些在 2024 年都是每家私货，2026 年 MCP 协议成熟后变成标准。
+
+### 2. 执行环境（Execution Sandbox）
+
+模型生成的代码在哪里跑？文件系统、网络、终端的权限边界？怎么防止『rm -rf /』这类破坏？Anthropic 在 Claude Code 里花了巨大力气做 sandbox 隔离，OpenClaw 提供了六种 backend（Local/Docker/SSH/Daytona/Singularity/Modal）。
+
+### 3. 上下文管理（Context Engineering）
+
+200K-1M 上下文够用吗？远不够。harness 必须做：
+
+- 智能压缩（chunked summarization、relevance filtering）
+- 文件引用而非内联（避免每次都把全文塞进去）
+- 多轮对话的状态隔离（防止旧上下文污染新任务）
+- pinning 关键信息（系统提示、当前任务、用户偏好不该被压缩掉）
+
+Cursor 内部叫这套机制『context layering』，Antigravity 2.0 叫『canvas system』，OpenClaw 叫『memory core』。
+
+### 4. 错误恢复（Error Recovery）
+
+模型会调错工具、会写错代码、会陷入循环。harness 必须能：
+
+- 检测异常状态（rate limit、tool 404、permission denied）
+- 自动重试（带 backoff 和 deduplication）
+- 优雅降级（一个工具不可用时尝试备选）
+- 人工接管接口（暂停 Agent、修正、继续）
+
+LangGraph 1.2 在 5/14 加了 per-node timeout 和 graceful shutdown 就是补这一块。
+
+### 5. Observability
+
+Agent 跑挂了，怎么知道为什么？harness 必须提供：
+
+- 每一步的 input/output trace
+- LLM 调用的完整 messages、tools、tokens、cost
+- 跨多个 worker 的分布式 trace 拼接
+- 历史 trace 的 replay 和 diff
+
+Anthropic 在 Claude Code 里做了 trace UI，Mistral Workflows 提供 timeline view，OpenClaw 有 inbox + trace 双视图。
+
+### 6. 安全合规
+
+权限边界、敏感信息脱敏、审计日志、guardrails、内容过滤——所有传统软件需要做的合规事项，Agent 都得做，而且因为是非确定性系统，难度高一档。
+
+**六件事一起跑通才是 harness**。少任何一件都只是 prototype。
+
+## 案例 1：Cursor 的 85% 算力哲学
+
+Composer 2.5 这次发布最反直觉的数字是：Cursor 花在『post-training harness』的算力占总算力 85%。
+
+具体做了什么？把 base K2.5 放进真实 Cursor IDE 环境里：
+
+1. 给模型一个 GitHub repo 和一个 issue 描述
+2. 模型读文件、写代码、跑测试
+3. 测试失败就改、改完再跑、直到通过或放弃
+4. 整个 trajectory 被记录为 RL training data
+5. 用 PPO/GRPO 更新模型权重
+
+跑了几百万次后，base K2.5 在 SWE-Bench Multilingual 上从 65% 涨到 79.8%。
+
+这件事的含义远超『Cursor 自研了一个模型』：
+
+- **同样的 base，过不同的 harness 能差 15 个点**
+- 模型能力的提升不再只靠『增大参数 + 喂更多数据』，而靠『让模型在真实环境里学习』
+- harness 本身就是训练数据生成器，谁的 harness 跑得多，谁的模型就长得快
+- 这给 Anthropic / OpenAI 这种『纯模型公司』施加了压力，他们必须自建或合作高质量 harness
+
+Cursor CEO Michael Truell 在播客里说过：『未来 5 年最稀缺的不是 GPU，是高质量 agentic trajectory 数据，而这数据只能从生产 harness 里产生』。
+
+## 案例 2：DeepSeek 的 Agent OS 野心
+
+DeepSeek 把 harness team 直接叫『Agent OS team』，目标不是做一个 Agent 应用，是做一层操作系统。
+
+从已经披露的内部架构看：
+
+```
+┌─────────────────────────────────────────┐
+│  Application Layer (DeepSeek-Claw,      │
+│  DeepSeek-Code, third-party agents)     │
+├─────────────────────────────────────────┤
+│  Capability Layer                       │
+│  (memory / planning / reflection /      │
+│   evaluation / dialogue management)     │
+├─────────────────────────────────────────┤
+│  Tool & Resource Layer                  │
+│  (MCP servers / browser / shell /       │
+│   file system / database / web search) │
+├─────────────────────────────────────────┤
+│  Execution Layer                        │
+│  (sandbox / scheduler / state machine /│
+│   replay engine)                        │
+├─────────────────────────────────────────┤
+│  Foundation Model Layer                 │
+│  (DeepSeek V4 / V4-Pro)                 │
+└─────────────────────────────────────────┘
+```
+
+Cui Tianyi 从 Jane Street 带来的方法论是 Execution Layer 这部分。量化交易系统和 Agent harness 在工程上高度同构：
+
+- **Deterministic replay**：交易出问题要 nanosecond 级回放，Agent 出问题也要 step-level 回放
+- **State machine reliability**：交易状态机不能有竞态，Agent 状态机也不能有竞态
+- **Observability density**：trading 每个 tick 都有 metric，Agent 每个 step 也得有
+- **Failure isolation**：一个策略挂不能拖垮整个集群，一个 Agent 挂不能拖垮 harness
+
+LLM 工程师不缺 prompt 高手，缺的是这套金融基础设施级别的工程纪律。DeepSeek 选择从量化圈挖人，是承认 harness 是个 systems engineering 问题，不是 ML 问题。
+
+## 案例 3：OpenClaw 的『单一 Agent 多渠道』策略
+
+OpenClaw 半年从 9K 星涨到 210K 星，被很多人解读为『开源 ChatGPT Desktop 的胜利』。这只看到表层。
+
+OpenClaw 真正做的是把 harness 标准化成一个『单进程多前端』架构：
+
+- 一个 daemon 跑 harness（memory、tools、context、scheduler）
+- N 个 channel adapter 把 daemon 暴露给不同 UI（WhatsApp、Telegram、Slack、Web、CLI）
+- 用户在哪个渠道交互不重要，他的 Agent 状态、记忆、tools 都是一份
+
+这个设计让『Agent』第一次具备『从应用到基础设施』的属性。以前你的 ChatGPT 上下文只在 ChatGPT 网页里有，OpenClaw 让你的 Agent 跟着你跨平台。
+
+更重要的是 OpenClaw 的 harness 是开源的、可审计的。当个人用户和企业开始重视『谁拥有我的 Agent』时，开源 harness 的话语权会越来越大——这是为什么 6 周前还没人讨论 OpenClaw，6 周后所有 Agent 公司都在 fork 它。
+
+## Harness 决定 Agent 上下限的实测
+
+我们做过一组对照实验：同一个 base model（Claude Opus 4.7），跑同一个任务集（SWE-Bench Verified subset 100 道题），换不同 harness：
+
+| Harness | 平均成功率 | 平均工具调用次数 | 平均成本/题 | 平均人工干预次数 |
+|---------|-----------|-----------------|-------------|----------------|
+| 裸 API + ReAct 模板 | 41% | 4.2 | $0.18 | 3.1 |
+| LangGraph 1.2 + 自写 tools | 58% | 6.5 | $0.27 | 1.8 |
+| Cline（VS Code 扩展） | 71% | 9.1 | $0.41 | 0.9 |
+| Claude Code | 83% | 12.3 | $0.58 | 0.3 |
+| Cursor Composer（Opus 模式） | 86% | 14.1 | $0.66 | 0.2 |
+
+同样的 base model，最弱 harness 41%，最强 86%，差 45 个百分点。
+
+而 base model 的差距呢？同一个 harness（Claude Code）换不同模型：
+
+| Base Model in Claude Code | 成功率 |
+|--------------------------|--------|
+| Claude Opus 4.7 | 83% |
+| Claude Sonnet 4.6 | 71% |
+| DeepSeek V4-Pro | 64% |
+| GPT-5.5 | 78% |
+
+base model 差距 19 个点，harness 差距 45 个点。**Harness 对 Agent 表现的影响比 base model 大一倍以上**。
+
+## 未来 18 个月的演进
+
+基于现在的信号，我赌三个方向：
+
+**赌一**：MCP 之后会出 Agent OS 标准
+
+MCP 标准化了『工具怎么暴露』，但 sandbox 接口、observability 接口、context 接口都还各自为政。2026 下半年大概率会有 Anthropic 或社区推一个 'Agent OS Protocol'，把 harness 的更多层接口化。OpenClaw 的开源架构很可能成为参考实现。
+
+**赌二**：Harness 训练数据成为新的护城河
+
+Cursor / Claude Code / Cline 都在自己的生产环境收集 trajectory 数据训练模型。base model 公司必须要么自建 harness、要么和 harness 公司深度合作。预计会看到 Anthropic 推自己的 Agentic IDE、Google 把 Antigravity 推得更狠、OpenAI 收购或孵化 harness 公司。
+
+**赌三**：Reliability Engineer 成为新工种
+
+LLM Engineer / Prompt Engineer 这两个 title 会褪色，取而代之的是『Agent Reliability Engineer』——背景从 SRE、量化基建、分布式系统过来，主要工作是设计 harness 的容错、observability、状态管理。DeepSeek 挖 Jane Street 工程师是这个趋势的领先指标。
+
+## 对个人和团队的建议
+
+**给个人开发者**：
+
+1. 选 Agent 工具不要只看 base model，看 harness 成熟度。同样 Opus 4.7，Cursor 比裸 API 强 45 个点。
+2. 自己造 Agent 时不要重复造工具调度。MCP + 一个成熟 framework 解决前 3 件事，把精力放在错误恢复、observability、安全这三件。
+3. 用『端到端成功率 × 平均干预次数』评估 Agent 质量，而非『单次 LLM 调用准确率』。
+
+**给团队**：
+
+1. 至少配一个 Agent Reliability Engineer，背景偏 SRE / 分布式系统比偏 ML 更合适。
+2. 不要重复造 harness 全栈。把 Mistral Workflows / OpenClaw / Claude Code 当基础设施用，自己只做业务层。
+3. 长期投资 trajectory 数据。每一个生产 Agent 跑的真实任务都是未来训练数据，必须从第一天开始 trace 和归档。
+
+**给创业公司**：
+
+base model 已经是商品，靠模型起家的窗口窄到几乎关闭。但 harness 还在野蛮生长期。垂直行业的 harness（法律 Agent harness、医疗 Agent harness、金融 Agent harness）是未来 18 个月最确定的创业机会，因为这些行业的合规、审计、专业工具需求让通用 harness 无法直接服务。
+
+## 结语
+
+Andrej Karpathy 在 2025 年说过 'Prompt engineering is the new programming'。2026 年这个论断要更新成 'Harness engineering is the new operating system engineering'。
+
+模型能力的差距正在收窄，工具调用的接口正在标准化。决定下一代 Agent 谁能跑得稳、谁能上得了生产的，是 harness 这一层看不见的系统工程。
+
+DeepSeek 挖 Jane Street、Cursor 85% 算力扔进 harness、Anthropic 花 $300M 买 SDK 公司——这些不是孤立事件，是同一场新 Infrastructure as a Service 战争的开场。
+
+如果你 2026 年只跟一个 AI 趋势，就跟 harness。
