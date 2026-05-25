@@ -1,0 +1,94 @@
+---
+// 文末 CTA：把变现入口串起来（newsletter + services + sponsorship）
+---
+
+<section class="cta">
+  <div class="cta-h">// next.txt ›</div>
+
+  <div class="cta-grid">
+    <a class="cta-card" href="/newsletter">
+      <div class="cta-card-h">📬 Subscribe</div>
+      <div class="cta-card-t">Frontier Brief</div>
+      <div class="cta-card-d">One signal per week. No AI filler.</div>
+    </a>
+
+    <a class="cta-card" href="/services">
+      <div class="cta-card-h">🛠️ Work With Me</div>
+      <div class="cta-card-t">AI engineering, hands-on</div>
+      <div class="cta-card-d">Architecture review, RAG audit, build sprints.</div>
+    </a>
+
+    <a class="cta-card" href="/sponsorship">
+      <div class="cta-card-h">💼 Sponsor</div>
+      <div class="cta-card-t">Reach senior AI engineers</div>
+      <div class="cta-card-d">Newsletter slots, sponsored deep-dives.</div>
+    </a>
+  </div>
+
+  <p class="disclosure">
+    Some outbound links in this post are affiliate links — see <a href="/affiliate-disclosure">disclosure</a>.
+  </p>
+</section>
+
+<style>
+  .cta {
+    margin: 48px 0 32px;
+    padding-top: 32px;
+    border-top: 1px solid var(--color-border-subtle);
+  }
+  .cta-h {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-accent-green);
+    margin-bottom: 14px;
+  }
+  .cta-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+  .cta-card {
+    display: block;
+    padding: 14px 14px 12px;
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 6px;
+    text-decoration: none;
+    transition: border-color 0.15s, transform 0.15s;
+    background: color-mix(in srgb, var(--color-accent-green) 2%, transparent);
+  }
+  .cta-card:hover {
+    border-color: var(--color-accent-green);
+    transform: translateY(-1px);
+  }
+  .cta-card-h {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-accent-green);
+    margin-bottom: 6px;
+  }
+  .cta-card-t {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--color-text-primary);
+    margin-bottom: 3px;
+    line-height: 1.25;
+  }
+  .cta-card-d {
+    font-family: var(--font-sans);
+    font-size: 12px;
+    color: var(--color-text-muted);
+    line-height: 1.4;
+  }
+  .disclosure {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-faint);
+    margin: 16px 0 0;
+  }
+  .disclosure a { color: var(--color-text-secondary); }
+  .disclosure a:hover { color: var(--color-accent-green); }
+  @media (max-width: 720px) {
+    .cta-grid { grid-template-columns: 1fr; }
+  }
+</style>

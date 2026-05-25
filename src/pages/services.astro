@@ -1,0 +1,121 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+---
+
+<BaseLayout
+  title="Services · YOMXXX"
+  description="Hire YOMXXX for hands-on AI engineering work — agent architecture review, RAG system audit, LLM infra setup, or longer-term advisory."
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>yomxxx</span> / <span class="cur">services</span>
+    </div>
+    <h1><span class="prefix">▸</span>Work With Me</h1>
+    <p class="lead">Hands-on AI engineering. No slide decks, no "AI transformation roadmaps".</p>
+
+    <div class="prose">
+      <h2>What I do</h2>
+      <p>
+        I help teams that are <strong>actually shipping LLM / agent / RAG systems in production</strong>
+        and need either a second set of eyes or a temporary extra engineer. I don't do strategy consulting.
+        I don't do "AI readiness assessments". I write code, read code, and tell you what's broken.
+      </p>
+
+      <h2>Engagements</h2>
+
+      <h3>🔍 Architecture Review · 1-2 weeks</h3>
+      <p>
+        For: teams that have a working LLM/agent system and are about to scale, productionize, or rewrite.
+      </p>
+      <ul>
+        <li>Read your repo + design docs in depth</li>
+        <li>2-3 hour deep-dive call with the eng team</li>
+        <li>Written report: risks, quick wins, refactor priorities, infrastructure gaps</li>
+        <li>Follow-up async questions for 2 weeks</li>
+      </ul>
+      <p class="price-note">From <strong>$1,500</strong> · fixed price · pay on delivery</p>
+
+      <h3>🛠️ Hands-on Build · 2-8 weeks</h3>
+      <p>
+        For: teams that need an extra senior IC to design + ship a specific system. Past examples:
+        building a multi-tenant RAG pipeline, designing an eval harness for an agent product,
+        migrating from LangChain to a custom orchestration layer.
+      </p>
+      <ul>
+        <li>I write production code, not prototypes</li>
+        <li>PR-based workflow, your repo, your stack</li>
+        <li>Pairing with your team, knowledge transfer baked in</li>
+      </ul>
+      <p class="price-note">From <strong>$8,000/month</strong> · 50% / 100% allocation · 2-month minimum</p>
+
+      <h3>🎓 Office Hours · ongoing</h3>
+      <p>
+        For: founders or eng leads who want a regular sounding board without a full engagement.
+      </p>
+      <ul>
+        <li>1 hour video call every other week</li>
+        <li>Async questions over email between calls</li>
+        <li>Bring code, architecture diagrams, or just questions</li>
+      </ul>
+      <p class="price-note"><strong>$400/month</strong> · 3-month minimum · paid quarterly</p>
+
+      <h2>What I don't do</h2>
+      <ul>
+        <li>Building chatbots that nobody will use</li>
+        <li>"AI strategy" without an existing engineering organization</li>
+        <li>Hourly contracts &lt; 20 hours</li>
+        <li>Equity-only deals (sorry)</li>
+      </ul>
+
+      <h2>How to reach out</h2>
+      <p>
+        Email <a href="mailto:15901434509@qq.com?subject=Engagement%20inquiry">15901434509@qq.com</a> with:
+      </p>
+      <ol>
+        <li>What you're building, in 3-4 sentences</li>
+        <li>The specific problem you'd want me to help with</li>
+        <li>Rough timeline and engagement type you're imagining</li>
+      </ol>
+      <p>
+        I'll reply within 3 business days. If we're a fit, we'll set up a free 30-min intro call to
+        scope the engagement.
+      </p>
+    </div>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 6px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    color: var(--color-text-primary);
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-text-muted);
+    margin: 0 0 24px;
+  }
+  .prose h3 {
+    margin-top: 28px;
+    font-size: 16px;
+    color: var(--color-text-primary);
+  }
+  .price-note {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-accent-amber);
+    margin: 8px 0 4px;
+  }
+</style>

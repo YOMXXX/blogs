@@ -1,0 +1,155 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+---
+
+<BaseLayout
+  title="Sponsorship · YOMXXX"
+  description="Sponsor YOMXXX — reach senior AI engineers, ML platform leads, and founders building production LLM systems."
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>yomxxx</span> / <span class="cur">sponsorship</span>
+    </div>
+    <h1><span class="prefix">▸</span>Sponsorship</h1>
+    <p class="lead">Reach senior AI engineers building things that ship.</p>
+
+    <div class="prose">
+      <h2>Who reads YOMXXX</h2>
+      <p>
+        The audience skews toward <strong>senior IC engineers, ML platform leads, and technical founders</strong>
+        — people who actually decide which inference framework, agent framework, vector DB, or eval tool gets
+        adopted at their company. Not hobbyists, not students, not "AI curious" PMs.
+      </p>
+      <ul>
+        <li>Topics: LLM inference, agents, RAG, fine-tuning, evals, ML infra</li>
+        <li>Format: long-form deep dives, paper digests, honest tool reviews</li>
+        <li>Tone: technical, opinionated, no marketing fluff</li>
+      </ul>
+
+      <h2>Sponsorship formats</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Format</th>
+            <th>Where it appears</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Newsletter primary slot</td>
+            <td>Top of weekly issue, ~80 words</td>
+            <td>1 sponsor per issue, max</td>
+          </tr>
+          <tr>
+            <td>Newsletter classified</td>
+            <td>Bottom of weekly issue, 1-2 lines</td>
+            <td>Up to 3 per issue</td>
+          </tr>
+          <tr>
+            <td>Sponsored deep-dive</td>
+            <td>Long-form post with clear <code>[Sponsored]</code> tag</td>
+            <td>Editorial control stays mine; I don't shill</td>
+          </tr>
+          <tr>
+            <td>Tool review (paid review request)</td>
+            <td>tools column, honest review</td>
+            <td>You pay for the review; you don't pay for a positive review</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>What I won't do</h2>
+      <ul>
+        <li>Generic banner ads that don't match the audience</li>
+        <li>"Sponsored content" pretending to be editorial</li>
+        <li>Reviews where the verdict is pre-agreed</li>
+        <li>Anything from companies whose products I'd be embarrassed to recommend</li>
+      </ul>
+
+      <h2>Pricing</h2>
+      <table class="price-table">
+        <thead>
+          <tr>
+            <th>Format</th>
+            <th>Price (USD)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Newsletter primary slot</td><td>from <strong>$200</strong></td></tr>
+          <tr><td>Newsletter classified</td><td>from <strong>$50</strong></td></tr>
+          <tr><td>Sponsored deep-dive</td><td>from <strong>$1,200</strong></td></tr>
+          <tr><td>Paid tool review</td><td>from <strong>$800</strong></td></tr>
+        </tbody>
+      </table>
+      <p class="note">
+        Intro pricing while audience is being built. Multi-issue packages get 20–30% discount.
+        Rates reviewed quarterly based on subscriber count and traffic.
+      </p>
+
+      <h2>How to pitch</h2>
+      <p>
+        Email <a href="mailto:15901434509@qq.com?subject=Sponsorship%20inquiry">15901434509@qq.com</a> with:
+      </p>
+      <ol>
+        <li>What you're selling and who it's for</li>
+        <li>Why you think it fits this audience (be specific)</li>
+        <li>Format you want and rough timeline</li>
+      </ol>
+      <p class="note">
+        I read every pitch but reply only to ones that fit. No reply within 7 days = not a fit.
+      </p>
+    </div>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 6px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    color: var(--color-text-primary);
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-text-muted);
+    margin: 0 0 24px;
+  }
+  .prose table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 13px;
+  }
+  .prose th, .prose td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--color-border-subtle);
+  }
+  .prose th {
+    color: var(--color-accent-green);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .prose code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: color-mix(in srgb, var(--color-accent-green) 8%, transparent);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .note { font-size: 12px; color: var(--color-text-faint); }
+  .price-table strong { color: var(--color-accent-amber); }
+</style>

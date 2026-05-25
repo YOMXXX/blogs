@@ -1,0 +1,104 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+---
+
+<BaseLayout
+  title="Affiliate Disclosure · YOMXXX"
+  description="YOMXXX's affiliate disclosure — how affiliate links are used on this site and how editorial independence is maintained."
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>yomxxx</span> / <span class="cur">affiliate-disclosure</span>
+    </div>
+    <h1><span class="prefix">▸</span>Affiliate Disclosure</h1>
+    <p class="lead">Plain-English version of what you'd expect under FTC 16 CFR Part 255.</p>
+
+    <div class="prose">
+      <h2>The short version</h2>
+      <p>
+        Some outbound links on this site — particularly to developer tools, SaaS products, and books — are
+        <strong>affiliate links</strong>. If you click through and sign up or buy something, I may receive a small
+        commission at <strong>no extra cost to you</strong>. This helps keep the blog free and ad-light.
+      </p>
+
+      <h2>How I decide what to link</h2>
+      <p>
+        I only join an affiliate program for a product <strong>after</strong> I've already used it and would
+        recommend it without compensation. The compensation does not influence which products I cover, what
+        I say about them, or what verdict I give in a review.
+      </p>
+      <p>
+        If a vendor pays me directly for content (sponsored post, paid review request), that piece is
+        <strong>clearly labeled</strong> <code>[Sponsored]</code> at the top. See <a href="/sponsorship">sponsorship</a>
+        for the rules I follow on paid content.
+      </p>
+
+      <h2>Affiliate programs I'm currently in</h2>
+      <p>
+        This list is updated as programs are joined or dropped. As of this writing, partners may include
+        (but are not limited to):
+      </p>
+      <ul>
+        <li>Developer tools (IDEs, coding assistants)</li>
+        <li>Infrastructure providers (cloud, vector DB, observability)</li>
+        <li>LLM API providers</li>
+        <li>Technical books on Amazon / publisher direct</li>
+      </ul>
+      <p class="note">
+        Specific brand names are intentionally left out here to avoid stale claims. Each affiliate link in an
+        article is annotated with <code>(affiliate)</code> next to the link the first time it appears.
+      </p>
+
+      <h2>What I won't do</h2>
+      <ul>
+        <li>Hide that a link is an affiliate link</li>
+        <li>Recommend a product I haven't actually used in production or in serious testing</li>
+        <li>Soften a negative review because the product is in my affiliate program</li>
+        <li>Buy or accept fake reviews / engagement</li>
+      </ul>
+
+      <h2>Questions or concerns</h2>
+      <p>
+        If you think a piece on this site failed to disclose something properly, or if a review feels
+        compromised, please email <a href="mailto:15901434509@qq.com?subject=Disclosure%20concern">15901434509@qq.com</a>.
+        I'll investigate and either correct the post or explain why I think the disclosure is sufficient.
+      </p>
+
+      <p class="updated">Last updated: 2026-05-25</p>
+    </div>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 6px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    color: var(--color-text-primary);
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-text-muted);
+    margin: 0 0 24px;
+  }
+  .prose code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: color-mix(in srgb, var(--color-accent-green) 8%, transparent);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .note { font-size: 12px; color: var(--color-text-faint); }
+  .updated { font-size: 11px; color: var(--color-text-faint); margin-top: 32px; font-family: var(--font-mono); }
+</style>

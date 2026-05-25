@@ -1,0 +1,99 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/astro/Header.astro';
+import Footer from '../components/astro/Footer.astro';
+---
+
+<BaseLayout
+  title="Newsletter · YOMXXX"
+  description="Subscribe to YOMXXX Frontier Brief — a weekly newsletter on AI infrastructure, agents, and the engineering tradeoffs that don't make it into the marketing slides."
+>
+  <Header />
+  <main class="container">
+    <div class="breadcrumb">
+      <span>yomxxx</span> / <span class="cur">newsletter</span>
+    </div>
+    <h1><span class="prefix">▸</span>Frontier Brief</h1>
+    <p class="lead">Weekly · AI infra & engineering tradeoffs · ~5 min read</p>
+
+    <div class="prose">
+      <h2>What you'll get</h2>
+      <ul>
+        <li><strong>Free</strong> — 1 essay/week distilled from the blog, no promo, no AI-generated filler</li>
+        <li><strong>Paid</strong> · $5/mo or $50/yr — production checklists, full code drops, behind-the-scenes notes on what broke and why</li>
+        <li><strong>Founder</strong> · $200/yr — everything above + quarterly Q&amp;A office hours over email, name in supporter wall</li>
+      </ul>
+
+      <h2>Why subscribe instead of just RSS</h2>
+      <p>
+        The blog covers frontier papers and tools daily. The newsletter is the opposite: <strong>one signal per week</strong>, the thing
+        I'd tell a friend over coffee. If you're shipping AI in production and don't have time to read 5 papers a day, this is the
+        version that filters for you.
+      </p>
+
+      <h2>Subscribe</h2>
+      <div class="substack-embed">
+        <iframe
+          src="https://yomxxx.substack.com/embed"
+          width="480"
+          height="320"
+          scrolling="no"
+          loading="lazy"
+          title="Subscribe to YOMXXX Frontier Brief"
+        ></iframe>
+        <p class="note">
+          Prefer email? Just send "subscribe" to <a href="mailto:15901434509@qq.com?subject=Subscribe%20to%20Frontier%20Brief">15901434509@qq.com</a> and I'll add you manually.
+        </p>
+      </div>
+
+      <h2>Recent issues</h2>
+      <p>
+        First issue ships <strong>shortly</strong>. In the meantime, the
+        <a href="/posts?column=weekly">weekly column</a> on the blog is the closest preview of the cadence and depth.
+      </p>
+
+      <h2>Privacy</h2>
+      <p>
+        I don't sell or share email addresses. Subscriber data lives in the newsletter provider only. See
+        <a href="/privacy">privacy policy</a> for details.
+      </p>
+    </div>
+  </main>
+  <Footer />
+</BaseLayout>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 6px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    color: var(--color-text-primary);
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+  h1 .prefix { color: var(--color-accent-green); margin-right: 6px; }
+  .lead {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--color-text-muted);
+    margin: 0 0 24px;
+  }
+  .substack-embed {
+    margin: 16px 0 24px;
+  }
+  .substack-embed iframe {
+    width: 100%;
+    max-width: 480px;
+    height: 320px;
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 6px;
+    background: #fff;
+    display: block;
+  }
+  .note { font-size: 12px; color: var(--color-text-muted); margin: 12px 0 0; }
+  .note a { color: var(--color-accent-green); text-decoration: none; }
+  .note a:hover { text-decoration: underline; }
+</style>

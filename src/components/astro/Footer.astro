@@ -27,15 +27,24 @@ const year = new Date().getFullYear();
         <li><a href="/about">about</a></li>
         <li><a href="/privacy">privacy</a></li>
         <li><a href="/contact">contact</a></li>
-        <li><a href="/rss.xml">rss</a></li>
-        <li><a href="/atom.xml">atom</a></li>
-        <li><a href="/feed.json">json feed</a></li>
+        <li><a href="/affiliate-disclosure">disclosure</a></li>
       </ul>
     </div>
     <div class="block">
-      <div class="block-h">// elsewhere</div>
+      <div class="block-h">// work</div>
+      <ul>
+        <li><a href="/newsletter">newsletter</a></li>
+        <li><a href="/services">services</a></li>
+        <li><a href="/sponsorship">sponsorship</a></li>
+      </ul>
+    </div>
+    <div class="block">
+      <div class="block-h">// follow</div>
       <ul>
         <li><a href="https://github.com/YOMXXX" target="_blank" rel="noopener noreferrer">github</a></li>
+        <li><a href="/rss.xml">rss</a></li>
+        <li><a href="/atom.xml">atom</a></li>
+        <li><a href="/feed.json">json feed</a></li>
       </ul>
     </div>
   </div>
@@ -58,7 +67,7 @@ const year = new Date().getFullYear();
     max-width: 1080px;
     margin: 0 auto;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     gap: 32px;
   }
   .block-h {
@@ -85,7 +94,10 @@ const year = new Date().getFullYear();
     gap: 8px;
   }
   .dot { color: var(--color-border-strong); }
-  @media (max-width: 720px) {
+  @media (max-width: 960px) {
+    .footer-inner { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 600px) {
     .footer-inner { grid-template-columns: repeat(2, 1fr); }
   }
 </style>
