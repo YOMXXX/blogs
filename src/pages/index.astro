@@ -53,6 +53,14 @@ const columnPostsMap = Object.fromEntries(
       Deep technical writing on LLMs, Agents, RAG, and the systems beneath. New essay every Tuesday.
     </p>
 
+    <a class="banner" href="/newsletter">
+      <span class="banner-tag">NEW</span>
+      <span class="banner-text">
+        <strong>Frontier Brief</strong> — weekly AI infrastructure newsletter. Subscribe free
+      </span>
+      <span class="banner-arrow">→</span>
+    </a>
+
     {
       featured && (
         <Hero
@@ -111,6 +119,42 @@ const columnPostsMap = Object.fromEntries(
     font-size: 13px;
     color: var(--color-text-muted);
     line-height: 1.6;
+    margin: 0 0 16px;
+  }
+  .banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
     margin: 0 0 24px;
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--color-accent-green) 5%, transparent);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-secondary);
+    text-decoration: none;
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  .banner:hover {
+    border-color: var(--color-accent-green);
+    transform: translateY(-1px);
+  }
+  .banner-tag {
+    display: inline-block;
+    background: var(--color-accent-green);
+    color: var(--color-bg-primary);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+  }
+  .banner-text { flex: 1; }
+  .banner-text strong { color: var(--color-text-primary); font-weight: 700; }
+  .banner-arrow { color: var(--color-accent-green); font-weight: 700; }
+  @media (max-width: 480px) {
+    .banner { font-size: 11px; }
+    .banner-text strong { display: block; }
   }
 </style>

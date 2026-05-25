@@ -2,9 +2,14 @@
 ---
 
 <section class="newsletter">
-  <h4>// subscribe to yomxxx weekly</h4>
-  <p>1 deep essay + 1 weekly digest, every Tuesday. No spam, ever.</p>
-  <form class="form" novalidate aria-disabled="true">
+  <h4>// subscribe to Frontier Brief</h4>
+  <p>1 signal per week. AI infrastructure, agents, RAG — distilled. No spam, ever.</p>
+  <form
+    class="form"
+    action="https://yomxxx.substack.com/subscribe"
+    method="POST"
+    target="_blank"
+  >
     <input
       class="input"
       type="email"
@@ -12,11 +17,14 @@
       autocomplete="email"
       placeholder="your@email.com"
       aria-label="Email address"
-      disabled
+      required
     />
-    <button class="btn" type="button" disabled>COMING SOON</button>
+    <button class="btn" type="submit">SUBSCRIBE →</button>
   </form>
-  <p class="note">// subscriptions open soon</p>
+  <p class="note">
+    Powered by <a href="https://yomxxx.substack.com" target="_blank" rel="noopener noreferrer">Substack</a>
+    · See <a href="/newsletter">all tiers</a>
+  </p>
 </section>
 
 <style>
@@ -80,4 +88,9 @@
     color: var(--color-text-faint);
     margin: 12px 0 0;
   }
+  .note a {
+    color: var(--color-text-secondary);
+    text-decoration: none;
+  }
+  .note a:hover { color: var(--color-accent-green); }
 </style>
