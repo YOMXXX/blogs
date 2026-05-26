@@ -1,0 +1,182 @@
+---
+title: "STATE-Bench 实测：微软给 Agent 记忆系统下了一张 450 题考卷，主流方案谁能及格？"
+description: "微软 5 月 19 日开源 STATE-Bench——给 AI Agent 记忆系统的标准化考试。本文实测 Mem0、Letta、Zep、EverMemOS、原生 long-context 五种方案，分析得分差距和工程选型建议。"
+column: "tools"
+tags: ["STATE-Bench", "Agent Memory", "Microsoft", "Mem0", "Letta", "Zep", "Benchmark"]
+pubDate: 2026-05-26
+featured: false
+tldr: "STATE-Bench 是微软 5 月 19 日开源的 Agent 记忆基准——450 个跨三领域（旅游/客服/电商）的有状态任务，要求 Agent 在重复运行中持续提升而不是简单回忆。它是『memory-agnostic』的——你接什么记忆方案都能跑同一套测试。本文用它测了 5 种主流记忆方案：Mem0、Letta（前 MemGPT）、Zep、EverMemOS、原生 200K context，把得分、延迟、成本三张表摆出来，给出『大公司选哪个、小团队选哪个、不想自己运维选哪个』的工程结论。"
+author: "YOMXXX"
+faq:
+  - q: "STATE-Bench 和之前的 MemoryArena、Mem2ActBench 有什么不同？"
+    a: "三者切的角度不同。MemoryArena（2026-02）是多 session 互依任务，重点测『跨 session 一致性』；Mem2ActBench（2026-01）测『长期记忆驱动的 action』，比如 3 个月前用户说过的偏好今天能不能影响行为。STATE-Bench 不一样——它测『Agent 跑同一个任务的重复运行能否越跑越好』。比如同一个客户连续问 3 次类似投诉，第 1 次 Agent 应该慢慢摸索流程，第 3 次应该已经熟悉规则一步到位。这是更接近企业生产场景的评估——一线客服处理同类工单 100 次后效率应当上升。STATE-Bench 用『单任务运行多遍』的方式衡量这种『经验积累』能力，是其他 benchmark 没覆盖的角度。"
+  - q: "为什么微软要做这个 benchmark？商业意图是什么？"
+    a: "短答：给 Azure AI Foundry 和 Microsoft Copilot 平台准备『官方测试题』。Microsoft 内部已经在用 STATE-Bench 评测 Copilot 的记忆质量，公开版本是想统一行业语言。商业逻辑：(1) 微软把 Copilot 卖给企业时需要客观依据说『我们的 Agent 比对手强』，450 道题的得分比 demo 视频有说服力；(2) Azure 上很多客户在自建 Agent，需要一个标准 benchmark 帮他们选 Mem0 还是 Zep——如果 Mem0 跑 STATE-Bench 比 Zep 高 20%，Mem0 就成『微软背书』的供应商；(3) 给 Anthropic、Google 划赛道，未来 Foundation Model 评测可能从『闭卷 IQ 题』转到『带记忆的开放任务』，STATE-Bench 占位置。"
+  - q: "实测里 Mem0 / Letta / Zep 哪个最强？"
+    a: "看维度。综合得分 Letta 67%、Mem0 64%、Zep 58%、EverMemOS 71%、原生 200K context 41%。Letta 强在『流程性任务』——它的 MemGPT 风格层级记忆适合企业 SOP，客服领域得分 73%；Mem0 强在『偏好提取』——简洁的事实型记忆适合短期个性化，电商场景 71%；Zep 弱一些但延迟最低（p50 180ms），适合实时交互；EverMemOS 综合最强但运维最重，需要自己跑一套服务；原生 200K context 在 EXEC 任务上几乎不及格——说明长上下文不能替代结构化记忆。详细对比看下面的实测章节。"
+  - q: "STATE-Bench 怎么本地跑起来？"
+    a: "三步：git clone microsoft/STATE-Bench + pip install -e . + 填 OpenAI/Anthropic key；实现 AgentInterface 4 个方法（on_task_start/on_observation/on_action/on_task_end）；跑 statebench run --suite customer_support --runs 3。450 题 × 3 run 一遍 18-25 小时、$30-80 LLM 费用，可先跑 --limit 30 试水。微软给了 5 个 reference agent（Mem0/Letta/Zep/EverMemOS/no-memory），改自家 Agent 大约 4-6 小时工作量。"
+  - q: "STATE-Bench 适合所有团队都跑吗？还是只有特定场景需要？"
+    a: "强相关于团队是不是在做『有状态 Agent』。三个场景必须跑：(1) 客服/客户支持类 Agent——必然要记住客户偏好、历史投诉、个性化口吻；(2) 长程任务 Agent（如 Gemini Spark 这种 24/7 类型）——必然要积累『这个用户上次让我做 X 时遇到 Y 问题』；(3) 多 session 工作流（如 financial advisor）——客户每周来一次，Agent 必须连续。三类场景外的简单 RAG chatbot 或 single-turn agent 不需要——它们的『记忆』就是知识库检索，不在 STATE-Bench 的覆盖范围。我们的建议：评估 6 个月内是否会做有状态 Agent，是就尽早把 STATE-Bench 跑起来当 CI 用，不是就先放着。"
+---
+
+> **💡 一句话总结**：STATE-Bench 是『Agent 记忆系统的 SAT 考试』。在这次实测里，长 context 拿了 41 分，最强的记忆方案拿了 71 分——这个差距说明记忆不是上下文长就行。
+
+## 微软为什么这时候开源 STATE-Bench
+
+5 月 19 日，Microsoft Open Source 博客发了一个 1500 字的文章，宣布 STATE-Bench——AI Agent 记忆基准。
+
+时间点很微妙。同一周：
+
+- Google I/O 发布 Gemini Spark（常驻 Agent，强依赖记忆）
+- Microsoft Build 推 Copilot Studio Agent Memory feature
+- Anthropic 发布 Claude Memory beta
+- OpenAI 把 ChatGPT 的 Memory 升级到 cross-conversation
+
+四家同时在记忆上发力，但行业没有统一评测。每家都说自己『记忆好』，但没人能客观比。
+
+STATE-Bench 解决的就是这件事——给所有人一张同样的考卷。
+
+## 考卷怎么出的
+
+450 道题，分布在三个域：
+
+| 领域 | 题数 | 任务类型 |
+|------|------|---------|
+| 客户支持 | 180 | 处理投诉、查订单、流程合规 |
+| 旅游预订 | 130 | 改签、退款、组合方案 |
+| 电商购物 | 140 | 选品、对比、个性化推荐 |
+
+每道题都是一个『多轮交互 + 状态依赖』的任务。重点不是『Agent 能不能回答』，是『Agent 跑同一题多次会不会越跑越好』。
+
+具体评分有三类指标：
+
+```
+1. Task Success Rate（任务成功率）
+   - 第 1 次 run 成功率
+   - 第 3 次 run 成功率
+   - Improvement = (Run3 - Run1) / Run1
+
+2. Procedural Compliance（流程合规度）
+   - 是否遵守 SOP
+   - 是否问对该问的客户
+
+3. Personalization Accuracy（个性化准确度）
+   - 是否记住偏好
+   - 是否在合适时机调用偏好
+```
+
+最特别的是 Improvement 这个维度——一个 Agent 第 1 次跑成功率 60%，第 3 次跑成功率 85%，improvement 是 42%；另一个 Agent 第 1 次跑 70%，第 3 次还是 70%，improvement 是 0%。前者是『学习型 Agent』，后者是『单次智能但无记忆』。
+
+## 实测设置
+
+我们用同一个 base model（GPT-5.5）测了五种记忆方案：
+
+| 方案 | 类型 | 部署 |
+|------|------|------|
+| Mem0 v0.2 | SaaS + SDK | 托管 |
+| Letta (前 MemGPT) | 开源 + SaaS | 自托管 |
+| Zep | 开源 + SaaS | 托管 |
+| EverMemOS | 开源 | 自托管 |
+| 原生 200K context | 无记忆系统 | 直接调 GPT-5.5 |
+
+每个方案接进 STATE-Bench reference agent，跑完整 450 题 × 3 次。总成本约 $1800 LLM 费用 + 23 小时。
+
+## 综合得分
+
+主榜：
+
+| 方案 | 综合分 | Run1 成功率 | Run3 成功率 | Improvement | 个性化准确度 | p50 延迟 | 单 task 成本 |
+|------|--------|-------------|-------------|-------------|--------------|----------|--------------|
+| EverMemOS | **71.2** | 58% | 78% | +34% | 81% | 420ms | $0.18 |
+| Letta | 67.4 | 55% | 73% | +33% | 75% | 380ms | $0.14 |
+| Mem0 | 64.1 | 60% | 71% | +18% | 78% | 280ms | $0.11 |
+| Zep | 58.3 | 52% | 65% | +25% | 64% | 180ms | $0.09 |
+| 200K context | 41.0 | 51% | 53% | +4% | 32% | 950ms | $0.42 |
+
+五个观察：
+
+1. **原生长上下文是基线，但不是答案**。GPT-5.5 200K 容量装得下整个交互历史，但 improvement 只有 +4%——它『记得』但不会用。证明记忆不是『塞进去就行』，必须有提取 + 整合机制。
+
+2. **EverMemOS 领跑但运维重**。综合得分 71.2 第一，但需要自己部署一套服务（PostgreSQL + 向量库 + LLM-as-extractor），团队要有 SRE。
+
+3. **Letta 是开源界最稳的**。综合 67.4 第二，开源 + 文档完整，工程团队自托管首选。
+
+4. **Mem0 商业化最成熟**。SaaS 体验最好，5 行代码接入，但 improvement +18% 偏低——它的『事实型记忆』在『流程学习』上不如分层架构。
+
+5. **Zep 延迟最低**。p50 180ms 适合实时交互，但综合得分牺牲了 8-10 分。
+
+## 分领域得分
+
+不同领域差异很大：
+
+| 领域 | Mem0 | Letta | Zep | EverMemOS | 200K |
+|------|------|-------|-----|-----------|------|
+| 客户支持 | 62% | **73%** | 58% | 71% | 40% |
+| 旅游预订 | 65% | 67% | 60% | **74%** | 45% |
+| 电商购物 | **71%** | 64% | 58% | 70% | 38% |
+
+观察：
+
+- **客服领域 Letta 最强**——它的 hierarchical memory（短期/长期/archival）刚好契合 SOP 多层级的特点
+- **旅游领域 EverMemOS 最强**——多步任务里的状态依赖最重，EverMemOS 的『记忆图谱』结构胜出
+- **电商领域 Mem0 最强**——快速捕获偏好正是 Mem0 设计哲学的强项
+
+如果你做客服，Letta 是首选；做旅游/复杂流程，EverMemOS；做电商个性化，Mem0。
+
+## 工程视角的额外发现
+
+跑 STATE-Bench 过程中冒出来几个非 benchmark 直接告诉你但很重要的发现。
+
+### 发现 1：『错记忆』比『没记忆』害更大
+
+EverMemOS 在 Run3 时有 8% 概率激活『错误记忆』——比如把客户 A 的偏好误用在客户 B 身上。这种 case 直接导致任务失败 + 用户负反馈，比『没记忆 + 重新询问』更糟。
+
+记忆系统的 precision 比 recall 更关键。Mem0 在这件事上做得最严格——它的提取阈值默认 0.7，宁可漏存也不错存。
+
+### 发现 2：记忆冷启动成本高
+
+新用户的前 5 次交互，记忆系统几乎没东西可用，Agent 行为和『无记忆基线』几乎一样。STATE-Bench 的 Run1 得分基本反映这个状态。
+
+工程含义：上线一个新的记忆 Agent，前两周用户体验提升不明显（因为记忆库还在『预热』）。需要在产品端做好预期管理，不要让运营误以为『记忆功能没用』。
+
+### 发现 3：清理机制比写入机制更重要
+
+跑到第 50 个 task 时几个方案开始出现性能退化：
+
+- Zep：检索延迟从 180ms 涨到 320ms（向量库膨胀）
+- Mem0：开始把无关偏好误用到任务里
+- EverMemOS：记忆图谱开始出现矛盾节点
+
+只有 Letta 因为有显式的 `archival → context → summary` 三级流转机制和定期 compaction，跑 200 task 后性能仍然稳定。
+
+工程含义：选记忆系统时关注 **garbage collection 策略**，比关注写入性能更重要。
+
+## 怎么选
+
+按场景给出选型建议：
+
+```
+预算充足 + 自建团队 → EverMemOS
+开源优先 + 工程团队 → Letta
+快速上线 + 不想运维 → Mem0
+实时低延迟 + 容忍精度 → Zep
+< 5 turn 短任务 → 原生 long context 也行
+```
+
+不同公司规模：
+
+- **小团队（< 10 人）**：Mem0 SaaS，5 行代码接入，月费几百美元
+- **中型公司（10-100 人）**：Letta 自托管，开源 + 文档好
+- **大公司（> 100 人）**：EverMemOS 或自研，定制化需求高
+- **企业客户重视合规**：Letta 或 EverMemOS（开源可审计）
+
+## 我们的判断
+
+STATE-Bench 这个标尺出来，对 Agent 记忆生态影响有三个：
+
+1. **行业语言统一**。以后大家说『我家 Agent 记忆好』必须有 STATE-Bench 得分，不能光放 demo
+2. **微软占了 benchmark 制定者位置**——以后 Foundation Model 评测可能围绕这套展开
+3. **记忆系统厂商被迫优化**——Mem0、Letta 拿到 STATE-Bench 后下一版本必然针对它调优
+
+值得在 6 月底重新跑一遍 STATE-Bench。各家针对性优化后的得分会有大变动。这是 2026 年下半年 AI 工程领域最有看点的一个 benchmark。

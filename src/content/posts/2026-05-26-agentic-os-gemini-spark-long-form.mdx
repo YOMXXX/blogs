@@ -1,0 +1,236 @@
+---
+title: "Agentic OS 时代来了：Gemini Spark 把 Agent 从『工具』推向『常驻服务』的范式转变"
+description: "Gemini Spark 是 Google I/O 2026 最重要的一张牌。本文从架构、隔离模型、用户面、安全护栏四个维度拆解它的设计选择，并对比 ChatGPT Agent、Claude Cowork 的路线分歧。"
+column: "long-form"
+tags: ["Gemini Spark", "Agentic OS", "Google I/O 2026", "AI Agent", "Architecture", "Long Running Agent"]
+pubDate: 2026-05-26
+featured: false
+tldr: "Google I/O 2026 把 Gemini Spark 摆在 keynote 中央——24/7 云端常驻、设备关机时仍在工作的 Agent。这不是又一个 chatbot，是 Google 在押注 Agent 不应是随用随启的工具、而是像电邮一样的常驻服务。本文从架构（Antigravity + Gemini 3.5 + 隔离 VM）、用户面、安全护栏拆解 Spark，对比 ChatGPT Agent / Claude Cowork 路线差异，给出 Agentic OS 三层模型的判断框架。"
+author: "YOMXXX"
+faq:
+  - q: "Gemini Spark 和 ChatGPT Agent、Claude Cowork 的本质区别是什么？"
+    a: "三个产品代表三种 Agent 落地哲学。ChatGPT Agent 是『session-based』——用户开一个对话、Agent 在浏览器沙箱里跑一段、完成后关掉，模型是『随启随用』的工具。Claude Cowork 是『desktop assistant』——常驻在桌面但只在用户在线时工作，强调安全边界（什么文件能读、什么 API 能调）。Gemini Spark 是『cloud daemon』——在 Google Cloud 一个 ephemeral VM 里跑，设备关机它还在干活，强调『代你执行长任务』。三个路线对应不同假设：OpenAI 假设 Agent 是工具、Anthropic 假设 Agent 是助手、Google 假设 Agent 是服务。Google 这条路最激进，对 trust 和安全要求也最高。"
+  - q: "为什么 Google 选 Antigravity 作为 Spark 的底座？"
+    a: "Antigravity 是 Google 11 月发布的 Agent 编程框架，2.0 在 5 月更新加了 long-running 任务支持和细粒度权限模型。Spark 直接用 Antigravity 当 runtime 有几个原因：(1) Antigravity 的 Browser/IDE/Terminal 三窗口模型适合 Agent 操作多种工具；(2) 它的 Subagent 机制让 Spark 能拆分长任务给子 Agent 并行做；(3) 它已经有完整的『approval gate』和『rollback』机制，给安全性兜底；(4) Google 内部已经用 Antigravity 跑了 6 个月，证明 24/7 运行稳定。这是『内部工具 → 对外产品』的典型路径，Spark 不是从零搭，是把 Antigravity 这台引擎装上消费级外壳。"
+  - q: "ephemeral VM + 长程任务怎么协调？任务跑一半 VM 销毁了怎么办？"
+    a: "Spark 的执行模型是『任务级 VM』而不是『session 级 VM』——每个具体任务（如『订机票』『整理周报』）分配一个独立 VM，任务完成立刻销毁。长程任务通过 Spark 的『任务调度器』拆成多个 step，每个 step 在新 VM 里跑、step 之间状态写入持久化存储（Google 自己的 Spanner）。VM 寿命短意味着即使一个 VM 被攻破也只影响一个 step，且攻击者拿不到长期凭证（VM 里的 token 也是 scoped + short-lived）。这是 Google Cloud 老本行——Spark 本质是『把多年的容器/VM 管理经验用在 Agent 上』。代价是 step 切换有 2-5 秒开销，单个任务跑得比单 VM 慢，但安全和隔离性显著提升。"
+  - q: "Spark 的 proactive notification 怎么不变成骚扰？"
+    a: "这是 Google 在 I/O 2026 主动回应的设计点。三条规则：(1) Spark 默认只在『任务有明确进展或需要决策时』发通知，不发『还在跑』『又前进了一步』这种状态更新；(2) 高风险动作（发邮件、付款、删文件）必须用户显式 approve，不能 Spark 自作主张；(3) 用户可以设『静音时间』和『通知优先级』，把『订机票成功』和『日历冲突警告』分别归入不同重要级别。Google 在 demo 里特意展示了 Spark 一周跑 200+ 任务、但只发了 7 条通知，因为绝大多数任务跑通后无需用户介入。这条产品哲学背后是『信任经济』——Agent 必须证明它不会让你的注意力贬值，用户才愿意让它常驻。"
+  - q: "Agentic OS 真的会成为下一个 OS 形态吗？还是只是大厂叙事？"
+    a: "短期看是大厂叙事（Spark 必然锁 Gmail/Drive 生态、Claude 锁 Claude 生态），长期看有真趋势：Agent 长程化（分钟到天）、设备解耦（关机任务仍跑）、proactive 化（主动通知而非被动等指令）这三件事必然推动『常驻 Agent 服务层』出现，不管叫不叫 Agentic OS。值得跟踪三个信号：Spark/ChatGPT Agent 的日活留存、跨厂 Agent 互操作协议（类似 SMTP 之于邮件）、iOS/Android 是否原生加入 Agent 系统服务。任一发生，Agentic OS 就坐实。"
+---
+
+> **💡 一句话总结**：Gemini Spark 不是又一个 ChatGPT 替代品，而是 Google 在押注『未来 5 年最重要的软件形态是常驻 Agent 服务』。这条赌注成立的前提是用户愿意为『一个永远在背景里替你工作的 AI』付费。
+
+## 5 月 19 日，Sundar Pichai 在 I/O 上的那句话
+
+> "Welcome to the agentic Gemini era."
+
+不是营销话术。Pichai 整场 keynote 用了 47 分钟讲一件事——**Gemini 不再只是模型，而是一个常驻 Agent 服务**。
+
+他演示 Spark 的场景非常具体：
+
+- 用户跟 Spark 说『下周一去东京出差，帮我安排』
+- 关上笔记本，去开了一个小时的会
+- 回来打开手机看通知：Spark 已经查了 12 个航班、5 个酒店、问了 3 个问题需要决策
+- 在通勤路上批准了选择，到家打开邮箱看到行程已发到 Calendar、签证检查表、关键会议联系人
+
+整个过程中**用户的 Mac/手机有 80% 时间是关闭状态**——Spark 跑在 Google Cloud 的一个隔离 VM 里。
+
+这件事不可能由 ChatGPT Agent 或 Claude 完成，因为它们的设计假设是『用户在线 + 一次性 session』。Spark 测试的是新假设——**Agent 是常驻服务，不是工具**。
+
+## 三个产品三种哲学
+
+理解 Spark 必须先把 5 月之前的 Agent 产品归类：
+
+### 路线一：Session-based Agent（ChatGPT Agent）
+
+- 用户打开 ChatGPT，进入『Agent mode』
+- Agent 在 OpenAI 的浏览器沙箱里跑一段任务
+- 用户看到 stream output，任务完成关闭 session
+- 关掉后所有上下文蒸发，下次再来全新开始
+
+代表产品：ChatGPT Agent (DeepResearch 进化版)、Perplexity Spaces
+
+适合场景：研究、一次性查询、内容生成
+
+### 路线二：Desktop Assistant Agent（Claude Cowork）
+
+- Agent 常驻桌面应用
+- 可以读本地文件、调本地工具
+- 任务在用户机器上跑（计算 + 存储都本地）
+- 关机 = Agent 暂停
+
+代表产品：Claude Cowork、Anthropic Mythos（推迟发布）
+
+适合场景：编程、文档处理、个人助理
+
+### 路线三：Cloud Daemon Agent（Gemini Spark）
+
+- Agent 跑在云端，与设备解耦
+- 用户 sleep / offline 时 Agent 仍工作
+- 任务进度 sync 到所有设备
+- 高风险动作向用户 push approval
+
+代表产品：Gemini Spark（仅此一家敢做到全云端 + 永远在线）
+
+适合场景：长程任务、跨工具流程、proactive 监控
+
+三种路线的取舍如表：
+
+| 维度 | Session | Desktop | Cloud Daemon |
+|------|---------|---------|--------------|
+| 用户在线要求 | 必须 | 必须 | 不需要 |
+| 任务时长 | 分钟级 | 小时级 | 天级 |
+| 数据隔离 | 厂商沙箱 | 本地机器 | 厂商 VM |
+| 隐私模型 | 中 | 高 | 低（数据上云） |
+| 工程难度 | 低 | 中 | 高 |
+| 商业模式 | 按 task 收费 | 订阅 | 订阅 + 计算 |
+
+## Spark 的架构剖析
+
+I/O keynote 加 Google Cloud blog 透露的细节，可以拼出 Spark 的架构图：
+
+```
+┌──────────────────────────────────────────────┐
+│           用户层 (iOS / Android / Web)        │
+│  - 任务接收、通知 push、approval UI          │
+└──────────────────────────────────────────────┘
+                    │
+                    ▼ gRPC over QUIC
+┌──────────────────────────────────────────────┐
+│            Spark Orchestrator                │
+│  - 任务接入、调度、状态管理 (Spanner)         │
+│  - 用户偏好学习                              │
+│  - 通知路由                                  │
+└──────────────────────────────────────────────┘
+                    │
+        ┌───────────┼───────────┐
+        ▼           ▼           ▼
+┌──────────┐ ┌──────────┐ ┌──────────┐
+│ Task VM 1│ │ Task VM 2│ │ Task VM 3│  ephemeral
+│Antigravity│ │Antigravity│ │Antigravity│  per-task
+│Gemini 3.5│ │Gemini 3.5│ │Gemini 3.5│  isolated
+└──────────┘ └──────────┘ └──────────┘
+        │           │           │
+        ▼           ▼           ▼
+   Gmail/Drive   3rd-party     Tools
+   (OAuth)      Web access     Native
+```
+
+四个关键设计：
+
+### 1. 任务级 VM，不是 session 级
+
+每个具体任务（『订机票』『写周报』）分配独立 VM。VM 在任务完成后销毁。step 之间通过 Orchestrator 持久化状态。
+
+这是反直觉的设计——大多数 Agent 系统会让一个 session 复用一个 VM 来减少冷启动开销。Spark 选了相反方向，因为：
+
+- **故障隔离**：一个任务被 prompt injection 攻陷不影响其他任务
+- **资源弹性**：根据任务负载动态分配
+- **审计清晰**：每个任务一条独立的 VM trace
+
+代价是 step 切换开销，但 Google 算过这笔账：单 task VM 损失 2-5 秒延迟，换来安全性提升和水平扩展能力，划算。
+
+### 2. Antigravity 当 runtime
+
+Antigravity 是 Google 在 11 月推出的 Agent 编程框架（2026-05 更新到 2.0），原本是给开发者构建 Agent 应用用的。Spark 把 Antigravity 作为内部 runtime——Spark 用户看不到 Antigravity，但每个任务底层用的就是它的 Browser/IDE/Terminal 三窗口模型。
+
+这是 Google 经典的『dogfood』策略：内部用 Antigravity 跑了 6 个月，证明稳定后包装成 Spark。和 Kubernetes 当年从 Borg 演化出来的路径一样。
+
+### 3. Gemini 3.5 base + agentic harness
+
+Spark 的核心推理模型是 Gemini 3.5（不是 Pro，是介于 Flash 和 Pro 之间的中型模型），外面套一层 agentic harness——负责工具调用、规划、状态管理。
+
+为什么不用更强的 Pro？因为长程任务的瓶颈不是单次推理质量，而是『tool use 准确性 + 状态管理』。Gemini 3.5 + 强 harness > Gemini 3.5 Pro + 弱 harness。这和 Anthropic 的 Claude Code 选择 Sonnet 而不是 Opus 是同一个思路。
+
+### 4. 信任 / 安全护栏
+
+四层护栏：
+
+1. **OAuth scope 限制**：Spark 接 Gmail/Drive 时申请最小 scope，比如只读邮件而不能删邮件
+2. **Approval gate**：发邮件、付款、删文件、修改 Calendar 重大事项前向用户 push 通知，必须 approve 才执行
+3. **Action audit log**：每个任务每个 action 记录到用户可访问的日志
+4. **Ephemeral credentials**：VM 拿到的 token 是 scoped + short-lived，VM 销毁 token 也作废
+
+这套护栏在 I/O demo 里特意强调，因为 Spark 的『常驻 + 自主』属性让用户最担心的就是『它会不会替我做我没批准的事』。
+
+## proactive 通知怎么不变骚扰
+
+Spark 设计组花了大量篇幅讲『通知设计』。这件事看起来软，其实是 Spark 能不能存活的关键。
+
+Demo 里展示的一个细节：
+
+> Spark 一周跑了 213 个任务，发了 7 条通知。
+
+7 条里：
+
+- 2 条是『任务完成，结果在邮件』（重要决策类）
+- 3 条是『需要决策才能继续』（订机票最后一步）
+- 1 条是『新发现的日历冲突』（高优先级）
+- 1 条是『任务失败，已尝试 3 次』（异常）
+
+剩下的 206 个任务全部静默完成。这个比例（7/213 ≈ 3%）是经过 A/B 测试调出来的——再低用户会怀疑 Spark 没在干活，再高变成骚扰。
+
+通知模型：
+
+```
+priority = task_importance * decision_urgency / silence_penalty
+notify_if priority > user_threshold AND not in_quiet_hours
+```
+
+用户可以为不同任务类别（出差/财务/工作/家庭）设不同 threshold。这是 Spark 跟 ChatGPT Agent 的明显差异——后者基本不主动通知，因为它没有『常驻』属性，也就没有通知需求。
+
+## Agentic OS 三层模型
+
+把 Spark、Claude Cowork、ChatGPT Agent、Anthropic Mythos 放在一起，能看出一个浮现中的『Agentic OS 三层模型』：
+
+```
+┌─────────────────────────────────────────┐
+│  L3: Agentic Service Layer (常驻服务)    │ ← Gemini Spark 在这里
+│  - 24/7 运行                            │
+│  - 跨设备同步                           │
+│  - proactive notification               │
+├─────────────────────────────────────────┤
+│  L2: Agentic Assistant Layer (会话助手)  │ ← Claude Cowork, ChatGPT Agent
+│  - 用户在线时活跃                       │
+│  - 任务粒度                             │
+│  - reactive only                        │
+├─────────────────────────────────────────┤
+│  L1: Agent Runtime Layer (基础设施)      │ ← Antigravity, LangGraph, Mistral Workflows
+│  - 工具调用                             │
+│  - 状态管理                             │
+│  - 编排                                 │
+└─────────────────────────────────────────┘
+```
+
+L1 是基础设施，开发者 visible；L2 是消费级会话产品，用户 visible；L3 是常驻服务，更像水电煤——你不太『使用』它，它就在那里运行。
+
+Spark 是第一个公开发力 L3 的产品。Anthropic 的 Mythos 推迟（公开理由是『安全顾虑』，但很多业内推测是技术上还没把 24/7 模式做到位）。OpenAI 暂时没有 L3 路线产品，ChatGPT Agent 还在 L2。
+
+谁能率先把 L3 跑通，可能拿到下一代 OS 的入口。这就是 Google 在 Spark 上 all-in 的根本逻辑。
+
+## 路线分歧背后的判断差异
+
+为什么 Anthropic 和 OpenAI 不跟进 L3？
+
+Anthropic 的判断：**Agent 的安全边界还没磨好，让 Agent 24/7 自主跑风险大于收益**。Dario Amodei 在 5 月初的访谈里明确说过『我们不会发布我们自己都不会用的 Agent』。Mythos 推迟就是这个判断的体现。
+
+OpenAI 的判断：**Agent 应该跟着用户的注意力走，离开用户就停**。Sam Altman 在播客里说『用户应该控制 Agent 什么时候在工作』。这是 L2 的哲学。
+
+Google 的判断：**消费级 AI 的下一波增长在『代你做事』，session-based 模型不够远**。Pichai 在 I/O 把 Spark 摆中央是赌这个。
+
+三家判断都有道理。一年后能验证：
+
+- 如果 L3 跑通，Spark 是下一代 OS 的雏形，Google 拿入口
+- 如果 L3 跑不通（信任崩塌、误操作频发），Anthropic 是对的，L2 才是合理终态
+- 如果 L3 跑得部分通，OpenAI 可能凭借生态最快补位
+
+值得在这个时间点开始观察的几个信号——
+
+1. Spark 的 DAU/留存数据（Google 公开还是内部数据泄露）
+2. Spark 的『误操作』率（多少用户撤回过 Spark 的 action）
+3. 是否出现 Spark-Claude 之类的『跨厂 Agent 协议』
+4. iOS/Android 是否引入原生 Agent 系统服务
+
+这场赌局还在开局阶段。但选择已经下了，Google 的注比谁都大。

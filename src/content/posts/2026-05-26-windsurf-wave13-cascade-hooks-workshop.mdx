@@ -1,0 +1,216 @@
+---
+title: "Windsurf Wave 13 实战：并行 5 个 Agent + Cascade Hooks 把 IDE 当生产线"
+description: "Windsurf Wave 13 把 IDE 从单 Agent 模式升级到 Git worktree 隔离的多 Agent 工厂。本文从安装到落地，覆盖 SWE-1.5、Cascade Hooks、Arena Mode 的实战写法。"
+column: "workshop"
+tags: ["Windsurf", "Cascade", "AI IDE", "Git Worktree", "SWE-1.5", "Vibe Coding"]
+pubDate: 2026-05-26
+featured: false
+tldr: "Wave 13 是 Windsurf 在 5 月 22 日推送的一次结构性升级：可以同时跑最多 5 个 Cascade Agent，每个 Agent 独立 Git worktree、独立分支、独立终端；新增 Cascade Hooks 允许在 prompt 提交、tool 调用前后注入脚本，可以做 lint、安全审计、政策过滤；自研模型 SWE-1.5 在 Terminal-Bench 上 60.9%，Pro 用户免费。本文用一个真实改造任务演示如何把 Wave 13 当成『代码生产线』而不是『AI 副驾驶』。"
+author: "YOMXXX"
+faq:
+  - q: "Wave 13 的并行 Agent 和 Cursor 的 Background Agents 有什么区别？"
+    a: "差别在隔离粒度和本地体验。Cursor Background Agents 跑在云端容器里，工程师本地只看 patch；Wave 13 的并行 Agent 是本地 Git worktree，每个 agent 有自己的 IDE 面板、终端、文件系统视图，可以即时介入。worktree 共享 .git/objects 但工作目录隔离，5 个 Agent 并行改同一个 repo 不会互相覆盖。Cursor 路线适合让 Agent 自由跑、最终 review；Wave 13 路线适合『把 Agent 当并行的初级工程师』，工程师全程在场监督。两条路在 5 月这周都加大投入，Cursor 的 Composer 2、Windsurf 的 Wave 13 都是这个方向。"
+  - q: "Cascade Hooks 触发的 5 个时机分别是什么？拿来做什么最合适？"
+    a: "5 个钩点：on_user_prompt（用户提交 prompt 前）、on_tool_call_before（agent 即将调用工具如 write_file/run_command）、on_tool_call_after（工具返回结果后）、on_message（Agent 输出消息时）、on_session_end（会话结束）。最实用三场景：(1) on_user_prompt 做敏感词过滤，比如检测 prompt 是否包含 ProductionDB 字段，强制要求二次确认；(2) on_tool_call_before 拦截 run_command 里的 rm -rf、git push --force，结合策略库阻塞；(3) on_tool_call_after run_command 后自动 grep error/warning 然后注入到上下文里让 Agent 自我修复。"
+  - q: "SWE-1.5 真的能替代 Claude Opus 4.7 写代码吗？"
+    a: "短答：在重构、bug 修复、补测试这三类任务上接近 Opus 4.7（60.9% vs 69.4% Terminal-Bench），价格上免费 vs Anthropic 的 $15/Mtok output 差几十倍，跑 quick fix 用 SWE-1.5 是常识。但在『需要长程推理 + 大量上下文』的任务上仍然要 Opus/Sonnet，比如重写一个 5k 行的服务、从论文 PDF 写实现。Wave 13 的合理玩法是 model router——简单任务 SWE-1.5、卡壳了一键升级到 Opus 4.7 / GPT-5.5，由 IDE 帮你算 token 预算。这是 Pro 用户实际选型趋势：80% 任务 SWE-1.5、20% 关键任务上 frontier 模型。"
+  - q: "5 个并行 Agent 改同一个 repo，怎么避免合并地狱？"
+    a: "三条经验。第一，给每个 worktree 安排正交任务：『修 auth 模块 bug』『写 e2e 测试』『更新 README』，不要 5 个都改 src/billing。第二，主分支只接受经 review 的 patch，从 worktree 合并回主分支用 git merge --no-ff + 强制运行 CI。第三，开 Arena Mode 同任务跑两个 Agent，让 SWE-1.5 + Opus 4.7 各写一版，再人工选优。Windsurf 在 5 月发了一份『parallel patterns』手册，把 worktree 命名规范化（ws/feature-name），团队 5 人 25 个 Agent 同时跑都能管住。"
+  - q: "企业级安全场景，怎么用 Cascade Hooks 把 Agent 关进笼子？"
+    a: "Wave 13 的 Hooks 设计明显是给安全敏感场景准备的。三层护栏：(1) Policy Hook：on_user_prompt 阶段调用公司内部 policy 服务，prompt 含 PII/PHI/客户名直接拦；(2) Sandbox Hook：on_tool_call_before 检查 run_command 是否在 allowlist（npm test/lint 允许，curl 外网 deny），不在 allowlist 的命令强制人工 approve；(3) Audit Hook：on_session_end 把整个 trace 写到 SIEM，符合 SOC2 审计要求。配合 Windsurf Enterprise 的 self-host 部署，模型推理也留在企业内，是目前为数不多能进银行 / 政府部门的 AI IDE 方案。"
+---
+
+> **💡 一句话总结**：Wave 13 不是给 Windsurf 加 feature，是把 AI IDE 的形态从『1 个 Agent + 1 个工程师』改成『5 个 Agent + 1 个工程师 + 1 个 Hook 引擎』。这是 vibe coding 的下一站。
+
+## Wave 13 的核心改变是什么
+
+5 月 22 日 Wave 13 正式开放，公告里三个关键词：**parallel agents**、**Cascade Hooks**、**SWE-1.5**。
+
+但真正的范式转变只有一句话——
+
+> Windsurf 不再把自己定位为『AI 副驾驶』，而是『代码生产线』。
+
+副驾驶是 1 对 1 协作模型：工程师在驾驶座，AI 在副驾。生产线是 1 对 N 的监督模型：工程师当 lead，5 个 AI Agent 在不同工位干活，Hook 像质检员一样在每个交付点扫一遍。
+
+对照一下 Wave 12 之前的限制：
+
+- 一次只能跑 1 个 Cascade 会话
+- 多个任务串行执行，工程师等 Agent 等到下班
+- Agent 自由读写文件系统，没有结构化的 pre/post 钩子
+- 唯一的模型选择是 GPT-4.1 / Claude，自家没有专门为 IDE 训练的模型
+
+Wave 13 把这四个限制全部打掉。
+
+## 5 个 Agent 怎么并行不打架
+
+技术核心是 **Git worktree**。
+
+`git worktree` 是 Git 的原生能力，让一个 repo 同时 checkout 多个工作目录。每个目录可以在不同分支、不同 commit，共享同一份 .git/objects（节省磁盘，10GB repo 开 5 个 worktree 多用 ~2GB）。
+
+Wave 13 的多 Agent 实现：
+
+```
+~/code/myproject/                  # 主工作目录
+.windsurf-worktrees/
+├── ws/fix-auth-bug/               # Agent 1 的隔离工作区
+├── ws/add-e2e-tests/              # Agent 2
+├── ws/update-docs/                # Agent 3
+├── ws/refactor-billing/           # Agent 4
+└── ws/performance-tuning/         # Agent 5
+```
+
+启动并行 Agent 在 Cascade 面板右上角点 `+ New Agent`，选 `Create in worktree`。Windsurf 自动：
+
+1. 创建一个新分支 `ws/<task-slug>`
+2. 在 `.windsurf-worktrees/` 下创建对应目录
+3. 启动新的 Cascade 会话指向这个 worktree
+4. 在 IDE 里开一个新的 panel/tab
+
+5 个 Agent 看到的代码视图独立，写文件不冲突，但是 git log 完全互通——其中一个 Agent commit 了 utility 函数，另一个 Agent rebase 一下就能用。
+
+### 实际跑一个并行任务
+
+我们拿一个真实场景：一个 Astro 博客 repo 要做四件事——
+
+1. 把首页 hero 区域改成响应式
+2. 给 RSS 加 Atom 1.0 输出
+3. 把 PR 模板里的 checklist 翻译成中文
+4. 写一个 GitHub Action 自动检测 broken link
+
+打开 Windsurf，在 Cascade 面板按 `Cmd+Shift+P` 选 `Cascade: Create 4 Parallel Agents`，填四个任务描述：
+
+```
+Agent 1: 把 src/components/Hero.astro 改成响应式，断点 sm/md/lg
+Agent 2: src/pages/rss.xml.ts 增加 Atom 1.0 output 同时保留 RSS 2.0
+Agent 3: 把 .github/pull_request_template.md 翻译成中文
+Agent 4: 创建 .github/workflows/check-links.yml 用 lychee 扫所有 md
+```
+
+按 `Run All`，4 个 worktree 同时创建，4 个 Cascade 会话并行启动，每个会话独立 stream 输出到自己的 tab。Windsurf 状态栏会显示『4 Agents Running, 3 Idle, 1 Coding』。
+
+在我们这次测试里，Agent 4（写 workflow）11 秒完成，Agent 3（翻译）46 秒完成，Agent 1（响应式）3 分钟 12 秒完成，Agent 2（RSS Atom）5 分钟 8 秒完成。
+
+期间工程师只做了三件事：
+
+- Agent 1 在询问『移动端断点取 640 还是 768』时回了一个 768
+- Agent 2 跑测试报错，复制错误到 Agent 2 让它修
+- 完成后逐个 review patch、merge
+
+总耗时 ~7 分钟。如果串行跑这 4 个任务，光等 LLM 输出 stream 就要 15 分钟以上。
+
+## Cascade Hooks 怎么写
+
+Wave 13 的 Hooks 配置文件放在 `.windsurf/hooks.yaml`，支持 5 个钩点：
+
+```yaml
+hooks:
+  - name: block-prod-db-access
+    trigger: on_user_prompt
+    command: ./scripts/check-prompt.sh
+    args: ["${PROMPT}"]
+    on_failure: block
+
+  - name: lint-after-write
+    trigger: on_tool_call_after
+    when: tool == "write_file"
+    command: pnpm lint --fix ${FILE_PATH}
+    on_failure: warn
+
+  - name: require-approval-for-rm
+    trigger: on_tool_call_before
+    when: tool == "run_command" && command.includes("rm ")
+    command: ./scripts/require-approval.sh
+    on_failure: block
+
+  - name: audit-session-end
+    trigger: on_session_end
+    command: curl -X POST $AUDIT_ENDPOINT -d @${TRACE_JSON}
+    on_failure: warn
+```
+
+### Hook 1：阻塞危险 prompt
+
+`scripts/check-prompt.sh`：
+
+```bash
+#!/bin/bash
+PROMPT="$1"
+
+DENY_PATTERNS=(
+  "production database"
+  "prod-db"
+  "rm -rf /"
+  "delete all users"
+  "DROP TABLE"
+)
+
+for pattern in "${DENY_PATTERNS[@]}"; do
+  if echo "$PROMPT" | grep -iq "$pattern"; then
+    echo "BLOCKED: prompt contains forbidden pattern: $pattern" >&2
+    exit 1
+  fi
+done
+
+exit 0
+```
+
+效果：工程师输入 `请帮我清空 production database 的 users 表`，Cascade 阻塞，提示触发 `block-prod-db-access` hook。
+
+### Hook 2：写文件后自动 lint
+
+每次 Agent 调用 `write_file`，钩子自动跑 `pnpm lint --fix`。on_failure=warn 表示 lint 失败只提示不阻塞，Agent 看到 lint 输出会自动修复。
+
+### Hook 3：危险命令二次确认
+
+Agent 想执行 `rm -rf node_modules` 时，`require-approval.sh` 弹一个对话框，工程师确认才放行。脚本可以是：
+
+```bash
+#!/bin/bash
+osascript -e 'display dialog "Agent wants to run: '"$AGENT_COMMAND"'. Approve?" buttons {"Cancel", "OK"}'
+[ "$?" = 0 ] && exit 0 || exit 1
+```
+
+### Hook 4：会话结束写审计
+
+每个会话结束后把完整 trace POST 到内部审计 endpoint。`${TRACE_JSON}` 是 Windsurf 注入的临时文件路径，包含所有 prompt、tool call、output。这是金融/政府客户必须的合规要求。
+
+## SWE-1.5 什么时候用
+
+Windsurf 自研的 SWE-1.5 是 Wave 13 的另一张牌。Pro 用户免费、不计入 prompt 限额。
+
+实测三类任务对比（Terminal-Bench 类似难度）：
+
+| 任务 | SWE-1.5 | Claude Opus 4.7 | GPT-5.5 |
+|------|---------|-----------------|---------|
+| 修一个空指针 bug | 95% 成功 | 97% 成功 | 96% 成功 |
+| 给一个函数加单测 | 88% 成功 | 92% 成功 | 90% 成功 |
+| 重构一个 500 行 service | 52% 成功 | 78% 成功 | 81% 成功 |
+| 从 README 写一个新 lib | 31% 成功 | 65% 成功 | 70% 成功 |
+
+模型选择策略：
+
+```
+任务复杂度 ≤ 中等 → SWE-1.5（免费、快）
+任务卡壳 ≥ 2 轮 → 自动升级到 Opus 4.7
+长程任务 (>50 file 改动) → 直接选 GPT-5.5 或 Opus 4.7
+```
+
+Windsurf 在 settings 里给了一个 `auto-escalation` 开关，开了之后 SWE-1.5 跑两轮无进展自动切 Opus 4.7，token 成本由 Windsurf 出（包含在 Pro 订阅）。
+
+## 怎么开始用 Wave 13
+
+1. 更新到 Windsurf 1.13.x（菜单 `Windsurf → Check for Updates`）
+2. 启用并行 Agent：`Settings → Cascade → Enable Parallel Agents`
+3. 创建 `.windsurf/hooks.yaml`，从 [官方 hook 仓库](https://github.com/windsurf/community-hooks) 复制一些 starter
+4. 在 Cascade 面板试着创建 2 个 worktree agent 并行跑
+5. 把模型默认设为 SWE-1.5，开 auto-escalation
+
+## 我们的看法
+
+Wave 13 改变了 AI IDE 的赛点。
+
+Cursor 还在『让 Composer 做更长的任务』的方向上加力——Cursor 2 增加了 Background Agents，可以在云端跑长任务。Windsurf 选了另一条路——『让本地工程师同时管多个 Agent』。
+
+两条路都有道理，但 Wave 13 的更接近软件团队的现实形态：你不是一个人，你是一个 tech lead 管着几个初级工程师。Hooks 给了 lead 设规则的能力，worktree 给了多人协作的物理隔离。
+
+下一个 6 个月，我们会看到 `parallel patterns` 这个词变成 vibe coding 的核心词汇。

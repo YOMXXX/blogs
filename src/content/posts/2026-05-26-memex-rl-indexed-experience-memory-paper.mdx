@@ -1,0 +1,185 @@
+---
+title: "Memex(RL) 论文速读：用『索引化经验记忆』把长程 Agent 成功率从 24% 拉到 85%"
+description: "Memex(RL) 提出『索引压缩 + RL 学习读写』把 LLM Agent 的工作上下文压缩 43% 而完整证据无损可回取，成功率从 24% 飙到 85.6%。本文拆它的索引机制、奖励设计和工程落地。"
+column: "paper"
+tags: ["Memex", "RL", "LLM Agent", "Memory", "Long Horizon", "arXiv"]
+pubDate: 2026-05-26
+featured: false
+tldr: "Memex(RL)（arXiv 2603.04257）针对长程 Agent 的核心痛点——上下文窗口限死任务深度——提出一种『结构化摘要 + 索引指针 + 外部经验库』的三层记忆架构。关键创新是用强化学习训练 Agent 学会『写什么摘要、用什么索引、何时去回取原始证据』。在 12 类长程 benchmark 上把 base 模型的 24% 成功率拉到 85.6%，峰值上下文用量下降 43%。本文拆解它的设计哲学、RL 奖励函数和工程落地路径。"
+author: "YOMXXX"
+faq:
+  - q: "Memex(RL) 和 EverMemOS、Mem0 这类记忆系统的区别在哪？"
+    a: "三者解决的问题层级不同。Mem0 是 SDK 层的『记忆库』，把 LLM 对话历史的 fact 抽出来存到向量库；EverMemOS 是『记忆 OS』，给多 agent 提供一个跨 session/跨 agent 的记忆服务。Memex(RL) 介于两者之间——它是『单个 Agent 在单次长程任务内的记忆机制』，核心问题是『如何在 200K 上下文窗口内跑完一个 2000 步任务』。Memex 的索引设计假设 task 内有可压缩的重复结构（比如 explore 一个网站时反复看同样的 menu），把这些结构压成索引、必要时回取细节。Mem0/EverMemOS 解决的是跨 task 跨时间的长期记忆，Memex 解决的是『当下这个任务』的 working memory。"
+  - q: "为什么必须用 RL 而不是 supervised 训练 Agent 学读写？"
+    a: "因为『何时回取证据』是个序列决策问题，没有金标准答案。一个有效的索引可能在 step 50 用到，也可能完全没用到；一个 summary 写得太详细可能在 step 100 触顶 context，写得太粗又导致 step 30 决策错。这种『当前决策对未来的影响有滞后反馈』正是 RL 擅长的——给定一个 reward（任务成功 + 上下文用量惩罚），RL 自动找到摘要粒度和回取时机的平衡。SFT 需要逐 step 的 ground truth annotation，没人能标这么细。论文里 ablation 显示纯 SFT pretrain 只能拿到 38% 成功率，加 MemexRL 才到 85.6%，差距来自『学习何时该回取』这种决策。"
+  - q: "索引化经验记忆的存储和回取细节是怎样的？"
+    a: "工作上下文里放三种东西：任务描述、最近 N 步完整观察、历史步『结构化摘要 + 索引 ID』。摘要是 JSON 格式，含 step_id/observation_type/result_summary/index_ref 等字段，索引指向外部经验库完整记录。Agent 每一步可选 4 种动作：take_action、archive_to_index、retrieve、proceed_without_recall。RL 学的就是这 4 个动作之间的权衡。论文用 trie 结构组织索引，retrieval 用 LLM 自己写的索引描述匹配，准确率 91%。"
+  - q: "Memex(RL) 训练成本和落地门槛？"
+    a: "训练 24 个 H100 × 3 周，base 是 Llama-3-8B-Instruct，PPO + 自定义 reward（任务成功减上下文用量 0.3 倍减错误索引 0.1 倍）。落地两档：直接用预训练 checkpoint（论文已开源），适合通用长程任务，推理成本和原版 8B 一致；或自任务继续训练，工程量 1-2 周搭 pipeline + 算力 1 周，适合垂类 Agent（金融、客服）。论文配套发了 LangChain 和 LlamaIndex 集成示例，5 行代码即接入。"
+  - q: "85.6% 这个成功率在哪些 benchmark 上测？能推广到生产场景吗？"
+    a: "12 个 benchmark 分四类：Web 类（WebArena 65.1% / Base 18%、Mind2Web 76% / 30%）、文档类（LongDoc-QA 92% / 41%）、代码类（SWE-Bench-Multi 62% / 21%）、多步推理类（AGENTBOARD-Hard 84% / 22%）。平均 85.6% 是加权得分。SWE-Bench-Multi 只到 62%——代码任务里『回取证据』需求不明显。生产推广关键是『任务里是否真有可压缩的重复结构』：网页浏览、文档解析、长会话客服强相关；从零写代码、纯创意生成弱相关。"
+---
+
+> **💡 一句话总结**：Memex(RL) 不是又一个 RAG 系统，是给 Agent 装了『笔记本 + 索引卡 + 档案柜』三件套，并用 RL 教会它什么时候翻笔记、什么时候找档案、什么时候继续干活。
+
+## 长程 Agent 的根本困境
+
+你给 Claude Opus 4.7 一个任务：『帮我把过去 30 个交易日 SP500 成分股的 10-K 摘要做成 Excel』。它开始干活：
+
+- step 1-10：解析任务，列出股票清单
+- step 11-50：访问 SEC EDGAR 抓第一只股票的 10-K
+- step 51-100：开始抓第二只股票，但前面的所有 PDF 内容还在上下文里
+- step 200：上下文逼近 200K，开始丢东西，决策质量崩
+
+200K context 听起来够大，但长程任务的 token 累积是恐怖的——10-K 一份能上 50K token，30 只股票就 1.5M token，单一上下文窗口装不下。
+
+LLM 社区的传统答案：
+
+1. **RAG 外置**：把读到的内容存到向量库，需要时检索。问题：检索粒度难调，相似 doc 查回来一堆。
+2. **滑动窗口**：保留最近 N 步，丢掉早期。问题：早期的『任务描述 / 关键约束』被丢了，agent 跑偏。
+3. **递归 summary**：定期把历史压缩成摘要。问题：信息损失不可逆，需要原文时找不回来。
+
+Memex(RL) 论文（arXiv 2603.04257，2026-03 发表，5 月已被多个团队复现）针对这个困境提出了一个第四条路。
+
+## Memex 的三层记忆架构
+
+核心数据结构有三层：
+
+```
+┌─────────────────────────────────────┐
+│  工作上下文 (LLM context window)      │
+│  ├── 任务描述 + 当前 subgoal          │
+│  ├── 最近 N 步完整观察               │
+│  └── 历史步『摘要 + 索引指针』       │
+└─────────────────────────────────────┘
+                │ retrieve(idx)
+                ▼
+┌─────────────────────────────────────┐
+│  经验数据库 (外部，文档完整保存)      │
+│  idx_001: 完整的 10-K 文档 50KB      │
+│  idx_002: 完整的 web page DOM 20KB   │
+│  idx_003: 完整的 tool call output    │
+└─────────────────────────────────────┘
+```
+
+工作上下文里的『摘要 + 索引指针』是一条结构化的 JSON：
+
+```json
+{
+  "step_id": 47,
+  "observation_type": "10-K filing",
+  "summary": "Apple FY2025 revenue $400B, R&D up 12%, ...",
+  "key_facts": ["revenue=$400B", "R&D=$32B"],
+  "index_ref": "idx_047",
+  "confidence": 0.92
+}
+```
+
+每条摘要平均 200 tokens（对应原文可能 50K tokens），压缩比 250×。Agent 在做决策时看到的就是这种结构化卡片堆——既知道历史发生了什么，又能在需要时『翻出原文』。
+
+## 关键动作空间
+
+Memex 把 Agent 的动作空间扩展为 4 类：
+
+| 动作 | 何时使用 | 代价 |
+|------|---------|------|
+| take_action(a) | 正常推进任务 | 无 |
+| archive_to_index(obs) | 观察很重要、之后可能要查 | 一次小开销，写 200 tokens 摘要 |
+| retrieve(idx) | 需要回取证据 | 把外部 record 拉回 context |
+| proceed_without_recall | 历史不重要、直接跳过 | 无 |
+
+每一步 Agent 都要在这 4 类动作里选一个。这是个序列决策问题，没有 ground truth——所以用 RL 训。
+
+## RL 训练设计
+
+奖励函数：
+
+```
+R(s, a) = TaskSuccess × 1.0
+       - ContextTokenUsage / MaxContext × 0.3
+       - WrongRetrievalCount × 0.1
+       - ArchiveRedundancy × 0.05
+```
+
+四项含义：
+
+1. **任务成功**主奖励，做完任务 +1
+2. **上下文用量惩罚**：context 越满惩罚越大，逼 Agent 学会压缩
+3. **错误回取惩罚**：retrieve 了一个回来发现没用到，扣分
+4. **冗余存档惩罚**：把无关紧要的观察也存进去，扣小分
+
+训练设置：
+
+- Base：Llama-3-8B-Instruct
+- 算法：PPO with KL constraint to base policy
+- 任务采样：12 个 long-horizon benchmark 任务池，每个 episode 1000-2000 steps
+- 算力：24× H100，3 周
+
+训练曲线 ablation 很有意思：
+
+- step 0-50k：纯模仿专家 trace，成功率从 24% 到 38%
+- step 50k-200k：RL 接管，Agent 开始探索 archive/retrieve 策略，成功率波动但整体上升到 65%
+- step 200k-500k：收敛阶段，Agent 学到稳定的 archive/retrieve 策略，成功率 85.6%
+
+最有意思的发现：训练后期 Agent 自动学会了**预防性存档**——遇到形如『公司财务摘要』这种语义结构清晰的内容会主动 archive，因为它『预感』后面会用到；遇到『按钮点击的反馈日志』这种一次性内容直接 proceed_without_recall。
+
+## 实测对比
+
+论文 Table 3 节选：
+
+| Benchmark | Base Llama-3-8B | + RAG | + Sliding window | + Memex(RL) |
+|-----------|-----------------|-------|------------------|-------------|
+| WebArena | 18% | 31% | 22% | **65.1%** |
+| Mind2Web | 30% | 42% | 35% | **76%** |
+| LongDoc-QA | 41% | 58% | 39% | **92%** |
+| AGENTBOARD-Hard | 22% | 28% | 24% | **84%** |
+
+可以看到 Memex 在所有任务上都比 RAG、sliding window 显著胜出。最强的是 LongDoc-QA（长文档问答）类任务，从 41% 拉到 92%——这类任务里『先看完原文、记住关键点、回答时回取证据』的模式刚好契合 Memex 的设计。
+
+## 工程落地路径
+
+论文同步发了 GitHub：`github.com/memex-rl/memex` （注意识别真假仓库，以论文链接为准）
+
+集成最简单：
+
+```python
+from langchain_core.runnables import RunnableLambda
+from memex import MemexAgent
+
+agent = MemexAgent.from_pretrained("memex-rl/llama3-8b-memex")
+
+result = agent.run(
+    task="抓取 SP500 前 10 大成分股的最新 10-K 关键财务摘要",
+    max_steps=2000,
+    context_budget=180_000,  # 留 20K 给系统提示
+)
+```
+
+对接 LlamaIndex 类似：
+
+```python
+from llama_index.agent.memex import MemexAgentRunner
+
+runner = MemexAgentRunner(
+    model="memex-rl/llama3-8b-memex",
+    tools=[SECTool(), ExcelTool()],
+    memex_config={
+        "archive_threshold": 0.7,
+        "retrieval_top_k": 3,
+    }
+)
+```
+
+部署成本：单卡 A100 跑 8B 模型可以服务 ~10 个并发 Agent，每秒生成 60 tokens。如果是高并发场景需要 vLLM + tensor parallelism 上 2-4 卡。
+
+## 我们的判断
+
+Memex(RL) 是 2026 年长程 Agent 方向的关键论文之一。它把『context window 怎么用』从一个工程问题升级为一个学习问题——这是 RL 在 LLM Agent 上一次很干净的应用，不是 RLHF 那种泛对齐，而是针对具体认知机制的 RL。
+
+它不是终点。论文最后承认了三个开放问题：
+
+1. **跨 task 泛化**：Memex 学到的索引策略在新任务上需要 fine-tune 一段时间才稳定
+2. **索引爆炸**：超长任务（5k+ steps）索引数量上万，索引检索本身变成瓶颈
+3. **错误回取的成本**：retrieve 一次错误的 index 浪费 5K tokens，对 cost-sensitive 场景是大问题
+
+这些问题大概率是接下来 12 个月的论文方向。如果你在做长程 Agent，Memex(RL) 是这周必读的论文之一，可以和 EverMemOS、MemoryArena 一起看，能搭出一个完整的 Agent 记忆栈。
