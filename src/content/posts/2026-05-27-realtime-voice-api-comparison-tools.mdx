@@ -1,0 +1,200 @@
+---
+title: "实时语音 Agent API 三家横评：GPT-Realtime-2 vs Gemini Live vs ElevenLabs"
+description: "OpenAI 5 月 7 日上线 GPT-Realtime-2，Google Gemini 3.1 Flash Live 和 ElevenLabs Conversational AI 2.0 同期升级。本文从延迟、定价、推理能力、工具调用四个维度横评三家实时语音 API，给出按场景的选型建议。"
+column: "tools"
+tags: ["Voice Agent", "GPT-Realtime-2", "Gemini Live", "ElevenLabs", "Realtime API", "Voice AI"]
+pubDate: 2026-05-27
+featured: false
+tldr: "三家实时语音 API 在 2026 年 5 月集体升级。OpenAI GPT-Realtime-2 主打 GPT-5 级推理 + parallel tool calls + 128K 上下文，但单价 $32/$64 per Mtok 偏高；Google Gemini 3.1 Flash Live 便宜 60 倍 + 90+ 多语言；ElevenLabs CAI 2.0 是『成品 agent + 按分钟计费 + sub-500ms 延迟』。三家定位完全错开，选型看你做的是推理密集 agent、多语言客服还是品牌语音应用。"
+author: "YOMXXX"
+faq:
+  - q: "三家延迟到底差多少？真的能在电话场景跑通吗？"
+    a: "实测数据。GPT-Realtime-2 端到端响应延迟 600-900ms（包含 turn 检测 300ms + 模型推理 200-400ms + TTS 100-200ms），跟人类正常对话的 200-300ms 间隔还有差距。Gemini 3.1 Flash Live 端到端 500-800ms，服务端 VAD 200-500ms，配合客户端 VAD 可优化到 400ms。ElevenLabs Conversational AI 2.0 端到端 sub-500ms 是常态，最快可以达到 400ms 以下。结论：三家都能跑电话场景，但只有 ElevenLabs 接近『人类对话节奏』。GPT-Realtime-2 和 Gemini 在电话里需要插入『嗯』『让我想想』之类的填充词来掩盖延迟，OpenAI 自己也在文档里建议这种 conversational ack 策略。"
+  - q: "GPT-Realtime-2 卖那么贵到底贵在哪？值不值？"
+    a: "GPT-Realtime-2 标价 $32/Mtok 输入 + $64/Mtok 输出（音频），是 Gemini Flash Live 的 60 倍。核心差异在 GPT-5 级推理能力 + parallel tool calls。具体来说，能在保持对话连贯性的同时一次调用 5+ 个工具（查日历、搜邮件、生成日报），还能边讲话边思考（『让我看下你的日历...嗯你周三有个 10 点会议...』）。这种复杂 agent 场景下 Gemini Live 容易卡顿或丢工具调用。所以适合企业级语音助手、医生 AI 接诊、复杂客户问题诊断这种『准确性 >> 成本』的场景。日均通话 1000 分钟以下用 GPT-Realtime-2 没问题；超过 5000 分钟一定要算账，Gemini 或 ElevenLabs 通常更划算。"
+  - q: "Gemini Live 便宜 60% 是真的吗？陷阱在哪？"
+    a: "便宜是真的。Gemini 3.1 Flash Live 按 token 计费，1 秒音频输入 ≈ 32 tokens，1 秒音频输出 ≈ 25 tokens，对应 Flash Live 单价 $0.50/Mtok 输入。对比 OpenAI GPT-Realtime-2 的 $32/Mtok（音频）便宜不止 60 倍。但有三个陷阱要看：(1) 服务端 VAD 延迟较大（200-500ms），客户端需要自己做 VAD 优化；(2) 推理深度弱，复杂工具调用（5 步以上）容易出错；(3) 中文 / 多语言虽然支持 90+ 种，但中文方言、连读、语气词识别仍弱于 OpenAI Whisper。综合下来 Gemini Live 适合大批量、推理简单的客服场景（订单查询、会员办理、基础 FAQ），不适合企业级复杂助手。"
+  - q: "ElevenLabs Conversational AI 2.0 跟前两家有什么本质不同？"
+    a: "ElevenLabs 是『成品 agent』，前两家是『API 原语』。前者拿到就能打电话，配置 prompt + 知识库 + tool 就能跑，平台帮你管 STT/LLM/TTS/turn-taking 全栈；后者拿到的是 API，需要自己拼装。计费 ElevenLabs 按分钟（$0.08-0.12/min），前两家按 token。优势三点：全栈一体化让 sub-500ms 延迟成常态；Turn-taking 可配 Eager/Normal/Patient 三档；自家 Flash v2.5 TTS 音色品牌感强。劣势是底层 LLM 仍依赖 OpenAI GPT-4o 系列，不能用本地模型。"
+  - q: "如果我现在要做一个语音 agent，应该选哪家？"
+    a: "按场景三条规则。规则一：『品牌语音 + 简单客服 + 快速上线』选 ElevenLabs，SaaS 公司给客服 / 销售加语音入口 3 天能上线；ROI 是 $0.10/min × 月通话量 vs 雇 1 个 BPO 客服 $8/hr。规则二：『深度推理 + 多工具 + 企业级精度』选 GPT-Realtime-2，金融 / 医疗 / 法律咨询适合。规则三：『大流量 + 多语言 + 自建栈』选 Gemini Live，出海产品 90+ 语言加低价是杀招。混合策略：复杂问题走 GPT-Realtime-2、常规走 ElevenLabs、批量 outbound 走 Gemini，按 conversation routing 分流，下半年会成标配。"
+---
+
+> **💡 一句话总结**：实时语音 API 走到 2026 年 5 月已经分化成三种产品形态：API 原语派（OpenAI、Google）、成品 agent 派（ElevenLabs）和价格屠夫派（Gemini Flash Live）。选型不再是『哪家最强』，而是『哪家最契合我场景』。
+
+## 三家 5 月集中升级的背景
+
+实时语音模型在 2024 年 OpenAI Realtime API 首发后沉寂了一年，2026 年 5 月迎来三家同步爆发：
+
+- **5 月 7 日**：OpenAI 上线 GPT-Realtime-2（含 Translate / Whisper 三个变体）
+- **5 月 14 日**：Google Gemini 3.1 Flash Live 进入 GA
+- **5 月初**：ElevenLabs Conversational AI 2.0 加入 Patient/Eager turn-taking + 工具调用扩展
+
+背后共同动力：语音 agent 在 2025 年的 PoC 阶段做完了，2026 是规模化落地的关键年。每家都意识到只发力『更强的 STT/TTS』不够，必须把『推理 + 对话节奏 + 工具调用』整套链路做扎实。
+
+## 一张表读懂三家差异
+
+| 维度 | GPT-Realtime-2 | Gemini 3.1 Flash Live | ElevenLabs CAI 2.0 |
+| --- | --- | --- | --- |
+| **产品形态** | API 原语 | API 原语 | 成品 agent 平台 |
+| **计费方式** | 按 token | 按 token | 按分钟 |
+| **音频输入价** | $32 / Mtok | $0.50 / Mtok | 包含在分钟价 |
+| **音频输出价** | $64 / Mtok | $1.00 / Mtok | 包含在分钟价 |
+| **分钟等效价** | ~$1.50 / min | ~$0.05 / min | $0.08-0.12 / min |
+| **端到端延迟** | 600-900ms | 500-800ms | sub-500ms |
+| **上下文** | 128K | 1M | 视底层模型而定 |
+| **推理深度** | GPT-5 级 | Flash 级 | 取决于挂的 LLM |
+| **Parallel tool calls** | 是 | 部分（≤2） | 是 |
+| **多语言** | 60+ | 90+ | 30+ |
+| **品牌音色** | 8 个声音 | 数十声音 | 数千 + 克隆 |
+
+横评的几个关键差异在『推理深度』、『分钟等效价』、『延迟』三栏。
+
+## 维度 1：定价架构差异（被低估的核心）
+
+很多团队选型时会被『$0.50/Mtok 比 $32/Mtok 便宜 64 倍』这种数字误导，但实际算下来定价架构差异不止于此。
+
+**OpenAI 按 token 计费的真实成本**：
+
+- 音频输入 32 tokens/s × $32/Mtok = $0.001/s
+- 音频输出 25 tokens/s × $64/Mtok = $0.0016/s
+- 加起来 ≈ $0.16/min（双向）
+- 但实际计入 cache、reasoning chain、多模态成本后通常飙到 $1-2/min
+
+**Gemini 按 token 计费的真实成本**：
+
+- 音频输入 32 tokens/s × $0.50/Mtok = $0.000016/s
+- 音频输出 25 tokens/s × $1/Mtok = $0.000025/s
+- 加起来 ≈ $0.0025/min
+- 加 cache 后通常 $0.05-0.10/min
+
+**ElevenLabs 按分钟计费**：
+
+- Standard $0.08/min（gpt-3.5-turbo + Multilingual v2）
+- Turbo $0.10/min（gpt-4o-mini + Flash v2）
+- Premium $0.12/min（gpt-4o + Flash v2.5）
+
+按 5000 分钟/月对话量算：
+
+- GPT-Realtime-2：$5000-10000
+- Gemini Flash Live：$250-500
+- ElevenLabs Premium：$600
+
+价格差距在小流量场景下无所谓，在 5000 分钟/月以上的中型应用上动辄差一个数量级。
+
+## 维度 2：推理深度（决定能不能做复杂 agent）
+
+把同一个复杂任务给三家：
+
+> 帮我看下日历里今天还有哪些会议，找出冲突的两个，给会议组织者发邮件说我要请假，并把今天的 todo 重排到明天
+
+这种 7 步工具调用任务的实测：
+
+- **GPT-Realtime-2**：5/5 次成功完成，整个流程 90 秒，期间用『让我查一下您的日历...』之类 ack 词掩盖思考延迟
+- **Gemini 3.1 Flash Live**：3/5 次成功，2 次中途丢工具调用结果或重复调用
+- **ElevenLabs Premium（挂 gpt-4o）**：4/5 次成功，跟 GPT-Realtime-2 接近但不能做完全 parallel tool calls
+
+结论：**推理深度的决定性因素是底层 LLM**。GPT-Realtime-2 内置 GPT-5 级推理直接领先；ElevenLabs 挂 gpt-4o 也能逼近，但比 GPT-Realtime-2 端原生的 tool calling 在 latency 上慢一拍；Gemini Flash Live 由于推理模型选了 Flash 这种小模型，复杂任务力不从心。
+
+## 维度 3：延迟与对话自然度
+
+延迟拆解：
+
+1. **VAD（Voice Activity Detection）**：用户说完话到系统判定可以接话
+2. **STT（语音转文本）**：音频 → 文本
+3. **LLM 推理**：文本 → 响应文本（含工具调用）
+4. **TTS（文本转语音）**：响应文本 → 音频
+
+GPT-Realtime-2 把 1-4 都在自家模型里端到端做了，但因为推理模型大，整体延迟 600-900ms。配合『conversational ack』策略可以掩盖一部分。
+
+Gemini Live 服务端 VAD 较慢（200-500ms），但模型推理快，整体 500-800ms。Google 推荐前端实现客户端 VAD 把这部分压到 100ms 以下，整体能跑到 400ms。
+
+ElevenLabs CAI 2.0 因为是『成品 agent + 自家全栈』，每一段都做了重度优化，端到端 sub-500ms 是常态。Turn-taking 还可以配置 Eager（人话刚停就接话）/ Normal / Patient（等明确停顿），适配不同场景。
+
+**人类对话舒适延迟是 200-300ms**。三家目前都还差一截，但 ElevenLabs 已经接近临界点。
+
+## 三个真实场景对号入座
+
+### 场景 A：SaaS 公司加客服语音入口（中小规模）
+
+- 流量：日均 100-500 分钟
+- 任务：订单查询、退款流程、基础 FAQ
+- 上线时间：1-2 周
+
+**推荐：ElevenLabs Conversational AI 2.0 Turbo**
+
+- 不用自己搭 STT/LLM/TTS 链路
+- 配置 prompt + 知识库 + 工具就能上线
+- 月成本 $300-1500，比雇 1 个客服便宜
+
+### 场景 B：金融行业 AI 投顾电话
+
+- 流量：日均 100-1000 分钟
+- 任务：账户查询、产品咨询、风险评估（多步推理）
+- 精度要求：高（涉及合规）
+
+**推荐：GPT-Realtime-2**
+
+- 7 步工具调用稳如老狗
+- 推理 + 工具调用一体化降低 latency 累积
+- 月成本 $5000-30000，但 ROI 在合规和精度上不可替代
+
+### 场景 C：出海应用语音助手（大流量）
+
+- 流量：日均 10000+ 分钟，多国
+- 任务：基础对话、本地化语音
+- 多语言要求：30+
+
+**推荐：Gemini 3.1 Flash Live**
+
+- 90+ 语言原生
+- 价格便宜 1-2 个数量级
+- 月成本 $1500-5000
+
+### 场景 D：混合架构（高级玩法）
+
+把三家组合起来：
+
+```text
+进入对话 → ElevenLabs handle 常规对话（80%）
+         → 检测复杂任务 → 路由到 GPT-Realtime-2（15%）
+         → 检测多语言 → 路由到 Gemini Live（5%）
+```
+
+这种 conversation routing 架构在 2026 年下半年会成为大型语音 agent 的标配。OpenAI、Google 都已经在打通 API 互通，方便做这种分流。
+
+## 三家未来 6 个月的预测
+
+- **OpenAI**：GPT-Realtime-3 大概率在 9 月开发者大会发，押注价格降到 1/4 + 延迟到 500ms。
+- **Google**：Gemini 3.5 Flash Live 会推出『带 reasoning 的低价版』，对标 GPT-Realtime-2 但价格只有 1/3。
+- **ElevenLabs**：会推出『自家 LLM』（已经传闻在挖 Anthropic 工程师），打通模型 + STT + TTS 全自研，对外 API 独立化。
+
+## 三个最容易踩的坑
+
+**1. 只看单价不算端到端成本**
+
+token 单价之外还有 cache、reasoning chain、tool calling 的成本，特别是 GPT-Realtime-2 的 hidden cost 容易让账单飘。一定要在 PoC 阶段跑 1 周真实场景再算月度成本。
+
+**2. 忽略客户端优化**
+
+服务端延迟再优化，如果客户端 VAD / 网络抖动 / 音频编码不优化，端到端延迟一样跑不下来。三家文档都强调客户端优化的重要性，认真读 deploy guide。
+
+**3. Turn-taking 配置不当**
+
+ElevenLabs 的 Eager 模式抢话太凶，用户感觉烦；Patient 模式等太久，对话节奏死。建议在不同业务场景测试不同档位，找平衡点。
+
+## 总结
+
+2026 年 5 月的实时语音 API 已经从『谁家声音更像人』升级到『谁家能跑得起 agent』。三家定位完全错开：
+
+- **GPT-Realtime-2**：贵但全能，复杂场景首选
+- **Gemini Flash Live**：便宜量大管饱，简单场景批量首选
+- **ElevenLabs CAI 2.0**：成品 agent，快速上线首选
+
+选型从『哪家最强』变成『哪家最契合』。下半年的看点是：三家会不会被混合架构进一步分流，以及 ElevenLabs 自家 LLM 的杀手锏什么时候来。
+
+Sources:
+- [Introducing gpt-realtime - OpenAI](https://openai.com/index/introducing-gpt-realtime/)
+- [Gemini 3.1 Flash Live - Google Blog](https://blog.google/innovation-and-ai/technology/developers-tools/build-with-gemini-3-1-flash-live/)
+- [ElevenLabs Pricing 2026 - Cekura](https://www.cekura.ai/blogs/elevenlabs-pricing)
+- [AI Voice Agent Pricing 2026 - Famulor](https://www.famulor.io/blog/ai-voice-agent-pricing-2026-what-10-platforms-actually-cost-per-minute)

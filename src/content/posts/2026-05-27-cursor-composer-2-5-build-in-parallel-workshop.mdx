@@ -1,0 +1,204 @@
+---
+title: "Cursor Composer 2.5 Build in Parallel 实战：把 IDE 当依赖图调度器"
+description: "Cursor Composer 2.5 在 5 月 18 日上线，配合 Build in Parallel 让 IDE 自动识别独立子任务、派遣 async subagent 并行执行。本文从启用到调度，覆盖 /multitask、依赖图、和 SWE-Bench 79.8% 实测对比。"
+column: "workshop"
+tags: ["Cursor", "Composer 2.5", "Build in Parallel", "AI IDE", "Async Subagent", "Kimi K2.5"]
+pubDate: 2026-05-27
+featured: false
+tldr: "Composer 2.5 是 Cursor 自家的 agentic 编码模型：SWE-Bench Multilingual 79.8%，逼平 Claude Opus 4.7，token 价格只有十分之一。配合 Cursor 3.3 引入的 Build in Parallel，IDE 会先构建依赖图，把独立步骤丢给 async subagent 并行跑，主 agent 只处理串行段。本文从启用、/multitask 命令、依赖图设计模式三步走，给一个真实改造任务的并行写法。"
+author: "YOMXXX"
+faq:
+  - q: "Composer 2.5 真的能匹敌 Claude Opus 4.7 吗？"
+    a: "在编码三大基准上几乎平手：SWE-Bench Multilingual 79.8% vs 80.5%、Terminal-Bench 2.0 69.3% vs 71%、CursorBench v3.1 私有评测领先 Opus 4.7。但要注意三个适用边界。第一，Composer 2.5 基于 Kimi K2.5 微调，长程对话超过 200 轮时一致性还是逊于 Opus。第二，纯文档撰写 / 论文复现这种需要深度世界知识的任务，Opus 4.7 / GPT-5.5 仍是首选。第三，模型对 IDE tool calling 是过拟合的，离开 Cursor 环境直接用 API 调用，性能会下降 5-8 个百分点。结论：在 IDE 内部 80% 编码任务用 Composer 2.5 足够，省下的 token 钱拿来跑 frontier 模型的 hard case。"
+  - q: "Build in Parallel 和直接开 5 个 Cursor 窗口手动多开有什么区别？"
+    a: "本质区别是依赖图调度。手动多开 5 个窗口本质是『工程师自己拆分任务 + 自己合并』，5 个 agent 互相不知道对方在改哪里，合并冲突需要人工解决。Build in Parallel 是 IDE 主动分析 plan：识别『修复 auth bug』『更新 README』『加 e2e 测试』这种正交任务并行派遣 async subagent，识别『重构 service 接口 → 更新所有 caller』这种串行依赖时保持顺序。它在 plan 层做拓扑排序，subagent 共享同一份 codebase context，最后由主 agent 统一合并 patch。简单说前者是 5 个独立 Claude，后者是 1 个 lead + 多个 worker 的层级结构。"
+  - q: "/multitask 命令具体怎么用？什么场景最适合？"
+    a: "三步走：(1) 在 chat 输入 `/multitask` 触发并行模式；(2) 描述大任务，Composer 会自动拆解为子任务并生成依赖图，问你确认；(3) 确认后 IDE 开 N 个 subagent panel，每个 panel 跟单独的 agent 实时通信。最适合的三种场景：A. 多语言迁移，比如『把 Python service 翻译成 Go，同时保留行为』，subagent 各负责一个文件；B. 大型重构后的回归测试补全，每个模块一个 subagent；C. 仓库初始化体力活，CI 配置 / Dockerfile / README / 测试样板四个独立任务并行。不适合的场景：调试一个具体 bug、写需要深度推理的算法实现，这些任务串行思考反而效率更高。"
+  - q: "Composer 2.5 价格便宜十倍是怎么做到的？训练有什么秘诀？"
+    a: "三个关键设计。第一，基座选了 Kimi K2.5 而不是 Llama 3/4，K2.5 本身就是为代码 + 长文本优化的 MoE，推理成本比同档 dense 模型低一半。第二，训练数据用了 25 倍合成任务，由 GPT-5.5 / Opus 4.7 在 Cursor 环境内『扮演工程师』产生 trace，再用 textual feedback（不是 RLHF 的偏好对，是结构化反馈，比如『这里应该先读文件再改』）做 supervised fine-tune。第三，基础设施层面 Cursor 自己跑模型 / 自己优化 KV cache 调度，Standard tier 跟 fast tier 的差价就是 KV cache 命中率差距。三层叠加，Standard 卖 $0.50 / $2.50 per Mtok 还有利润，对比 Opus 4.7 的 $15 / $75，自然是十分之一。"
+  - q: "Build in Parallel 跟 Windsurf Wave 13、Antigravity 2、Grok Build 怎么对比？"
+    a: "5 月这周四家都在打并行子 agent，差异在两个轴。一是隔离粒度：Wave 13 用 git worktree 物理隔离，每个 agent 独立 IDE 面板；Cursor 共享 workspace、靠依赖图防冲突；Antigravity 2 跑云端 sandbox 只看 patch；Grok Build 最激进，8 个 parallel sub-agent 但 IDE 简陋。二是模型组合：Wave 13 用自家 SWE-1.5 + Opus 兜底；Cursor 默认 Composer 2.5；Antigravity 用 Gemini 3.5；Grok Build 用 Grok 5。趋势是并行 agent 已成 IDE 默认形态，比拼焦点转向依赖图准确性 + 多 agent 协作协议。"
+---
+
+> **💡 一句话总结**：Composer 2.5 不是简单升级了模型，而是 Cursor 把『agent + 依赖图 + KV cache』三层栈做到了一体化。Build in Parallel 让 IDE 第一次像 CI/CD 系统那样调度任务。
+
+## Composer 2.5 五分钟概览
+
+5 月 18 日 Cursor 在博客 [Introducing Composer 2.5](https://cursor.com/blog/composer-2-5) 上线了自家最强的编码模型。数字先放最前面：
+
+| 基准 | Composer 2 | Composer 2.5 | Claude Opus 4.7 | GPT-5.5 |
+| --- | --- | --- | --- | --- |
+| SWE-Bench Multilingual | 73.7% | **79.8%** | 80.5% | 78.2% |
+| Terminal-Bench 2.0 | 61.7% | **69.3%** | 71.0% | 67.5% |
+| CursorBench v3.1 | 74.1% | **81.6%** | 80.9% | 79.4% |
+| 价格 (input / output per Mtok) | $0.40 / $2.00 | **$0.50 / $2.50** | $15 / $75 | $10 / $50 |
+
+价格只有 Opus 4.7 的 1/10，性能基本持平 —— 这是 5 月 18 日以来 Hacker News 顶起来的关键事实。但 Cursor 真正的杀手锏不是模型本身，而是配合 Cursor 3.3（5 月 7 日推送）的 **Build in Parallel** 功能。
+
+## Build in Parallel 解决什么问题
+
+老 agent 模式的痛点：
+
+- 一个 plan 里 80% 的子任务其实彼此独立（比如『加 lint 配置 / 写 README / 补 e2e 测试』），但被串行执行了
+- 工程师等 agent 等到下班，因为每次只能跑一个
+- 想多开几个 agent 又要自己拆分任务，拆错了合并冲突地狱
+
+Cursor 在 3.3 里把这个问题正面解了：
+
+1. **依赖图分析**：Composer 收到大任务后，先把它拆成 N 个 step，每个 step 标注上下游依赖关系（读哪些文件、改哪些文件、产出什么）
+2. **拓扑排序 + 并行调度**：IDE 把没有依赖的 step 同时丢给 async subagent，相互依赖的保持串行
+3. **统一合并**：所有 subagent 完成后，主 agent 检查 patch 不冲突，再统一 commit
+
+这套机制公开的官方说法是 "dependency-aware execution graph"，跟 CI/CD 系统的 DAG 调度本质一样。
+
+## 启用与基础用法
+
+### Step 1: 开启 Build in Parallel
+
+设置入口：`Cursor → Settings → Features → Build in Parallel`。需要 Cursor 3.3 以上（菜单里如果没有这一项，先升级 IDE）。
+
+启用后会有两个新选项：
+
+- `Auto parallelize`: 默认 off，开启后 Composer 自动判断是否拆分；建议先 off 自己控制
+- `Max concurrent subagents`: 默认 3，免费用户最高 3，Pro 5，Business 8
+
+### Step 2: 用 /multitask 显式触发
+
+在 chat 输入 `/multitask` 后跟任务描述，例如：
+
+```text
+/multitask 
+重构 src/api/payment 模块：
+1. 把 PaymentService 拆成 PaymentGateway + PaymentValidator 两个类
+2. 更新所有 caller（src/handlers/, src/jobs/）
+3. 补充单元测试到 80% 覆盖率
+4. 更新 docs/payment.md
+5. 给 CI 加 contract test
+```
+
+Composer 收到后会先返回一个 plan，类似：
+
+```text
+[Plan]
+- Step A: 拆分 PaymentService → PaymentGateway + PaymentValidator (改 src/api/payment/*)
+- Step B: 更新 src/handlers/ 中的 caller     (依赖 A)
+- Step C: 更新 src/jobs/ 中的 caller          (依赖 A)
+- Step D: 写新单元测试 tests/payment/*.test  (依赖 A)
+- Step E: 更新 docs/payment.md                (无依赖)
+- Step F: CI 配置加 contract test            (无依赖)
+
+[Topology]
+A → {B, C, D}   并行执行 B/C/D
+{E, F}          独立并行
+```
+
+确认后 IDE 弹出 5 个 subagent panel（A 单独、B/C/D 并行、E/F 并行），同步显示每个 subagent 当前在改什么文件。
+
+### Step 3: 监督 + 合并
+
+每个 subagent 完成后 panel 变绿，patch 进入 review 队列。主 agent 在所有依赖完成后做最后的全局检查：
+
+- 文件冲突检测（两个 subagent 不能同时写同一个文件）
+- 测试运行
+- 风格一致性（同一个变量在 B/C/D 里被改成不同名字会被警告）
+
+通过后 commit 一次。整个流程比串行快多少？根据 Cursor 公布的数据，平均加速 2.3x，依赖稀疏的大重构任务能到 4x。
+
+## 三个真实场景的依赖图设计
+
+### 场景 1：多模块跨语言迁移
+
+任务：把 Python service 翻译成 Go。
+
+错误的提示词写法：
+
+```text
+把整个 service 翻译成 Go
+```
+
+—— Composer 不会拆分，会一文件一文件串行翻译。
+
+正确写法：
+
+```text
+/multitask
+把 Python service 翻译成 Go：
+- 每个 .py 文件对应一个 .go 文件，独立翻译
+- 共享类型定义放在 pkg/types/，最先翻译
+- 主入口 main.go 最后翻译
+- 翻译完成后跑 go test ./... 验证
+```
+
+Composer 会识别出 `pkg/types/` 是上游，主入口是下游，中间所有文件并行。8 个文件的 service，并行翻译比串行快 3.7 倍。
+
+### 场景 2：仓库 onboarding 体力活
+
+任务：给一个新仓库加上完整工程化配置。
+
+```text
+/multitask
+为这个新仓库添加以下配置（所有任务彼此独立）：
+1. 加 ESLint + Prettier 配置，把现有代码格式化
+2. 写 Dockerfile + docker-compose.yml
+3. 写完整的 README.md（项目背景、安装、使用、贡献指南）
+4. 加 GitHub Actions CI（lint + test + build）
+5. 加 .gitignore + .editorconfig + LICENSE
+```
+
+5 个任务无依赖，并行执行后 IDE 在 5 分钟内完成 1 小时的体力活。
+
+### 场景 3：bug 修复 + 回归覆盖
+
+任务：修复一个 bug 同时补回归测试。
+
+```text
+/multitask
+issue #234 描述的 SSO 登录 401 问题：
+- 主任务：定位 + 修复（先做）
+- 同时：扫描 src/auth/ 找出现有覆盖率，补充缺失的单元测试
+```
+
+Composer 会把修复设为 Step A、测试补充设为 Step B，B 等 A 完成后再开始（因为要测新代码）。这种『主任务 + 影子任务』的写法可以在不打断思路的情况下顺便提升覆盖率。
+
+## 跟其他三家的对比
+
+5 月以来 4 家主流 AI IDE 都加了并行子 agent，差异如下：
+
+| 工具 | 隔离机制 | 默认模型 | 最大并发 | 适用风格 |
+| --- | --- | --- | --- | --- |
+| **Cursor Composer 2.5** | 依赖图 + 共享 workspace | Composer 2.5 (Kimi K2.5) | 8 (Business) | 强结构化、IDE 内深度 |
+| Windsurf Wave 13 | Git worktree 物理隔离 | SWE-1.5 + Opus 4.7 | 5 | 工程师全程监督 |
+| Antigravity 2 | 云端 sandbox | Gemini 3.5 | 4 | 异步、看 patch |
+| Grok Build | 进程级隔离 | Grok 5 | 8 | 激进并行、IDE 简陋 |
+
+选型建议：
+
+- 想在 IDE 里深度协作、看每个 subagent 状态 → **Cursor Composer 2.5**
+- 想跟 5 个 Agent 各自有完整 worktree → Windsurf Wave 13
+- 任务跑 30 分钟以上、不想盯着 IDE → Antigravity 2
+- 极致并行、可以接受简陋体验 → Grok Build
+
+## 三个使用误区
+
+**误区 1：所有任务都用 /multitask**
+
+并行有额外协调成本。简单的『加一个按钮 / 修一个空格 bug』串行更快。一般经验是任务能拆成 3 个以上独立子步骤再用 multitask。
+
+**误区 2：并发开到最大**
+
+8 个 subagent 同时跑会导致 IDE 卡顿、token 消耗陡增。推荐保持 3-5。`Max concurrent subagents` 调到 5 之后再没收益。
+
+**误区 3：完全信任依赖图**
+
+Composer 偶尔会漏掉隐式依赖（比如『改了某个 enum 但没扫到所有 switch case』）。重要 plan 一定要看一眼依赖图，发现问题手动加 dependency。`Step B depends on A` 这种语句直接写在描述里 Composer 会识别。
+
+## 总结
+
+Composer 2.5 + Build in Parallel 是 Cursor 把 IDE 从『AI 副驾驶』推向『工程师指挥的并行车间』的关键一步。比起单纯堆模型，这次升级更值得关注的是依赖图调度——它把『AI 写代码』从『下一个 token 预测』升级到了『DAG 执行引擎』层面。
+
+如果你已经在用 Cursor，今天就把 IDE 升级到 3.3 + 开启 Build in Parallel；如果还在用其他 AI IDE，对比下『并行 + 自家模型 + 价格』三件套，再决定要不要迁移。
+
+Sources:
+- [Introducing Composer 2.5 · Cursor Blog](https://cursor.com/blog/composer-2-5)
+- [Cursor Composer 2.5: Benchmarks, Pricing - DataCamp](https://www.datacamp.com/blog/composer-2-5)
+- [Cursor's Composer 2.5 - Artificial Analysis](https://artificialanalysis.ai/articles/cursor-composer-2-5-coding-agent-index)

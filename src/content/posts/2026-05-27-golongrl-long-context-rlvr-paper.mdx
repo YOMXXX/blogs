@@ -1,0 +1,161 @@
+---
+title: "GoLongRL 速读：开源版长上下文 RLVR，30B 追平 235B 思维模型"
+description: "GoLongRL 在 5 月 19 日上线 arXiv，提出能力导向的长上下文 RLVR 后训练方法。本文拆解 23K 数据集九大任务类型、TMN-Reweight 算法、以及让 Qwen3-30B-A3B 追平 DeepSeek-R1 的实测结果。"
+column: "paper"
+tags: ["GoLongRL", "RLVR", "Long Context", "Qwen3", "TMN-Reweight", "arXiv 2605"]
+pubDate: 2026-05-27
+featured: false
+tldr: "GoLongRL 是 2026 年 5 月 19 日 arXiv 上的一项开源工作，核心贡献是把长上下文能力切成 9 个细类（多跳推理、文档检索、跨段对齐等），用 23K RLVR 样本做监督，并引入 TMN-Reweight（任务级均值归一化 + 难度自适应加权）解决多任务奖励异质问题。实测 Qwen3-30B-A3B 训练后追平 DeepSeek-R1-0528 和 Qwen3-235B-A22B-Thinking-2507，是开源社区第一次把『长上下文能力对齐 RL』做到生产水准。"
+author: "YOMXXX"
+faq:
+  - q: "GoLongRL 解决的长上下文 RL 痛点具体是什么？"
+    a: "三个痛点。第一，任务覆盖单一：之前的长上下文 RL 数据集 80% 是『大海捞针』式检索，但工程里真实需求是多跳推理、跨段对齐、文档摘要、表格 QA 等 9 种能力，单一任务训练完模型在新任务上崩盘。第二，奖励异质：检索类任务用 EM 评分（0/1），摘要类用 ROUGE（连续值），多个任务混合训练时简单求和会让连续奖励主导，离散奖励信号被淹没。第三，难度不平衡：简单样本贡献正梯度，难样本贡献负梯度，朴素 GRPO 在多任务里收敛不稳定。GoLongRL 三步走分别对应：能力分类法、TMN-Reweight、难度自适应加权。"
+  - q: "TMN-Reweight 算法到底做了什么？"
+    a: "TMN-Reweight = Task-level Mean Normalization + Difficulty-adaptive Reweighting。两步处理。第一步归一化：对每个任务类型 t，统计其内部奖励均值 `μ_t` 和方差 `σ_t`，把所有样本奖励标准化为 `(r - μ_t) / σ_t`，让 9 个任务的奖励处于同一量级。第二步加权：根据样本难度 d（用模型回答正确率倒数衡量）调整其权重 `w = 1 + α·log(d)`，难样本权重更高，避免被简单样本淹没。两步叠加后，GRPO 优势函数变成 `A_t = w·((r - μ_t) / σ_t)`。论文里这两个改动单独看每个都不新，组合起来在多任务 RLVR 场景下让 Qwen3-30B 增益 3.2 pp。"
+  - q: "9 种任务类型具体是哪些？怎么覆盖长上下文能力？"
+    a: "论文沿用了一个 capability taxonomy：(1) 单文档 QA，(2) 多文档 QA，(3) 多跳推理（需要跨段联系），(4) 时间排序（按时间整理事件），(5) 跨段对齐（合并多个段落的描述），(6) 摘要（生成长文档摘要），(7) 表格 QA（表格 + 文本混合），(8) 代码理解（长仓库），(9) 多轮对话理解。每个类型独立的评估指标，比如 1/2 用 EM、3 用 reasoning chain match、6 用 ROUGE-L、7 用结构化 accuracy、8 用代码执行通过率。这套分类不是论文首创，但 GoLongRL 第一次把 9 个细类都涵盖到 23K RL 训练数据里，开源同时覆盖这么完整还没见过。"
+  - q: "Qwen3-30B-A3B 训练后真的追平 DeepSeek-R1 / Qwen3-235B？怎么解读？"
+    a: "数据上确实接近：LongBench v2 多跳子集 GoLongRL 训练后的 Qwen3-30B 拿到 58.7%，DeepSeek-R1-0528 60.1%，Qwen3-235B-Thinking 59.4%。但要冷静看三件事。第一，benchmark 漂移风险：LongBench v2 部分子集已经在网上流传，训练数据集成了相似分布的样本时分数会虚高。第二，30B vs 235B 的真实差距在『需要世界知识 + 多跳推理』的任务上仍然明显，比如 BrowseComp 类型 30B 落后 7-9 pp。第三，部署成本上 30B-A3B 推理峰值只用 12GB 显存，相比 235B 的 4×A100 是数量级差距。结论：可以在生产里用 30B 处理 80% 长上下文任务，关键场景留 235B / R1 兜底。"
+  - q: "为什么说这是开源社区里程碑？"
+    a: "三方面。第一，数据 + 代码 + 训练 trace 全开源，GitHub repo `xiaoxuanNLP/GoLongRL` 公开了 23K 数据集 + 完整 RL 训练流水线，对比 QwenLong-L1.5 那种『论文发了但数据不开放』的工作，社区可以直接复现。第二，算法层面 TMN-Reweight 简洁可移植，10 行 PyTorch 代码就能加到现有 GRPO 训练框架里，HuggingFace TRL 已经合并了相关 PR。第三，把长上下文能力从『一个模糊概念』细化为 9 个可衡量能力，给社区一个测评 + 训练的统一坐标系。后续 long-context RL 工作大概率会以 GoLongRL 的 taxonomy 作为基线。"
+---
+
+> **💡 一句话总结**：GoLongRL 把长上下文 RL 从『大海捞针 + GRPO』升级到『9 个能力细类 + TMN-Reweight』，让开源 30B 模型在多跳推理类任务上首次追上 235B 思维模型。
+
+## 论文基本信息
+
+- **标题**：GoLongRL: Capability-Oriented Long Context Reinforcement Learning with Multitask Alignment
+- **arXiv**：[2605.19577](https://arxiv.org/abs/2605.19577)，2026 年 5 月 19 日提交
+- **作者**：Minxuan Lv 等 12 位
+- **代码 + 数据**：[github.com/xiaoxuanNLP/GoLongRL](https://github.com/xiaoxuanNLP/GoLongRL)
+- **关键词**：长上下文（long context）、RLVR（带可验证奖励的 RL）、多任务对齐、能力分类法
+
+## 问题背景：长上下文 RL 之前哪里出了问题
+
+长上下文模型从 2024 年的 128K 卷到现在 1M+，但能力评测早就发现：上下文窗口大不等于真的能用。Qwen3-235B 在 LongBench v2 也只有 60% 出头，DeepSeek-R1 在 BrowseComp 长上下文版还会出现『大段段落直接复制』的退化行为。
+
+社区普遍的解决思路是 RL 后训练，但之前的工作集中在『大海捞针』这一类合成任务：在长文档里塞一个特殊 fact，让模型找出来。这种训练有两个问题：
+
+1. **任务单一**：真实场景的长上下文需求多样得多，多跳推理、跨段对齐、表格 QA、代码理解都没在训练里
+2. **奖励异质**：不同任务的奖励量纲完全不同，混合训练时简单求和会让连续奖励主导
+
+GoLongRL 给出的答案是**先把能力切细，再用算法对齐**。
+
+## 核心贡献 1：9 种任务的能力分类法
+
+论文先列出长上下文场景里实际遇到的 9 类任务：
+
+| # | 任务类型 | 评估指标 | 数据来源 |
+| --- | --- | --- | --- |
+| 1 | 单文档 QA | EM / F1 | 真实文档 + 合成问题 |
+| 2 | 多文档 QA | EM / F1 | 多 PDF 拼接 + GPT-5 生成问题 |
+| 3 | 多跳推理 | Reasoning chain match | HotpotQA 变体 |
+| 4 | 时间排序 | Kendall tau | 新闻 / 历史文档 |
+| 5 | 跨段对齐 | BLEU + 语义相似度 | 学术论文段落对齐 |
+| 6 | 文档摘要 | ROUGE-L | 长论文 / 报告 |
+| 7 | 表格 + 文本 QA | 结构化 accuracy | 财报、科学论文 |
+| 8 | 代码理解 | 测试通过率 | 大型仓库 + 问题 |
+| 9 | 多轮对话理解 | LLM-as-judge | 长会话日志 |
+
+每个任务平均 2.5K 样本，总计 23K。这套分类的精度直接决定 RL 训练的有效性 —— 比起『一堆长文档 + 随机问题』，分类后能让模型在每个能力上分别收敛。
+
+## 核心贡献 2：TMN-Reweight 算法
+
+TMN-Reweight 全称是 Task-level Mean Normalization + Difficulty-adaptive Reweighting，解决两个问题：
+
+### 问题 1：奖励量纲不一
+
+任务 1 的 EM 是 0 或 1，任务 6 的 ROUGE-L 是 0-1 连续值，任务 8 的代码通过率也是 0-1 但分布偏高（多数 0.8 以上）。直接混在一起做 GRPO，连续奖励主导优化方向，离散奖励样本的梯度信号被淹没。
+
+TMN 的做法是先在每个任务 t 内统计奖励均值 `μ_t` 和方差 `σ_t`，再把奖励归一化为：
+
+```python
+normalized_reward = (raw_reward - mu_t) / sigma_t
+```
+
+归一化后所有任务的奖励都在零均值单位方差，9 个任务在 GRPO 里的『话语权』均等。
+
+### 问题 2：难度不平衡
+
+简单样本（模型已经会的）贡献正梯度但意义不大，难样本（模型卡壳的）才是 RL 的训练价值所在。GoLongRL 用模型对每个样本的回答正确率倒数衡量难度 d，给样本一个权重：
+
+```python
+weight = 1 + alpha * log(difficulty)
+```
+
+`alpha` 论文取 0.5。难样本权重 1.5-2.0，简单样本 1.0 左右，让训练资源向难样本倾斜。
+
+### 组合后的优势函数
+
+最终 GRPO 的 advantage 变成：
+
+```python
+A_t = weight * normalized_reward
+```
+
+听起来简单，但在多任务长上下文 RLVR 场景下这两个简单改动让 Qwen3-30B 增益 3.2 pp，对比 vanilla GRPO 优势明显。
+
+## 实测结果：30B 追平 235B
+
+论文用 Qwen3-30B-A3B（MoE 30B 模型，激活 3B）作为基模做 RL，对比对象包括 DeepSeek-R1-0528、Qwen3-235B-A22B-Thinking-2507（235B 思维链模型）等：
+
+| 模型 | LongBench v2 | BrowseComp-Long | LongMemEval |
+| --- | --- | --- | --- |
+| Qwen3-30B-A3B (基础) | 51.2% | 32.1% | 45.7% |
+| + GoLongRL | **58.7%** | **39.4%** | **53.2%** |
+| DeepSeek-R1-0528 | 60.1% | 41.8% | 54.6% |
+| Qwen3-235B-Thinking | 59.4% | 42.5% | 55.1% |
+
+读图重点：
+
+- 30B 基础模型 RL 后基本追平 235B 思维链
+- 部署成本只有后者 1/8（30B-A3B 推理峰值 12GB，235B 需要 4×A100）
+- 在多跳推理（BrowseComp-Long）上差距相对最大，说明纯参数量在世界知识 + 多跳推理上仍有不可替代价值
+
+## 哪些地方值得复用
+
+如果你在做长上下文相关的工作，至少有三件事可以直接借鉴：
+
+**1. 数据分类法可以直接拿来评测自家模型**
+
+23K 数据全部开源在 `xiaoxuanNLP/GoLongRL` repo 下，下载后跑一遍就能得到模型在 9 类长上下文能力上的能力雷达图。比起跑一个聚合分数，雷达图更能定位短板。
+
+**2. TMN-Reweight 可以加到现有 RL 框架**
+
+HuggingFace TRL 已经有 PR 把 TMN-Reweight 合并为可选 reward processor。你只需要在配置里加：
+
+```python
+reward_processor = TMNReweightProcessor(
+    task_label_key="task_type",
+    alpha=0.5,
+)
+```
+
+兼容现有 GRPO / PPO 训练循环。
+
+**3. 多任务 RLVR 的能力分类思路**
+
+哪怕你做的不是长上下文，多任务 RLVR 的『先分类、再归一化、再难度加权』方法论可以迁移到任何多技能模型训练里 —— 比如 coding agent 的多种工具调用、agent reasoning 的多种推理模式。
+
+## 几个值得继续追的问题
+
+论文也有未解之处：
+
+- **23K 数据规模是否最优？** 论文没做 data scaling 实验，更大数据集（100K 级）是否还有收益不明确
+- **`alpha = 0.5` 是经验值**，对其他模型（Llama / Mistral）是否需要调整未知
+- **9 类任务的边界模糊**，比如『时间排序』和『多跳推理』有重叠，未来工作可能需要更精细的分类
+
+## 总结
+
+GoLongRL 是 2026 年长上下文 RL 方向最务实的一篇开源工作。算法层面 TMN-Reweight 不复杂但很实用，数据层面 9 类任务的能力分类直接成为社区评测标准。对开源生态最大的贡献是：让 30B 量级的模型在长上下文场景下首次有了和 235B 思维模型一较高下的底气。
+
+接下来值得关注的方向是：
+
+1. 这套方法能否推广到多模态长上下文（图 + 文）
+2. TMN-Reweight 在 RLHF（带偏好的 RL）场景下是否同样有效
+3. 9 类任务分类是否会被进一步细分
+
+Sources:
+- [GoLongRL: Capability-Oriented Long Context RL - arXiv](https://arxiv.org/abs/2605.19577)
+- [xiaoxuanNLP/GoLongRL - GitHub](https://github.com/xiaoxuanNLP/GoLongRL)
+- [LongBench v2 评测说明](https://arxiv.org/abs/2412.15204)
