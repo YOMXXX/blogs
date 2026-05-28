@@ -1,0 +1,365 @@
+---
+title: "claude-context 实战：用语义搜索 MCP 让编码 Agent 精准定位百万行代码"
+description: "claude-context 是 Zilliz 开源的 MCP 插件，用 BM25 + 稠密向量混合检索为 Claude Code 等编码 Agent 添加语义代码搜索能力。本文从安装到 monorepo 实战，覆盖架构、索引策略、成本和踩坑。"
+column: "workshop"
+tags: ["claude-context", "MCP Server", "Semantic Search", "Coding Agent", "Zilliz", "Vector Database"]
+pubDate: 2026-05-28
+featured: false
+tldr: "claude-context 是 Zilliz 开发的 MCP 插件，给 Claude Code、Cursor、Windsurf 等编码 Agent 添加语义代码搜索能力。它用 BM25 + 稠密向量混合检索 + AST-aware chunking + Merkle-tree 增量索引，让 Agent 在百万行代码库里精准找到相关代码，实测减少 39.4% token 消耗、36.1% 工具调用。GitHub 一周涨 10.6K stars，本文从架构到 monorepo 实战全覆盖。"
+author: "YOMXXX"
+faq:
+  - q: "claude-context 和直接用 grep/ripgrep 搜代码有什么区别？"
+    a: "grep/ripgrep 只能精确匹配字符串，搜 authentication middleware 必须知道变量名叫 authMiddleware 才能找到。claude-context 用语义向量搜索，你搜「处理用户认证的中间件」就能命中 verifyJWT、authGuard 等语义相关的代码块，同时 BM25 分支保证精确标识符匹配不丢。两者是互补关系：grep 适合已知名字的精确查找，claude-context 适合不知道代码在哪、叫什么名字的探索式搜索。"
+  - q: "claude-context 支持哪些编码 Agent 和 IDE？"
+    a: "目前支持 Claude Code、Cursor、Windsurf、Cline、VS Code、Codex CLI、Gemini CLI、Qwen Code 等所有兼容 MCP 协议的客户端。安装方式统一：CLI 类工具用命令行一行安装，IDE 类工具在 MCP 配置文件中添加 JSON 配置。只要客户端支持 MCP stdio 传输协议，就能接入 claude-context。"
+  - q: "索引一个大型代码库需要多少时间和费用？"
+    a: "首次索引时间取决于代码量和嵌入提供商。5 万行代码库首次索引约 2-5 分钟，50 万行约 15-30 分钟。费用方面，用 OpenAI text-embedding-3-small 嵌入 50 万行代码约 0.5-1 美元；Zilliz Cloud 免费层可存 100 万向量，小型项目零存储成本。增量索引靠 Merkle-tree 检测变更，日常 git pull 后重建通常 5 秒内完成。"
+  - q: "claude-context 必须用云端向量数据库吗？能不能完全本地运行？"
+    a: "可以完全本地运行。向量数据库支持 Milvus 自建实例和 Zilliz Cloud 两种模式；嵌入模型可以选 Ollama 跑本地模型，不需要调用任何云端 API。本地方案的配置是设 EMBEDDING_PROVIDER=ollama、OLLAMA_HOST 指向本地 Ollama 服务、MILVUS_ADDRESS 指向本地 Milvus 实例。缺点是本地嵌入模型质量通常不如 OpenAI text-embedding-3-large，检索精度会有 5-10% 的差距。"
+  - q: "claude-context 有哪些已知的坑需要注意？"
+    a: "三个主要问题：第一，Milvus v2.5.7 存在 BM25 bug，需要关闭混合模式只用稠密向量搜索作为临时方案；第二，本地 snapshot 元数据可能过期，get_indexing_status 显示 0 files 0 chunks 不代表索引丢了，而是本地缓存过期；第三，多实例 stdio 模式下多个 MCP 进程可能争抢 sync lock，建议关闭 background sync 改用 trigger watcher 按需触发。"
+---
+
+> **💡 一句话总结**：claude-context 不是给 Agent 塞更多代码进 context window，而是让 Agent 像资深工程师一样 —— 不读完整个 repo，但总能找到最相关的那段代码。
+
+## 为什么编码 Agent 需要语义搜索
+
+当前编码 Agent 在大型代码库中查找代码，主要靠三种方式，每种都有致命缺陷：
+
+**方式一：读完整个 repo。** Claude Code 默认会用 `Read` 工具逐个打开文件。一个 50 万行的代码库，全部读入 context window 需要约 200 万 token。以 Claude Opus 4.7 的 $15/Mtok 输入价格算，光读一遍就要花 $30，而且很容易撞到上下文窗口上限。
+
+**方式二：猜文件路径。** Agent 根据命名惯例猜 `src/auth/middleware.ts`、`lib/utils/auth.js`。大概有一半概率猜对，另一半概率在错误的文件里浪费好几轮对话。
+
+**方式三：grep 关键字。** 用 `Grep` 或 `ripgrep` 搜精确字符串。问题是你必须知道变量叫什么名字。搜 `authentication middleware` 找不到命名为 `verifyJWT` 的函数，搜 `error handling` 找不到叫 `recoverPanic` 的 Go 代码。
+
+claude-context 提出的方案是第四种：**语义搜索**。Agent 用自然语言描述意图（「处理 JWT 令牌验证的中间件」），MCP Server 返回语义最相关的代码块 —— 不管它叫 `verifyJWT`、`authGuard` 还是 `tokenValidator`。
+
+实测数据：在等效检索质量下，claude-context 减少了 **39.4% 的 token 消耗**和 **36.1% 的工具调用次数**。这不是因为它更聪明，而是因为它让 Agent 第一次就找对了代码，不需要反复试错。
+
+## claude-context 架构剖析
+
+claude-context 的架构分两层：底层的 `@zilliz/claude-context-core` 引擎和上层的 MCP 接口。
+
+### 混合检索：BM25 + 稠密向量
+
+纯向量搜索对代码有一个致命弱点：**精确标识符匹配不稳定**。你搜 `parseJSON`，向量搜索可能返回语义相近但名字完全不同的 `decodePayload`。反过来，纯 BM25（关键词频率排序）无法理解语义，搜「错误恢复逻辑」找不到 `gracefulShutdown`。
+
+claude-context 用 Milvus 的混合搜索能力，同时跑两条检索管线：
+
+```
+查询 "JWT token validation middleware"
+        │
+        ├── BM25 (稀疏) ──→ 精确匹配 "JWT", "token", "validation"
+        │                    命中: verifyJWT(), validateToken()
+        │
+        └── Dense Vector (稠密) ──→ 语义相似度
+                                    命中: authGuard(), checkBearerToken()
+        │
+        └── Rerank & Merge ──→ 合并排序，返回 Top-K
+```
+
+两条管线的结果通过加权融合（reciprocal rank fusion）合并，兼顾精确匹配和语义理解。
+
+### AST-Aware Chunking：按语法结构切分
+
+把代码按固定字符数切分（比如每 500 字符一块）会破坏函数和类的完整性。claude-context 用 tree-sitter 做 AST 解析，按**语法结构**切分：
+
+- 一个完整的函数定义是一个 chunk
+- 一个类/接口声明是一个 chunk
+- import 区域和模块级常量各自成 chunk
+
+如果某个语言没有 tree-sitter 支持，自动退化到 LangChain 的字符级切分。
+
+当前支持 AST 解析的语言：TypeScript、JavaScript、Python、Java、C++、C#、Go、Rust、PHP、Ruby、Swift、Kotlin、Scala、Markdown，共 14 种。
+
+### Merkle-Tree 增量索引
+
+首次索引需要处理整个代码库，但日常开发中每次 `git pull` 只改了几个文件。claude-context 用 Merkle tree 做变更检测：
+
+1. 每个文件计算内容哈希
+2. 目录级别聚合为 Merkle tree
+3. 下次索引时只比较 tree root hash，快速定位变更文件
+4. 只对变更文件重新 chunk、embedding、写入向量数据库
+
+实测效果：5 万行代码库，`git pull` 后增量重建通常在 **5 秒内**完成。
+
+### MCP 工具接口
+
+claude-context 暴露四个 MCP 工具：
+
+| 工具 | 作用 | 关键参数 |
+| --- | --- | --- |
+| `index_codebase` | 索引代码目录 | `path`（必填）、`force`、`splitter`（ast/langchain）、`ignorePatterns` |
+| `search_code` | 语义搜索 | `path`（必填）、`query`（必填）、`limit`（默认 10，最大 50）、`extensionFilter` |
+| `clear_index` | 清除索引 | `path`（必填） |
+| `get_indexing_status` | 查看索引进度 | 按绝对路径追踪，进度是阶段制而非文件计数 |
+
+## 三步安装
+
+### 前置条件
+
+- Node.js &gt;= 20.0.0
+- 一个嵌入 API Key（OpenAI / VoyageAI / Gemini / Ollama 任选）
+- 一个向量数据库（Zilliz Cloud 免费层或自建 Milvus）
+
+### Claude Code 安装（推荐）
+
+一行命令搞定：
+
+```bash
+claude mcp add claude-context \
+  -e OPENAI_API_KEY=sk-your-openai-api-key \
+  -e MILVUS_ADDRESS=https://your-endpoint.zillizcloud.com \
+  -e MILVUS_TOKEN=your-zilliz-cloud-api-key \
+  -- npx @zilliz/claude-context-mcp@latest
+```
+
+安装后重启 Claude Code，输入 `/mcp` 确认 `claude-context` 状态为 `connected`。
+
+### Cursor / Windsurf / VS Code 安装
+
+在 MCP 配置文件中添加（Cursor 是 `~/.cursor/mcp.json`，VS Code 是 `.vscode/mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "claude-context": {
+      "command": "npx",
+      "args": ["-y", "@zilliz/claude-context-mcp@latest"],
+      "env": {
+        "OPENAI_API_KEY": "sk-your-openai-api-key",
+        "MILVUS_ADDRESS": "https://your-endpoint.zillizcloud.com",
+        "MILVUS_TOKEN": "your-zilliz-cloud-api-key"
+      }
+    }
+  }
+}
+```
+
+### Codex CLI 安装
+
+在 `codex.toml` 中添加：
+
+```toml
+[mcp_servers.claude-context]
+command = "npx"
+args = ["-y", "@zilliz/claude-context-mcp@latest"]
+startup_timeout_ms = 30000
+
+[mcp_servers.claude-context.env]
+OPENAI_API_KEY = "sk-your-openai-api-key"
+MILVUS_ADDRESS = "https://your-endpoint.zillizcloud.com"
+MILVUS_TOKEN = "your-zilliz-cloud-api-key"
+```
+
+### 全本地方案（无云端依赖）
+
+如果不想把代码发到云端，可以全部跑在本地：
+
+```bash
+claude mcp add claude-context \
+  -e EMBEDDING_PROVIDER=ollama \
+  -e OLLAMA_HOST=http://127.0.0.1:11434 \
+  -e EMBEDDING_MODEL=nomic-embed-text \
+  -e MILVUS_ADDRESS=http://localhost:19530 \
+  -- npx @zilliz/claude-context-mcp@latest
+```
+
+前提是本地跑了 Ollama（嵌入模型）和 Milvus（向量数据库）。
+
+## 实战：在 monorepo 中搜索代码
+
+假设你有一个 30 万行的 TypeScript monorepo，目录结构：
+
+```
+my-monorepo/
+├── packages/
+│   ├── api-gateway/     # Express + tRPC
+│   ├── auth-service/    # JWT + OAuth
+│   ├── billing/         # Stripe integration
+│   ├── shared/          # 公共工具库
+│   └── web-app/         # Next.js 前端
+├── infra/               # Terraform + K8s
+└── scripts/             # CI/CD 脚本
+```
+
+### Step 1: 索引代码库
+
+在 Claude Code 中直接让 Agent 索引：
+
+```
+> 帮我索引当前项目的代码库
+```
+
+Agent 会自动调用 `index_codebase`，传入当前工作目录的绝对路径。你也可以手动指定忽略模式：
+
+```
+> 索引当前代码库，忽略 node_modules、dist、.next、coverage 目录
+```
+
+首次索引 30 万行代码大约需要 10-15 分钟（取决于嵌入 API 的速率限制）。可以用 `get_indexing_status` 查看进度。
+
+### Step 2: 语义搜索 vs grep 对比
+
+**场景：找到所有处理支付失败重试的逻辑。**
+
+用 grep：
+
+```bash
+grep -rn "retry" packages/billing/
+# 结果：67 行匹配，包括 retry 按钮的 UI 文本、retry 队列的配置注释、
+# 跟支付无关的 HTTP retry interceptor……噪音极大
+```
+
+用 claude-context：
+
+```
+> 搜索处理支付失败后自动重试的业务逻辑
+```
+
+Agent 调用 `search_code`，返回的 Top 5 结果：
+
+1. `packages/billing/src/services/payment-retry.service.ts` — `retryFailedPayment()` 函数，包含指数退避和最大重试次数
+2. `packages/billing/src/workers/retry-queue.worker.ts` — 消费 retry 队列的 worker
+3. `packages/billing/src/events/payment-failed.handler.ts` — 支付失败事件的处理器，决定是否入队重试
+4. `packages/shared/src/utils/backoff.ts` — 公共退避算法工具
+5. `packages/api-gateway/src/middleware/idempotency.ts` — 幂等键中间件，防止重试导致重复扣款
+
+注意第 4 和第 5 条结果 —— 它们不在 `billing` 目录下，grep 加路径过滤根本找不到，但它们和「支付重试」在语义上高度相关。
+
+### Step 3: 结合搜索结果修改代码
+
+```
+> 支付重试目前是固定 3 次，我想改成可配置的，从环境变量读取最大重试次数。
+> 帮我找到所有硬编码了重试次数的地方并修改。
+```
+
+Agent 会先调用 `search_code` 搜索「硬编码重试次数」，找到所有相关代码块，然后精准修改 —— 不需要你告诉它文件在哪里。
+
+### 自动触发重建索引
+
+在 Claude Code 中配置 PostToolUse hook，每次 Agent 修改文件后自动触发增量索引：
+
+```bash
+# 在 .claude/settings.json 中添加
+touch ~/.context/.sync-trigger
+```
+
+claude-context 内置 file watcher，监听 `~/.context/.sync-trigger` 文件的修改时间戳，检测到变化后有 2 秒去抖窗口，然后启动增量同步。
+
+## 索引策略与成本估算
+
+### 嵌入 API 费用
+
+| 嵌入模型 | 价格 | 10 万行代码估算 | 特点 |
+| --- | --- | --- | --- |
+| OpenAI text-embedding-3-small | $0.02/Mtok | ~$0.10 | 性价比最高，推荐默认 |
+| OpenAI text-embedding-3-large | $0.13/Mtok | ~$0.65 | 精度更高，大型 repo 推荐 |
+| VoyageAI voyage-code-3 | $0.06/Mtok | ~$0.30 | 代码专用嵌入，召回率最佳 |
+| Ollama nomic-embed-text | 免费（本地） | $0 | 需要 GPU，精度略低 |
+
+### 向量存储费用
+
+- **Zilliz Cloud 免费层**：100 万向量，足够 50 万行以下的代码库
+- **Zilliz Cloud 标准层**：$0.06/GB/月，50 万行代码约 2GB 存储，月费 ~$0.12
+- **自建 Milvus**：只需服务器成本，无额外费用
+
+### 索引时间参考
+
+| 代码规模 | 首次索引 | 增量重建 |
+| --- | --- | --- |
+| 1 万行 | 30 秒 - 1 分钟 | &lt;2 秒 |
+| 5 万行 | 2 - 5 分钟 | &lt;5 秒 |
+| 50 万行 | 15 - 30 分钟 | &lt;10 秒 |
+| 100 万行 | 45 - 90 分钟 | &lt;15 秒 |
+
+增量重建的速度优势非常明显 —— 这是 Merkle-tree 变更检测的核心价值。
+
+## 与 grep / ripgrep / tree-sitter 对比
+
+| 维度 | grep / ripgrep | tree-sitter 查询 | claude-context |
+| --- | --- | --- | --- |
+| 搜索方式 | 正则精确匹配 | AST 模式匹配 | BM25 + 语义向量混合 |
+| 能否语义搜索 | 不能 | 不能 | 能 |
+| 需要知道标识符名称 | 是 | 是 | 否 |
+| 跨文件关联 | 不能 | 有限 | 能（通过语义相似度） |
+| 索引成本 | 零 | 零 | 嵌入 API + 向量存储 |
+| 适用场景 | 已知名字的精确查找 | 结构化代码分析 | 探索式搜索、大规模代码理解 |
+| 延迟 | &lt;100ms | &lt;200ms | 500ms - 2s（含网络） |
+| 离线能力 | 完全离线 | 完全离线 | 可离线（Ollama + 本地 Milvus） |
+
+**结论**：三者不是替代关系，而是互补。grep 是「我知道叫什么，告诉我在哪」；tree-sitter 是「我知道结构，给我匹配的节点」；claude-context 是「我知道要做什么，帮我找相关代码」。
+
+## 高级配置
+
+### 自定义文件类型
+
+默认只索引已知语言的文件。如果项目包含 `.vue`、`.svelte`、`.astro` 等模板文件，需要手动添加：
+
+```bash
+claude mcp add claude-context \
+  -e OPENAI_API_KEY=sk-xxx \
+  -e MILVUS_TOKEN=xxx \
+  -e CUSTOM_EXTENSIONS=".vue,.svelte,.astro,.mdx" \
+  -- npx @zilliz/claude-context-mcp@latest
+```
+
+或在 `index_codebase` 调用时传 `customExtensions` 参数。
+
+### 自定义忽略规则
+
+```bash
+-e CUSTOM_IGNORE_PATTERNS="*.generated.ts,*.test.ts,dist/**,coverage/**"
+```
+
+环境变量和工具参数中的忽略规则会合并生效。
+
+### 调整嵌入批量大小
+
+默认每批 100 个 chunk 调一次嵌入 API。如果遇到 rate limit，可以降低：
+
+```bash
+-e EMBEDDING_BATCH_SIZE=50
+```
+
+### 后台同步配置
+
+```bash
+# 关闭后台定时同步（多实例场景推荐）
+-e CLAUDE_CONTEXT_BACKGROUND_SYNC=false
+# 只靠 trigger watcher 按需触发
+-e CLAUDE_CONTEXT_TRIGGER_WATCHER=true
+```
+
+## 已知限制和踩坑
+
+### 1. Milvus v2.5.7 BM25 Bug
+
+Milvus v2.5.7 存在一个 BM25 相关的 bug，会导致混合搜索结果异常。临时方案是降级到 v2.5.6 或禁用混合模式只用稠密向量搜索。Zilliz Cloud 用户不受影响，因为云端版本已经修复。
+
+### 2. 本地 Snapshot 元数据过期
+
+运行 `get_indexing_status` 看到「0 files, 0 chunks」时，不要慌 —— 这通常不是索引丢了，而是本地 snapshot 元数据缓存过期。索引数据实际存在向量数据库里，重新运行 `index_codebase` 会触发增量同步，不需要全量重建。
+
+### 3. 多实例 Sync Lock 争抢
+
+如果同时开了多个 Claude Code 窗口（或多个 MCP 客户端），它们共享同一个 home 目录下的 sync lock。多个进程争抢 lock 可能导致同步延迟。建议：
+
+- 关闭后台同步（`CLAUDE_CONTEXT_BACKGROUND_SYNC=false`）
+- 只依赖 trigger watcher（`CLAUDE_CONTEXT_TRIGGER_WATCHER=true`）
+
+### 4. 符号链接和多克隆
+
+claude-context 按**绝对路径**区分代码库。如果你用符号链接或 git worktree 在不同路径打开同一个 repo，会被当作两个独立的代码库分别索引。解决方法是确保所有客户端用同一个绝对路径访问代码库。
+
+### 5. 进度报告跳跃
+
+`get_indexing_status` 的进度是阶段制（parsing → chunking → embedding → writing），不是文件计数百分比。在大型 repo 上可能看到进度从 20% 突然跳到 80%（因为 embedding 阶段是批量处理的），这是正常行为。
+
+## 总结
+
+claude-context 解决的核心问题很简单：**让编码 Agent 不再需要读完整个代码库才能找到相关代码**。它的价值不在于搜索本身有多花哨，而在于把「Agent 在大型 repo 中的盲目探索」变成了「基于语义的精准定位」。
+
+GitHub 一周从零涨到 11.6K stars 说明了开发者社区的真实需求。当 Agent 能力越来越强、处理的代码库越来越大时，context retrieval 的质量就成了瓶颈。claude-context 用 MCP 做接口、Milvus 做存储、AST + 混合检索做引擎，给出了一个工程上可落地的答案。
+
+如果你的日常工作涉及 10 万行以上的代码库，特别是 monorepo 场景，claude-context 值得花 5 分钟装上试一试。token 消耗降 40% 带来的成本节省，可能比你想象的更可观。

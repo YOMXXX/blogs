@@ -1,0 +1,230 @@
+---
+title: "SkillOpt 论文速读：微软把梯度下降搬到了 skill.md，52 场全胜"
+description: "微软 SkillOpt 把 skill 文档当可训练状态，结构化编辑加验证门控做 text-space 优化，52 个评测格全胜，部署只需一个 markdown。"
+column: "paper"
+tags: ["SkillOpt", "Microsoft Research", "Agent Skills", "Text-Space Optimization", "Prompt Engineering", "arXiv 2605"]
+pubDate: 2026-05-28
+featured: false
+tldr: "SkillOpt 是微软提出的首个系统化 text-space optimizer：frozen agent 跑 scored batch，optimizer model 提出结构化编辑（add/delete/replace），只在 validation score 提升时接受。配合 learning-rate budget、rejected-edit buffer、slow/meta update，52 个评测格全部最优。部署产物是一个 best_skill.md，无需模型修改。"
+author: "YOMXXX"
+faq:
+  - q: "SkillOpt 和传统 prompt engineering 有什么本质区别？"
+    a: "传统 prompt engineering 依赖人工试错或一次性 LLM 生成，没有系统化的反馈循环。SkillOpt 把 skill 当作可训练的外部状态，引入 epoch、batch、learning rate、validation gate 等深度学习训练范式，通过多轮迭代和验证门控来收敛到最优 skill。核心差异在于：传统方法是开环的（写完就用），SkillOpt 是闭环的（写、跑、评、改、验证，循环直到收敛）。"
+  - q: "SkillOpt 的 textual learning-rate budget 具体怎么工作？"
+    a: "textual learning-rate 是一个编辑量预算，限制 optimizer 每一步能对 skill 文档做多少修改。论文默认 lr=4，意味着每步最多 4 条 add/delete/replace 操作。这防止 optimizer 在某一步做大规模重写，把之前积累的有效规则覆盖掉。消融实验显示去掉 learning-rate 后 SearchQA 降 2.5 pp、LiveMath 降 4.0 pp，说明控制编辑粒度对训练稳定性很关键。"
+  - q: "52 场全胜的实验设置具体是怎样的？"
+    a: "实验覆盖 6 个 benchmark（SearchQA、SpreadsheetBench、Office、DocVQA、LiveMath、ALFWorld）、7 个 target model（GPT-5.5/5.4/5.4-mini/5.4-nano/5.2、Qwen3.5-4B、Qwen3.6-35B-A3B）、3 个 execution harness（direct chat、Codex、Claude Code）。每个 (model, benchmark, harness) 组合是一个 cell，SkillOpt 在全部 52 个 cell 上都达到最优或并列最优，对比基线包括 human skills、one-shot LLM skills、Trace2Skill、TextGrad、GEPA、EvoSkill。"
+  - q: "SkillOpt 优化出的 skill 能跨模型、跨 harness 迁移吗？"
+    a: "可以。论文做了三组迁移实验：(1) 跨模型：GPT-5.4 上训练的 LiveMath skill 直接给 GPT-5.4-nano 用，提升 15.2 pp；(2) 跨 harness：Codex 上训练的 SpreadsheetBench skill 迁移到 Claude Code，提升 31.8 pp；(3) 自优化：GPT-5.4-nano 同时当 target 和 optimizer，SpreadsheetBench 上也提升了 10.4 pp。这说明 SkillOpt 学到的不是针对特定模型的 trick，而是任务级别的通用策略。"
+  - q: "部署 SkillOpt 优化出的 skill 需要额外的推理成本吗？"
+    a: "不需要。SkillOpt 的训练阶段需要 optimizer model 和 target model 交互，但训练完成后部署产物只有一个 best_skill.md 文件（300-2000 tokens）。这个文件直接作为 system prompt 或工具描述注入 frozen agent，不需要额外的模型调用、不需要修改模型权重、不需要 optimizer 在线参与。推理成本只增加了 skill 文档对应的 token 数，可以忽略不计。"
+---
+
+> **💡 一句话总结**：SkillOpt 把 agent skill 文档当神经网络权重来训练——有 epoch、有 learning rate、有 validation gate——在 52 个评测格全部最优，部署时只需往 prompt 里塞一个 markdown 文件。
+
+## 论文基本信息
+
+- **标题**：SkillOpt: Executive Strategy for Self-Evolving Agent Skills
+- **arXiv**：[2605.23904](https://arxiv.org/abs/2605.23904)，2026 年 5 月 22 日提交，5 月 25 日 v2
+- **作者**：Yifan Yang 等 15 位，Microsoft Research
+- **代码**：[github.com/microsoft/SkillOpt](https://github.com/microsoft/SkillOpt)，MIT 开源，1.2K+ stars
+- **项目页**：[microsoft.github.io/SkillOpt](https://microsoft.github.io/SkillOpt)
+- **关键词**：text-space optimization、agent skills、validation-gated editing、prompt optimization
+
+## 核心问题：为什么 skill 需要系统化优化
+
+现在的 agent 框架普遍用 skill 文档（一段 markdown 或 system prompt）来引导模型行为。但这些 skill 的产生方式存在三个层次的问题：
+
+**手写 skill**：依赖专家经验，迭代效率低。一个人写的 ALFWorld 导航规则可能漏掉「搜索失败后扩大范围」这种靠大量 rollout 才能发现的边界条件。
+
+**一次性 LLM 生成**：让 GPT-5 读几个示例后一次性生成 skill，虽然比手写快，但生成质量严重依赖示例选择，且没有任何反馈机制——生成完就定稿，跑得好不好全靠运气。
+
+**松散自迭代**：一些工作（如 Trace2Skill、EvoSkill）尝试让 LLM 根据执行结果修改 skill，但缺乏系统化约束——没有编辑量控制（一次大改可能把好规则也删了）、没有验证门控（改完不验证直接用）、没有失败记忆（同一个无效编辑可能被反复尝试）。
+
+SkillOpt 的核心洞察是：**skill 应该被当作 frozen agent 的外部状态来训练，像 weight-space optimization 一样有纪律**。这个类比非常精确——深度学习训练有 learning rate 控制步长、有 validation set 防过拟合、有 gradient accumulation 稳定更新，text-space 的 skill 优化同样需要这些机制。
+
+## 方法详解：text-space optimization 的五个关键设计
+
+SkillOpt 的工作流程是一个四阶段循环：Rollout → Reflect → Edit → Gate。五个关键设计让这个循环具备了深度学习训练的稳定性。
+
+### 设计 1：Rollout + Scored Batch
+
+Target model（frozen，不修改权重）使用当前 skill 执行一批任务，记录完整的 messages、tool calls、verifier feedback、task metadata 和 final scores。成功和失败的 rollout 被分开处理——这一步对应深度学习里的 forward pass + loss computation。
+
+### 设计 2：结构化编辑（add/delete/replace）
+
+Optimizer model（独立于 target model 的另一个 LLM）分析 rollout 结果后，提出对 skill 文档的结构化编辑。编辑只有三种操作：
+
+- **add**：在 skill 文档中新增一条规则
+- **delete**：移除一条已有规则
+- **replace**：用新版本替换一条已有规则
+
+这三种操作对应的是对 skill 文档的原子修改。论文特意不允许「整体重写」——你不能一次性把整个 skill 文档替换掉，只能做局部编辑。
+
+### 设计 3：Textual Learning-Rate Budget
+
+每一步的编辑量受 learning-rate budget 约束。论文默认 `lr=4`，意味着每步最多 4 条 add/delete/replace 操作。这个设计直接类比神经网络的 learning rate：
+
+- **lr 太大**：一次改太多，可能把之前积累的有效规则覆盖掉
+- **lr 太小**：收敛太慢，需要更多 epoch
+- **lr=4**：实验中的平衡点
+
+消融实验的数据很有说服力：去掉 learning-rate budget 后，SpreadsheetBench 从 77.5% 降到 75.7%，LiveMath 从 61.3% 降到 57.3%。4 个百分点的差距说明**控制编辑粒度对训练稳定性非常关键**。
+
+### 设计 4：Rejected-Edit Buffer
+
+被 validation gate 拒绝的编辑不会被丢弃，而是存入 rejected-edit buffer。下一轮 optimizer 在提出新编辑时能看到「哪些修改已经被试过但失败了」，避免重复提出相同的无效编辑。
+
+这对应深度学习中的 momentum / gradient history——优化器需要记住之前的优化轨迹。消融实验显示去掉 rejected buffer 后 SpreadsheetBench 降 4.6 pp，效果显著。
+
+### 设计 5：Epoch-wise Slow Update + Meta Skill
+
+除了每一步的快速编辑，SkillOpt 还有两个更慢节奏的更新机制：
+
+- **Slow update**：每个 epoch 结束时，optimizer 综合整个 epoch 的 rollout 做一次全局审视，更新 skill。论文在 ALFWorld 实验中展示了一个典型案例——Step 3 的快速编辑让 skill 退化，但 Epoch 3 的 slow update「救回」了性能，从 68.6% 拉到 81.4%
+- **Meta skill**：optimizer 侧的记忆，记录跨 epoch 的优化经验。关键点在于 meta skill 只存在于训练阶段，**不增加部署成本**
+
+消融实验里这两个组件的效果最显著：去掉 slow update 和 meta skill 后，SpreadsheetBench 从 77.5% 暴跌到 55.0%，降了 22.5 pp。
+
+## 实验结果：52 场全胜的分析
+
+SkillOpt 的实验设置覆盖面极广：
+
+| 维度 | 具体内容 |
+| --- | --- |
+| Benchmark（6 个） | SearchQA、SpreadsheetBench、Office、DocVQA、LiveMath、ALFWorld |
+| Target Model（7 个） | GPT-5.5、GPT-5.4、GPT-5.4-mini、GPT-5.4-nano、GPT-5.2、Qwen3.5-4B、Qwen3.6-35B-A3B |
+| Execution Harness（3 个） | Direct chat、Codex、Claude Code |
+| 对比基线 | Human skills、One-shot LLM skills、Trace2Skill、TextGrad、GEPA、EvoSkill |
+
+在全部 52 个 (model, benchmark, harness) cell 上，SkillOpt 都达到最优或并列最优。几组关键数据：
+
+### GPT-5.5 的提升幅度
+
+| Harness | SearchQA | SpreadsheetBench | Office | DocVQA | LiveMath | ALFWorld | 平均 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Direct chat | +9.6 | +38.9 | +39.0 | +12.4 | +29.3 | +11.9 | **+23.5** |
+| Codex | +5.5 | +57.5 | +12.8 | +5.0 | +28.0 | N/A | **+21.8** |
+| Claude Code | +4.0 | +58.3 | +13.9 | +3.5 | +13.3 | N/A | **+18.6** |
+
+SpreadsheetBench 上的增益最夸张：在 Codex 和 Claude Code 环境下分别提升了 57.5 和 58.3 个百分点。这说明复杂的表格操作类任务特别受益于系统化的 skill 优化——agent 需要精确的步骤规则，而这些规则很难一次性手写正确。
+
+### 小模型上的效果
+
+值得注意的是 GPT-5.4-nano 的表现：Direct chat 平均提升 +24.9 pp，甚至超过了 GPT-5.5 的 +23.5 pp。其中 DocVQA 上提升了 49.4 pp，ALFWorld 提升了 35.1 pp。这说明**小模型从好的 skill 中获益更大**——大模型可能靠自身能力「内化」部分 skill 知识，小模型更依赖外部指令引导。
+
+Qwen3.5-4B（4B 参数）在 ALFWorld 上提升了 50.7 pp，进一步验证了这一点：模型越小，skill 的边际价值越大。
+
+### ALFWorld 的进化轨迹
+
+论文详细展示了 ALFWorld 实验的训练过程：
+
+1. **初始 skill**：模型 test hard 准确率 70.9%
+2. **Step 1-2**：快速编辑逐步加入搜索策略规则，selection score 上升
+3. **Step 3**：快速编辑导致 skill 退化，但 Epoch 3 的 slow update 救回——train rollout 80.0%，selection gate 81.4%
+4. **最终**：test hard 准确率提升到 **85.8%**，净增 14.9 pp
+
+学到的关键规则包括：「搜索失败后扩大搜索范围」「严格追踪已搜索过的位置」——这些都是需要大量 rollout 才能发现的边界条件，手写 skill 几乎不可能覆盖到。
+
+## 迁移性实验
+
+SkillOpt 的迁移性实验回答了三个关键问题：
+
+### 跨模型迁移
+
+GPT-5.4 上训练的 LiveMath skill 直接给 GPT-5.4-nano 用，提升了 **15.2 pp**。这意味着你可以用一个模型训练 skill，然后部署到另一个成本更低的模型上——训练开销只需要付一次。
+
+### 跨 Harness 迁移
+
+在 Codex 环境中训练的 SpreadsheetBench skill 迁移到 Claude Code 环境，提升了 **31.8 pp**。Codex 和 Claude Code 是两个完全不同的 agentic 执行环境（不同的工具调用协议、不同的执行沙箱），skill 依然有效，说明 SkillOpt 学到的是**任务级别的策略**而非 harness 特定的 trick。
+
+### 自优化
+
+GPT-5.4-nano 同时当 target model 和 optimizer model，在 SpreadsheetBench 上也提升了 **10.4 pp**。论文特别强调这说明 SkillOpt 的循环「不仅仅是从强模型蒸馏知识」——即使 optimizer 和 target 是同一个模型，结构化的 edit-validate 循环本身就能发现有价值的编辑。
+
+## 工程意义：这改变了什么
+
+SkillOpt 对实际工程的影响可以从三个层面理解：
+
+### 部署成本为零
+
+训练阶段需要 optimizer model + target model 的交互，但训练完成后的部署产物只有一个 `best_skill.md` 文件（300-2000 tokens）。这个文件直接作为 system prompt 或工具描述注入 frozen agent：
+
+```markdown
+# best_skill.md (示意)
+
+## 搜索策略
+1. 首次搜索失败后，扩大关键词范围重试
+2. 严格维护已搜索位置列表，避免重复搜索
+3. 超过 3 次搜索失败时切换搜索策略
+
+## 结果验证
+1. 每步操作后验证环境状态是否符合预期
+2. 发现状态不一致时立即回退上一步
+...
+```
+
+没有额外的模型调用，没有 optimizer 在线参与，推理成本只增加了几百个 token 的 prompt 长度。
+
+### 开发范式转变
+
+以前的 prompt 优化是手艺活——写一版、跑一跑、凭感觉改、再跑。SkillOpt 把它变成了工程流程：
+
+```bash
+# 准备数据
+mkdir -p data/my_task/{train,val,test}
+
+# 训练 skill（类似训练模型）
+python scripts/train.py --config configs/my_task.yaml \
+  --optimizer_model gpt-5.5 \
+  --target_model gpt-5.4-mini \
+  --epochs 5 --batch_size 16 --lr 4
+
+# 部署（拿到 best_skill.md 就完事）
+cp outputs/my_task/best_skill.md production/skills/
+```
+
+这个流程和训练神经网络几乎同构：准备数据 → 配置超参 → 训练 → 拿最佳 checkpoint 部署。团队不再需要「prompt 工程师」的个人经验，而是用数据和验证来驱动 skill 的改进。
+
+### 与现有 agent 框架兼容
+
+SkillOpt 不需要修改任何 agent 框架的代码。无论你用的是 Codex、Claude Code、还是自建的 agentic loop，只需要在 system prompt 里加上 `best_skill.md` 的内容。论文已经在三个截然不同的 harness 上验证了这一点。
+
+## 和已有工作的对比
+
+| 方法 | 编辑方式 | 验证门控 | 编辑量控制 | 失败记忆 | 52 cell 胜率 |
+| --- | --- | --- | --- | --- | --- |
+| Human skill | 手写 | 无 | 无 | 无 | 0/52 |
+| One-shot LLM | 一次生成 | 无 | 无 | 无 | 0/52 |
+| TextGrad | 梯度式文本编辑 | 无 | 无 | 无 | 部分 |
+| Trace2Skill | 轨迹提炼 | 无 | 无 | 无 | 部分 |
+| EvoSkill | 进化搜索 | 无 | 无 | 无 | 部分 |
+| **SkillOpt** | 结构化 add/delete/replace | **validation gate** | **lr budget** | **rejected buffer** | **52/52** |
+
+SkillOpt 赢在系统化——不是某一个组件特别创新，而是把深度学习训练的工程纪律完整搬到了 text-space：控制步长、记住失败、验证才接受、多尺度更新。每个组件单独看都不复杂，组合起来效果碾压。
+
+## 几个值得继续追的问题
+
+论文也有未解之处：
+
+- **训练成本**：每次 rollout 都需要 target model 执行完整任务，在 SpreadsheetBench 这种需要多步工具调用的 benchmark 上，训练一轮的 API 调用量不小。论文没有给出具体的训练成本数据
+- **Optimizer model 的选择**：论文主要用 GPT-5.5 作为 optimizer，更小的 optimizer 是否够用、不同 optimizer 之间的效果差异有多大，没有系统评测
+- **Skill 长度上限**：部署产物是 300-2000 tokens，但随着任务复杂度增加，skill 是否需要更长？更长的 skill 是否会导致模型 attention 分散？
+- **多任务 skill**：目前每个 benchmark 训练一个 skill，能否训练一个通用 skill 覆盖多个任务？
+
+## 总结
+
+SkillOpt 的核心贡献不在于某个算法突破，而在于**建立了 text-space optimization 的工程范式**。它证明了：只要引入训练循环该有的纪律——控制步长、记住失败、验证才接受、多尺度更新——skill 文档的优化也能做到和权重优化一样可靠。
+
+52 个评测格全胜是结果，方法论才是价值所在：
+
+1. **Skill 是 frozen agent 的可训练外部状态**，不是一次性产物
+2. **Text-space 优化需要深度学习训练的工程纪律**，不能靠 LLM 自由发挥
+3. **部署产物是一个 markdown 文件**，训练多贵都不影响推理成本
+
+如果你在做 agent 相关的工作，SkillOpt 的代码已经 MIT 开源。建议从自己业务的一个任务开始试——准备好 train/val/test 数据集，跑一轮训练，看看 `best_skill.md` 里学出了什么。大概率你会发现一些自己手写时完全想不到的规则。
+
+Sources:
+- [SkillOpt: Executive Strategy for Self-Evolving Agent Skills - arXiv](https://arxiv.org/abs/2605.23904)
+- [microsoft/SkillOpt - GitHub](https://github.com/microsoft/SkillOpt)
+- [SkillOpt Project Page](https://microsoft.github.io/SkillOpt)
