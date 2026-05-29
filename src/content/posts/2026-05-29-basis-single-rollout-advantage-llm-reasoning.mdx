@@ -1,0 +1,265 @@
+---
+title: "BASIS 论文精读：单样本 RL 也能高效训练推理型 LLM"
+description: "BASIS 利用 batch 内跨 prompt 信息共享，让单样本 RL 的优势估计精度超过 8 样本 GRPO，将 RLVR 训练采样开销降低 8 倍且几乎不损失性能。"
+column: "paper"
+tags: ["BASIS", "Reinforcement Learning", "LLM Reasoning", "GRPO", "Advantage Estimation", "RLVR"]
+pubDate: 2026-05-29
+featured: false
+tldr: "BASIS（Batchwise Advantage Estimation from Single-Rollout Information Sharing）是 2026 年 5 月 26 日发布在 arXiv 的 critic-free 后训练方法。核心思路是每个 prompt 只采一条推理轨迹（单样本，省计算），但通过 batch 内跨 prompt 的信息共享来改进价值函数估计。实验表明，单样本 BASIS 的价值估计 MSE 比 REINFORCE++ 降低 69%，甚至低于 8 样本 GRPO 的 group mean 估计器，训练耗时大幅减少且性能接近多样本基线。"
+author: "YOMXXX"
+faq:
+  - q: "BASIS 和 GRPO 的根本区别是什么？"
+    a: "GRPO 对每个 prompt 采样多条（通常 8 条以上）推理轨迹，用组内均值做基线来估计优势函数，计算量大但估计相对准确。BASIS 每个 prompt 只采一条轨迹，但把 batch 内所有 prompt 的 rollout 信息共享起来构建全局价值估计，用一条轨迹的计算成本换取了接近多条轨迹的估计精度。"
+  - q: "什么是 critic-free 方法？和 PPO 等有 critic 的方法有何区别？"
+    a: "critic-free 方法不需要额外训练一个价值网络（critic）来估计优势函数，而是通过统计技巧（如组内均值、batch 信息共享）直接从采样奖励中计算优势。PPO 需要同时训练策略网络和价值网络，显存占用翻倍，且价值网络本身的训练也可能不稳定。BASIS、GRPO、REINFORCE++ 都属于 critic-free 路线。"
+  - q: "BASIS 的信息共享机制具体是怎么工作的？"
+    a: "BASIS 观察到同一个 batch 里不同 prompt 的奖励信号包含了全局训练状态的信息。它利用 batch 内所有 prompt 的奖励和轨迹特征，构建一个跨 prompt 的价值函数估计器，让每个 prompt 不只依赖自己那一条轨迹的奖励，还能从其他 prompt 的结果中借鉴信息。这类似于统计学中的经验贝叶斯方法——用全局数据改进局部估计。"
+  - q: "价值估计 MSE 降低 69% 对实际训练有什么影响？"
+    a: "价值估计的精度直接决定了策略梯度的信噪比。MSE 降低 69% 意味着梯度中的噪声大幅减少，策略更新方向更准确。实际训练表现为：收敛速度更快、训练曲线更平滑、最终性能更稳定。对资源受限的团队来说，这意味着用更少的 GPU 时间就能训练出同等质量的推理模型。"
+  - q: "BASIS 适合什么样的团队和场景使用？"
+    a: "BASIS 特别适合 GPU 资源有限但希望做 RLVR 训练的团队。原来用 GRPO 每个 prompt 需要采 8 条轨迹，BASIS 只需要 1 条，采样计算量直接降到八分之一。它可以集成到 OpenRLHF、veRL 等现有框架中，适用于数学推理、代码生成、逻辑推理等需要可验证奖励的场景。"
+---
+
+> **💡 一句话总结**：BASIS 通过 batch 内跨 prompt 信息共享，让单样本 RL 的价值估计精度超过 8 样本 GRPO，把 RLVR 训练的采样开销降低 8 倍且几乎不损失推理性能。
+
+## 论文基本信息
+
+- **标题**：BASIS: Batchwise Advantage Estimation from Single-Rollout Information Sharing
+- **arXiv**：[2605.27293](https://arxiv.org/abs/2605.27293)，2026 年 5 月 26 日提交
+- **作者**：Shijin Gong, Erhan Xu, Kai Ye 等
+- **关键词**：单样本强化学习、批次信息共享、优势估计、价值函数、RLVR
+
+## 核心问题：计算效率和样本效率的两难
+
+用可验证奖励的强化学习（Reinforcement Learning with Verifiable Rewards, RLVR）提升 LLM 的推理能力，已经成为后训练阶段的标准做法。从 DeepSeek-R1 到 Qwen3，几乎所有前沿推理模型都在 SFT 之后加了一轮 RL 训练。
+
+但 RLVR 训练有一个绕不开的核心矛盾：**计算效率 vs 样本效率**。
+
+### 多样本方法：估计准但计算贵
+
+GRPO（Group Relative Policy Optimization）是当前最主流的 RLVR 算法之一。它的做法是对每个 prompt 采样多条推理轨迹（通常 8 条甚至更多），然后用组内均值作为基线来估计每条轨迹的优势函数（advantage）。
+
+优势函数的估计精度至关重要——它决定了策略梯度的信噪比。GRPO 的组内均值基线是一个合理的估计器：当采样数量 G 足够大时，组内均值趋近于真实的价值函数。但这个「足够大」带来了巨大的计算成本。
+
+假设一个 batch 有 64 个 prompt，每个 prompt 采 8 条轨迹，总共需要做 512 次前向推理。其中 7/8 的推理仅仅是为了给那 1/8 提供更准的基线估计——这是极大的资源浪费。对于 GPU 受限的团队，这意味着要么减少 batch size，要么减少采样数，两者都会伤害训练效果。
+
+### 单样本方法：计算快但估计粗
+
+REINFORCE++ 等方法走了另一个极端：每个 prompt 只采一条轨迹。采样成本降到了最低，但优势估计的精度也降到了最低——只有一个样本，根本无法通过组内对比来估计价值函数。
+
+REINFORCE++ 的常见做法是用全局 running mean 作为基线：维护一个指数移动平均的全局奖励均值，用每条轨迹的奖励减去这个均值作为优势估计。这个估计极其粗糙——不同 prompt 的难度差异巨大，用同一个全局均值做基线，简单题的正确答案会被低估，困难题的错误答案会被高估。
+
+### 矛盾的本质
+
+把这个矛盾总结成一句话：**多采几条看得更清楚，但多采几条也多花几倍钱**。
+
+GRPO 和 REINFORCE++ 分别站在这条 trade-off 曲线的两端。GRPO 用 8 倍的计算换精度，REINFORCE++ 用精度换速度。所有之前的工作——DAPO、Dr.GRPO、RLOO 等——都是在这条曲线上选不同的点，没有人试图改变曲线本身。
+
+BASIS 的目标是：**改变曲线**。
+
+## BASIS 方法：跨 prompt 信息共享
+
+BASIS 的核心洞察非常简洁：**一个 batch 里有 64 个 prompt，每个 prompt 采了一条轨迹，虽然单独看每个 prompt 只有一个样本，但 batch 整体上有 64 个样本。这些样本之间的信息是可以共享的。**
+
+### 为什么信息可以共享
+
+考虑一个直觉性的例子。假设 batch 里有两个数学题：
+
+- Prompt A：一道简单的线性方程，模型采到了正确答案，奖励 = 1
+- Prompt B：一道困难的微积分题，模型采到了错误答案，奖励 = 0
+
+如果只看各自的奖励，我们只知道 A 做对了、B 做错了。但如果我们知道这个 batch 里 80% 的 prompt 都拿到了奖励 1（说明模型整体水平不低），那么：
+
+- Prompt A 的奖励 1 就不那么令人惊讶——大家都做对了，这条轨迹的「优势」（advantage）应该接近零
+- Prompt B 的奖励 0 也就更有信息量——大多数题都做对了但这道没做对，说明它确实难，这条轨迹的「劣势」（disadvantage）应该较大
+
+这就是信息共享的直觉：**每个 prompt 的价值函数估计，可以借助 batch 内其他 prompt 的奖励分布来改进。**
+
+### 价值函数估计的具体机制
+
+BASIS 构建了一个基于 batch 统计量的价值函数估计器。与 REINFORCE++ 只用一个全局标量均值不同，BASIS 利用了更丰富的 batch 结构信息。
+
+核心思路可以用伪代码概括：
+
+```python
+def basis_advantage(batch_rewards, batch_features):
+    """
+    batch_rewards: shape [B], 每个 prompt 一条轨迹的奖励
+    batch_features: shape [B, d], 每条轨迹的特征向量
+    """
+    # 1. 用 batch 内所有样本拟合一个价值函数估计器
+    # 而不是简单地取均值
+    value_estimator = fit_batch_value_function(
+        features=batch_features,
+        rewards=batch_rewards
+    )
+
+    # 2. 用估计器预测每个 prompt 的价值基线
+    baselines = value_estimator.predict(batch_features)
+
+    # 3. 优势 = 奖励 - 基线
+    advantages = batch_rewards - baselines
+
+    return advantages
+```
+
+关键在于 `fit_batch_value_function` 这一步。BASIS 不是简单地算一个标量均值，而是利用 batch 内所有 prompt 的轨迹特征和奖励，拟合一个参数化的价值函数。这个函数能够根据每个 prompt 的特征（比如 prompt 长度、题目类型、中间步骤特征等）给出**个性化的基线估计**，而不是对所有 prompt 用同一个数字。
+
+> **💡 类比理解**：REINFORCE++ 的全局均值基线就像给全班同学的考试成绩都减去班级平均分——学霸和学渣用同一个基线。GRPO 的组内均值就像同一道题做多次取平均——准确但费时。BASIS 的做法像是看了全班所有同学的所有科目成绩，建立一个模型来预测每个同学在每道题上的「预期得分」——既个性化又利用了全局信息。
+
+### 为什么不需要 Critic 网络
+
+读到这里可能有人会问：「这不就是在训练一个价值网络（critic）吗？」
+
+关键区别在于：BASIS 的价值估计器**不是一个需要梯度更新的神经网络**，而是一个在每个 batch 上即时拟合的统计模型。它不需要反向传播，不占用额外显存，不引入训练不稳定性。每个 batch 到来时，用当前 batch 的数据拟合一次，用完即弃。
+
+这让 BASIS 保持了 critic-free 方法的所有工程优势——单一模型、简单训练循环、稳定收敛——同时获得了接近 critic 方法的价值估计精度。
+
+## 核心实验结果
+
+### 价值函数估计精度
+
+论文最有说服力的实验是直接比较不同方法的价值函数估计 MSE（均方误差）。真实价值函数通过大量采样（每个 prompt 128 条轨迹）的经验均值来近似。
+
+| 方法 | 估计方式 | 相对 MSE |
+| --- | --- | --- |
+| REINFORCE++ | 全局 running mean | 基线（1.00） |
+| GRPO（G=4） | 4 样本组内均值 | 0.58 |
+| GRPO（G=8） | 8 样本组内均值 | 0.42 |
+| **BASIS（G=1）** | 单样本 + batch 信息共享 | **0.31** |
+
+几个关键发现：
+
+1. **单样本 BASIS 的估计误差比 8 样本 GRPO 还低**——这是论文最核心的结果。用 1/8 的采样量拿到了更好的估计精度，直接打破了「多采才能准」的固有认知
+2. **相对 REINFORCE++ 降低 69%**——这意味着策略梯度的信噪比提高了 3 倍以上
+3. MSE 的降低不是来自更多的采样，而是来自**更聪明的信息利用**
+
+### 训练效率对比
+
+在相同的训练 token 预算下，各方法的最终推理性能对比：
+
+- **BASIS（单样本）** vs **GRPO（8 样本）**：性能接近（差距在 1% 以内），但 BASIS 的**壁钟时间**（wall-clock time）减少了约 6-7 倍
+- **BASIS** vs **REINFORCE++**：相同的单样本计算开销，BASIS 的最终性能**显著优于** REINFORCE++，差距在 3-5% 之间
+- **BASIS** vs **DAPO、Dr.GRPO**：这些改进型 GRPO 变体仍然需要多样本采样，BASIS 在效率-性能曲线上占据更优位置
+
+### 训练稳定性
+
+论文还展示了训练曲线的对比。REINFORCE++ 的训练曲线波动剧烈，因为每步的梯度估计噪声很大；GRPO 的曲线平滑但进度慢（每步计算量大）；BASIS 的曲线兼具了两者的优点——步进速度快（单样本），曲线波动小（估计精度高）。
+
+### 跨任务泛化
+
+论文在数学推理（GSM8K、MATH）、代码生成和逻辑推理等多个任务上验证了 BASIS 的效果。一个值得注意的趋势是：**任务越难，BASIS 的优势越明显**。
+
+这很好理解：简单任务的大多数轨迹奖励都接近 1，价值函数估计的难度低，不同方法的差距不大。难任务的奖励分布更复杂、方差更大，精确的价值估计更重要，BASIS 的 batch 信息共享机制就更能体现价值。
+
+## 与已有方法的系统对比
+
+### GRPO：同族但不同策略
+
+GRPO 和 BASIS 都是 critic-free 方法，都用采样奖励直接估计优势函数。区别在于估计策略：
+
+- **GRPO**：在同一个 prompt 内纵向比较——同一道题的多条轨迹互相比较
+- **BASIS**：在 batch 内横向比较——不同 prompt 的轨迹之间共享信息
+
+GRPO 的纵向比较更「纯粹」——同一道题的不同轨迹直接可比。但代价是每道题都要采多条。BASIS 的横向比较引入了跨题目的噪声，但通过统计方法控制了这个噪声，最终在更低的计算成本下达到了更高的估计精度。
+
+### REINFORCE++：同是单样本，但估计精度天差地别
+
+REINFORCE++ 和 BASIS 都是单样本方法，计算成本几乎相同。但 REINFORCE++ 的全局 running mean 基线过于粗糙——它假设所有 prompt 的期望奖励相同，这显然是错的。
+
+BASIS 用 batch 信息共享构建的个性化基线，本质上是在承认并利用「不同 prompt 难度不同」这一事实。这就是 69% MSE 降低的来源。
+
+### DAPO 和 Dr.GRPO：改良而非革新
+
+DAPO（Dynamic Advantage Policy Optimization）和 Dr.GRPO 是对 GRPO 的改进变体，通过更好的 advantage normalization、clip 策略或采样策略来提升效果。但它们没有从根本上解决多样本开销问题——仍然需要每个 prompt 采多条轨迹。
+
+BASIS 和这些方法不在同一个维度上竞争：DAPO/Dr.GRPO 优化的是「多样本怎么用得更好」，BASIS 解决的是「能不能只用一个样本」。两者甚至可以结合——先用 BASIS 做单样本估计，再把 DAPO 的 normalization 技巧应用于 BASIS 的优势估计值。
+
+## 工程实践意义
+
+### 1. GPU 受限团队的 RLVR 方案
+
+这是 BASIS 最直接的工程价值。假设你有一个 8xA100 集群，想对 7B 模型做 RLVR 训练：
+
+- **GRPO（G=8）**：每个 prompt 采 8 条轨迹，batch size = 64 → 需要做 512 次推理，一个 batch 可能需要 10+ 分钟
+- **BASIS（G=1）**：每个 prompt 采 1 条轨迹，同样 batch size = 64 → 只需 64 次推理，一个 batch 约 1-2 分钟
+
+训练时间从一周缩短到一两天，而最终推理性能几乎无损。对大多数学术实验室和中小团队来说，这可能是决定「能不能做 RLVR」的关键因素。
+
+### 2. 与现有框架的集成
+
+BASIS 的实现不需要魔改训练框架的核心逻辑。在 OpenRLHF 或 veRL 中，核心改动集中在 advantage 计算模块：
+
+```python
+# 原来的 GRPO advantage 计算
+def grpo_advantage(group_rewards):
+    """group_rewards: shape [B, G]"""
+    baseline = group_rewards.mean(dim=1, keepdim=True)
+    advantages = group_rewards - baseline
+    return advantages
+
+# BASIS advantage 计算
+def basis_advantage(single_rewards, batch_features):
+    """
+    single_rewards: shape [B], 每个 prompt 一条轨迹
+    batch_features: shape [B, d]
+    """
+    # 用 batch 信息拟合价值估计器
+    value_baseline = batch_value_estimator(
+        batch_features, single_rewards
+    )
+    advantages = single_rewards - value_baseline
+    return advantages
+```
+
+采样循环从 `for g in range(G)` 变成不需要循环，advantage 计算从组内均值变成 batch 信息共享估计器。其余的策略梯度计算、PPO clip、KL 约束等完全不变。
+
+### 3. 适用场景判断
+
+BASIS 最适合的场景：
+
+- **可验证奖励**：数学推理（有标准答案）、代码生成（有测试用例）、逻辑推理（有正确性校验）。这些任务的奖励信号是精确的二值或离散值
+- **prompt 多样性高**：batch 内的 prompt 涵盖不同难度和类型，信息共享的增益最大
+- **GPU 预算有限**：这是 BASIS 相对 GRPO 的核心优势场景
+
+不太适合的场景：
+
+- **开放域生成**（如创意写作）：奖励信号本身就是模糊的，价值函数估计的精度提升意义有限
+- **batch size 极小**（如 &lt;8）：batch 内样本太少，信息共享的统计效力不足
+- **对训练速度不敏感**：如果你有足够的 GPU 集群，GRPO 的多样本采样不是瓶颈，BASIS 的优势不明显
+
+### 4. 与 DMPO 的互补关系
+
+有趣的是，BASIS 和前两天速读的 DMPO 解决的是 RLVR 训练中**不同维度的问题**：
+
+- **DMPO**：解决模式崩塌——模型只学会一种推理路径的问题（KL 方向选择）
+- **BASIS**：解决计算效率——多样本采样过于昂贵的问题（价值估计策略）
+
+两者在技术上是正交的，理论上可以结合使用：用 BASIS 的信息共享做优势估计（解决效率问题），用 DMPO 的前向 KL 做策略更新（解决多样性问题）。这个结合是否有效值得后续工作探索。
+
+## 局限与开放问题
+
+1. **batch 信息共享的理论保证**：论文主要通过实验验证了 BASIS 的有效性，但跨 prompt 信息共享的理论基础还不够充分。在什么条件下信息共享一定能改善估计精度？prompt 分布的什么特性会影响共享效果？这些理论问题值得更深入的分析
+
+2. **特征选择**：BASIS 需要从轨迹中提取特征来拟合价值估计器，特征的选择和质量直接影响估计精度。论文使用了哪些特征、不同特征的贡献有多大，值得更细致的消融分析
+
+3. **大规模模型验证**：论文的实验规模集中在 7B-14B 级别的模型。在 70B+ 模型上，batch size 通常更小（显存限制），信息共享的统计效力是否足够？采样效率的提升是否能弥补可能的估计精度下降？
+
+4. **与 online RL 的交互**：BASIS 的 batch 信息共享假设 batch 内的样本来自同一个策略版本。在 online RL 场景下，如果 batch 内混合了不同策略版本的样本（如异步训练），信息共享的有效性可能受影响
+
+5. **动态调整机制**：训练初期模型能力弱、奖励信号高方差，batch 信息共享的增益可能最大；训练后期模型趋于收敛、奖励分布变窄，简单的均值基线可能就够用了。一个自适应的策略——训练初期用 BASIS、后期回退到更简单的估计器——可能效果更好
+
+## 总结
+
+BASIS 这篇论文的核心贡献是提出了一个简洁而有效的洞察：**同一个 batch 里不同 prompt 的信息是可以共享的**。这个洞察让单样本 RL 方法获得了超越多样本方法的价值估计精度，打破了计算效率和样本效率之间看似不可调和的矛盾。
+
+最让人印象深刻的数字是：单样本 BASIS 的估计 MSE 比 8 样本 GRPO 还低。这不是靠堆计算量实现的改进，而是靠「更聪明地利用已有信息」实现的飞跃。
+
+对于 RLVR 从业者的实用建议很明确：如果你正在用 GRPO 训练推理模型但被采样成本困扰，BASIS 值得尝试。实现改动集中在 advantage 计算模块，不需要重构训练框架，预期可以将训练时间缩短 6-8 倍，而性能损失控制在 1% 以内。
+
+这篇论文和 DMPO 一起，构成了 2026 年 5 月 RLVR 领域的两个重要改进方向——一个解决效率，一个解决多样性——为推理模型训练的工程实践提供了更多选择。
+
+Sources:
+- [BASIS: Batchwise Advantage Estimation from Single-Rollout Information Sharing - arXiv](https://arxiv.org/abs/2605.27293)
+- [GRPO: Group Relative Policy Optimization](https://arxiv.org/abs/2402.03300)
+- [REINFORCE++: A Simple and Efficient Approach for Aligning Large Language Models](https://arxiv.org/abs/2501.03262)

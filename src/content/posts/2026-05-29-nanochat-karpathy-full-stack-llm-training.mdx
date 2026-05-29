@@ -1,0 +1,501 @@
+---
+title: "nanochat 实战：用 $100 从零训练一个能对话的 ChatGPT 克隆"
+description: "nanochat 是 Andrej Karpathy 开源的极简全栈 LLM 训练流水线，约 8000 行 PyTorch 代码覆盖 tokenization 到 Chat UI 全流程。本文从 --depth 旋钮到分布式预训练，手把手走通 $100 训练一个能对话的模型。"
+column: "workshop"
+tags: ["nanochat", "Karpathy", "LLM Training", "PyTorch", "Pretraining", "Fine-tuning"]
+pubDate: 2026-05-29
+featured: false
+tldr: "nanochat 是 Karpathy 的极简全栈 LLM 训练方案，用一个 --depth 参数控制全部超参数，$48 复现 GPT-2 能力、$100 训出能对话的模型。覆盖 BPE tokenizer、预训练、SFT 微调、RL、评估、Chat UI 六个阶段，约 8000 行代码，不是框架而是最大可 fork 的强基线。配套的 autoresearch 项目能让 AI Agent 一夜自动跑 100 个 ML 实验。"
+author: "YOMXXX"
+faq:
+  - q: "nanochat 和之前的 nanoGPT 有什么区别？"
+    a: "nanoGPT 只覆盖预训练阶段，训完的模型只能做文本补全，不能对话。nanochat 是全栈方案，从 BPE tokenizer 训练、预训练、SFT 微调、RL 强化学习、评估到 Chat UI 一条龙，训完直接能对话。代码量也从 nanoGPT 的约 600 行扩展到约 8000 行。"
+  - q: "nanochat 需要什么硬件才能跑？"
+    a: "推荐 8×H100 节点（约 2 小时训完 GPT-2 级别模型），8×A100 也行但更慢。单卡也能跑，会自动做梯度累积，训练时间变成 8 倍。显存不足 80GB 的卡需要减小 --device-batch-size。甚至支持 CPU 和 Apple Silicon MPS，但只能跑缩小版模型做实验。"
+  - q: "为什么 nanochat 不用 torch.amp.autocast 管理精度？"
+    a: "nanochat 用全局 COMPUTE_DTYPE 变量显式管理精度，模型权重始终保持 fp32 以确保优化器精度，自定义 Linear 层在前向传播时才 cast 到计算精度。H100/A100 默认用 bfloat16，V100/T4 用 float32。这种设计比 autocast 更透明，也更容易调试精度相关的问题。"
+  - q: "--depth 设多大合适？新手应该从多少开始？"
+    a: "新手建议从 depth=12 开始，这是 GPT-1 级别的规模，单次训练约 5 分钟，适合快速验证流程。depth=24-26 接近 GPT-2 能力，需要 8×H100 约 2 小时。depth 越大模型越强但成本线性增长，建议先用小 depth 跑通全流程再逐步加大。"
+  - q: "autoresearch 和 nanochat 是什么关系？"
+    a: "autoresearch 是 Karpathy 基于 nanochat 做的自动 ML 实验框架，把 nanochat 的训练代码简化为单 GPU 版本塞进一个 train.py 文件，然后让 AI Agent（Claude/Codex）自动修改代码、训练、评估、决定保留还是回滚。每个实验固定 5 分钟，一夜能跑约 100 个实验，相当于一个不睡觉的 ML 研究员。"
+---
+
+> **💡 一句话总结**：nanochat 不是另一个训练框架 —— 它是 Karpathy 给你的一个「最大可 fork 的强基线」，8000 行代码，从 tokenizer 到 Chat UI，$100 训出一个能对话的模型。
+
+## 为什么需要 nanochat
+
+2019 年 OpenAI 训练 GPT-2 花了大约 $43,000。2024 年 Karpathy 发布 nanoGPT，用极简代码复现了 GPT-2 的预训练过程。但 nanoGPT 有一个关键局限：**它只覆盖预训练**。训出来的模型只能做文本补全 —— 你给它一句话的开头，它接着往下写，但它不会对话。
+
+从「能补全文本的语言模型」到「能对话的 ChatGPT」，中间还有一大段路要走：
+
+1. 训练自己的 tokenizer（而不是复用别人的）
+2. 预训练之后做 SFT 微调（让模型学会对话格式）
+3. 可选的 RL 强化学习（让模型学会拒绝、推理、遵守指令）
+4. 评估（不只是 loss 曲线，而是 HellaSwag、MMLU 这些标准 benchmark）
+5. 推理优化（KV cache、采样策略）
+6. Chat UI（让普通用户能用浏览器和模型对话）
+
+nanochat 就是补上这一整段路的项目。它不是 nanoGPT 的升级版，而是一个**全栈方案** —— 从第一个 byte 到最后一个 HTTP 响应，全部包在约 8000 行 PyTorch 代码里。
+
+## --depth 旋钮：一个参数控制一切
+
+大多数训练框架让你面对几十个超参数：模型宽度、注意力头数、学习率、warmup steps、权重衰减、训练 token 数……nanochat 的核心设计哲学是**把所有这些压缩到一个参数**：`--depth`。
+
+`--depth` 就是 Transformer 的层数。设定 depth 之后，所有其他超参数自动推算：
+
+```python
+# nanochat 的超参数自动推算逻辑（简化版）
+# depth 是唯一的输入，其他全部由它决定
+
+def get_config(depth: int):
+    # 模型宽度随 depth 线性增长
+    n_embd = 64 * depth
+    # 注意力头数 = 宽度 / 64
+    n_head = n_embd // 64
+    # 学习率随模型增大而减小
+    learning_rate = 0.003 * (depth / 12) ** -0.5
+    # 训练时长随模型增大而增长
+    total_tokens = ...  # 与 depth 相关的缩放
+    # 权重衰减保持固定
+    weight_decay = 0.1
+    return Config(
+        n_layer=depth,
+        n_embd=n_embd,
+        n_head=n_head,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        ...
+    )
+```
+
+这意味着用户不需要理解任何超参数调优知识。你只需要问自己一个问题：**我想要多大的模型？**
+
+| depth | 对标规模 | 训练时间 (8×H100) | 成本 (按需) |
+|-------|---------|-------------------|------------|
+| 12 | GPT-1 级别 | ~5 分钟 | ~$2 |
+| 24-26 | GPT-2 级别 | ~2 小时 | ~$48 |
+| 更大 | 更强的对话能力 | ~4 小时 | ~$100 |
+| 更大+ | 数学/代码能力 | ~41.6 小时 | ~$1000 |
+
+depth=12 是新手的最佳起点 —— 5 分钟跑完全流程，适合验证环境和理解代码。depth=26 大约等于 GPT-2 的能力，是性价比的甜蜜点。
+
+> **⚠️ 注意**：对 nanochat 的任何修改都必须是「principled enough that they work for all settings of depth」—— 这是 Karpathy 的代码审查标准。任何只在特定 depth 生效的 hack 都不会被合并。
+
+## 成本曲线：从 $43,000 到 $48
+
+2019 年 OpenAI 训练 GPT-2 的成本约 $43,000。nanochat 用 $48（8×H100 按需实例，约 2 小时）复现了等效的能力。这是约 **900 倍**的成本下降。
+
+具体的成本拆解：
+
+```
+硬件：8×H100 SXM 节点
+费率：~$3/GPU/小时 × 8 GPU = ~$24/小时
+训练时间：~2 小时（GPT-2 等效）
+总成本：~$48（按需实例）/ ~$15（竞价实例）
+算力：4e19 FLOPs
+```
+
+nanochat 还维护了一个 **Speedrun Leaderboard**，追踪打败 GPT-2 的 DCLM CORE 分数（0.256525）需要多少时间：
+
+| 编号 | 时间 | 备注 |
+|------|------|------|
+| Entry 0 | 168 小时 | OpenAI 原始训练 (2019) |
+| Entry 6 | 1.65 小时 | autoresearch round 2，fp8 + ClimbMix 数据集 |
+
+从 168 小时到 1.65 小时 —— 超过 **100 倍**的加速，而且还在继续优化。
+
+## 训练流水线：六个阶段全走通
+
+nanochat 的训练流水线分六个阶段，每个阶段对应一个独立的脚本。下面逐一走通。
+
+### 阶段一：Tokenizer 训练
+
+nanochat 不复用 GPT-2 或 GPT-4 的 tokenizer，而是从零训练自己的 BPE tokenizer：
+
+```bash
+# 训练 BPE tokenizer
+python -m scripts.tok_train
+
+# 评估 tokenizer 质量（压缩率等）
+python -m scripts.tok_eval
+```
+
+训练出的 tokenizer 采用 GPT-4 风格的 BPE 分词。为什么要自己训而不是复用？因为 tokenizer 的词表直接影响模型效率 —— 用别人的词表，你的模型可能在某些 token 上浪费容量。自己训的 tokenizer 能针对你的训练数据做最优分词。
+
+### 阶段二：预训练数据准备
+
+nanochat 默认使用 HuggingFace 的 **FineWeb-Edu** 数据集，这是一个教育质量过滤后的网页文本集合：
+
+```bash
+# 下载和预处理训练数据
+# nanochat 的 dataloader 会自动处理分片和 tokenization
+# 数据在训练时流式加载，不需要预先全部下载
+```
+
+数据通过 `nanochat/dataloader.py` 中的分布式 tokenizing dataloader 流式加载。这个 dataloader 的设计亮点是**边分词边训练**，不需要预先把整个数据集 tokenize 成文件，节省了大量磁盘空间和预处理时间。
+
+### 阶段三：预训练
+
+这是最核心的阶段。nanochat 用 `torchrun` 做分布式训练，支持 DDP（数据并行）和 FSDP（完全分片数据并行）：
+
+```bash
+# 在 8×H100 上训练 depth=26 的模型（GPT-2 级别）
+OMP_NUM_THREADS=1 torchrun \
+    --standalone \
+    --nproc_per_node=8 \
+    -m scripts.base_train \
+    -- \
+    --depth=26 \
+    --run="d26_gpt2"
+
+# 快速实验：depth=12，约 5 分钟
+OMP_NUM_THREADS=1 torchrun \
+    --standalone \
+    --nproc_per_node=8 \
+    -m scripts.base_train \
+    -- \
+    --depth=12 \
+    --run="d12_quick"
+```
+
+预训练使用 **AdamW + Muon 混合优化器**。Muon 是一个改进的优化器，在 nanochat 的规模下比纯 AdamW 收敛更快。优化器实现在 `nanochat/optim.py` 中，同一个文件同时支持单卡和分布式模式。
+
+关于精度管理，nanochat 采用了一个独特的设计 —— **不用 `torch.amp.autocast`**：
+
+```python
+# nanochat 的精度管理：全局 COMPUTE_DTYPE 变量
+# 模型权重始终 fp32（优化器需要），自定义 Linear 层在 forward 时 cast
+
+# 根据硬件自动选择
+# H100/A100 (SM 80+) → bfloat16
+# V100/T4 (SM < 80)  → float32
+# CPU / MPS           → float32
+
+# 手动覆盖
+# NANOCHAT_DTYPE=float32 torchrun ...
+```
+
+权重保持 fp32 是为了优化器精度（AdamW 的一阶/二阶矩估计需要高精度），前向传播时才 cast 到 bfloat16 节省显存和计算。这比 autocast 更透明 —— 你永远知道每个 tensor 是什么精度。
+
+### 阶段四：SFT 微调
+
+预训练完的模型只会补全文本。要让它学会对话，需要做 Supervised Fine-Tuning（SFT）：
+
+```bash
+# SFT 微调：把预训练模型变成对话模型
+python -m scripts.chat_sft \
+    --checkpoint=logs/d26_gpt2/model.pt \
+    --run="d26_chat"
+```
+
+SFT 数据使用 HuggingFace 的 **SmolTalk** 数据集，包含多轮对话格式的训练数据。nanochat 还支持 **identity customization** —— 你可以通过合成数据让模型记住自己的名字、身份和行为边界。
+
+### 阶段五：评估
+
+nanochat 提供两套评估脚本：
+
+```bash
+# 基座模型评估：CORE score、bits per byte
+python -m scripts.base_eval --checkpoint=logs/d26_gpt2/model.pt
+
+# 对话模型评估：多个 benchmark
+python -m scripts.chat_eval --checkpoint=logs/d26_chat/model.pt
+```
+
+评估指标包括：
+
+- **DCLM CORE score**：综合语言理解能力，GPT-2 的基线是 0.256525
+- **Bits per byte (BPB)**：每个字节需要多少 bit 编码，越低越好，且与词表大小无关
+- **HellaSwag**：常识推理
+- **MMLU**：多领域知识
+- **ARC**：科学推理
+- **GSM8K**：数学推理（需要更大的 depth 才能看到效果）
+- **HumanEval**：代码生成
+
+BPB 作为核心指标的好处是**与词表大小无关** —— 你换了 tokenizer、改了词表大小，BPB 仍然可以直接比较。这在自动化实验中尤其重要（后面的 autoresearch 就依赖这个特性）。
+
+### 阶段六：推理和 Chat UI
+
+训完的模型可以通过 CLI 或 Web UI 使用：
+
+```bash
+# CLI 模式：命令行对话
+python -m scripts.chat_cli -p "What is the capital of France?"
+
+# Web UI 模式：启动浏览器对话界面
+python -m scripts.chat_web
+# 打开 http://localhost:8000 即可对话
+
+# 强制使用 float32 精度（CPU/MPS 环境）
+NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"
+```
+
+推理引擎在 `nanochat/engine.py` 中实现，支持 **KV cache** 加速。Chat UI 是纯 HTML/CSS/JS 前端 + Python HTTP 后端，没有任何前端框架依赖。
+
+## 代码走读：关键文件和设计哲学
+
+nanochat 的代码结构非常清晰，核心模块全在 `nanochat/` 目录下：
+
+```
+nanochat/
+├── gpt.py          # Transformer 模型定义（单文件，没有模型工厂）
+├── engine.py       # 推理引擎（KV cache、采样策略）
+├── optim.py        # AdamW + Muon 优化器（单卡 + 分布式）
+├── dataloader.py   # 分布式 tokenizing dataloader
+└── common.py       # 工具函数、COMPUTE_DTYPE 全局变量
+
+scripts/
+├── tok_train.py    # Tokenizer 训练
+├── tok_eval.py     # Tokenizer 评估
+├── base_train.py   # 预训练
+├── base_eval.py    # 基座模型评估
+├── chat_sft.py     # SFT 微调
+├── chat_rl.py      # RL 强化学习
+├── chat_eval.py    # 对话模型评估
+├── chat_cli.py     # CLI 推理
+└── chat_web.py     # Web UI
+
+tasks/              # 评估任务定义
+├── arc/
+├── gsm8k/
+├── mmlu/
+├── humaneval/
+├── hellaswag/
+└── smoltalk/
+
+runs/               # 一键运行脚本
+├── speedrun.sh     # 完整 GPT-2 speedrun
+├── scaling_laws.sh # 缩放定律实验
+├── miniseries.sh   # 小规模系列实验
+└── runcpu.sh       # CPU/MPS 运行
+```
+
+### 设计哲学
+
+Karpathy 在 README 中明确了 nanochat 的定位：
+
+**不是框架**。没有巨型配置对象，没有模型工厂，没有 if-then-else 怪物。每个脚本都是自包含的，你可以直接读懂它在干什么。
+
+**最大可 fork 性**。nanochat 的目标不是让你 `pip install nanochat` 然后调用 API，而是让你 fork 这个 repo，直接改代码。每个文件都是为了被修改而设计的。
+
+**单一文件原则**。`gpt.py` 一个文件包含整个 Transformer 模型定义。`optim.py` 一个文件包含所有优化器逻辑（单卡和分布式）。不需要在 10 个文件之间跳转才能理解一个功能。
+
+**PR 政策**。任何提交到 nanochat 的 PR 都必须声明是否有大量 LLM 贡献。这不是反 AI —— 而是确保贡献者理解自己提交的每一行代码。
+
+## 一键 Speedrun：完整体验
+
+如果你有一台 8×H100 节点，跑完整流程只需要一条命令：
+
+```bash
+# 环境准备
+git clone https://github.com/karpathy/nanochat.git
+cd nanochat
+uv sync --extra gpu
+source .venv/bin/activate
+
+# 一键 speedrun：从零到能对话的模型
+bash runs/speedrun.sh
+```
+
+`speedrun.sh` 会自动执行全部六个阶段：训练 tokenizer → 准备数据 → 预训练 → SFT → 评估 → 启动 Chat UI。完成后打开浏览器就能和你自己训练的模型对话。
+
+### 在云端 GPU 上跑 nanochat
+
+大多数人没有自己的 H100 节点。以下是在主流云 GPU 平台上跑 nanochat 的方案：
+
+```bash
+# Lambda Cloud（推荐，H100 实例最便宜之一）
+# 1. 在 lambda.ai 租一台 8×H100 实例（按需约 $3/GPU/小时）
+# 2. SSH 进去
+
+ssh ubuntu@<instance-ip>
+git clone https://github.com/karpathy/nanochat.git
+cd nanochat
+uv sync --extra gpu
+source .venv/bin/activate
+
+# 先跑一个 5 分钟的 depth=12 验证环境
+OMP_NUM_THREADS=1 torchrun \
+    --standalone \
+    --nproc_per_node=8 \
+    -m scripts.base_train \
+    -- \
+    --depth=12 \
+    --run="d12_test"
+
+# 确认没问题后跑完整 speedrun
+bash runs/speedrun.sh
+```
+
+其他可选平台：
+
+| 平台 | 8×H100 按需价格 | 备注 |
+|------|----------------|------|
+| Lambda Cloud | ~$24/小时 | 性价比最高之一 |
+| RunPod | ~$28/小时 | 竞价实例更便宜 |
+| Vast.ai | ~$20-26/小时 | 价格波动大，需要抢 |
+| AWS p5.48xlarge | ~$98/小时 | 贵但稳定 |
+
+> **💡 省钱技巧**：用竞价/spot 实例可以把成本降到按需价格的 30-50%。depth=26 的完整训练只要 2 小时，被抢占的概率很低。记得设置好 checkpoint 保存，万一被抢占可以断点续训。
+
+### 单卡和低配方案
+
+没有 8 卡节点也能跑 nanochat：
+
+```bash
+# 单卡 H100/A100：自动梯度累积，训练时间 ×8
+OMP_NUM_THREADS=1 torchrun \
+    --standalone \
+    --nproc_per_node=1 \
+    -m scripts.base_train \
+    -- \
+    --depth=12 \
+    --run="d12_single"
+
+# 显存不足 80GB 的卡（如 A6000 48GB, RTX 4090 24GB）
+# 减小 device-batch-size
+OMP_NUM_THREADS=1 torchrun \
+    --standalone \
+    --nproc_per_node=1 \
+    -m scripts.base_train \
+    -- \
+    --depth=12 \
+    --device-batch-size=4 \
+    --run="d12_small_gpu"
+
+# CPU / Apple Silicon MPS：只能跑缩小版模型
+bash runs/runcpu.sh
+```
+
+单卡 RTX 4090 跑 depth=12 大约 40 分钟，足以理解整个流程。depth=26 需要很长时间，不建议在单卡上跑。
+
+## autoresearch：让 AI Agent 替你做 ML 实验
+
+nanochat 证明了从零训练 LLM 可以很便宜。但**如何高效地做 ML 实验**仍然是个问题 —— 调超参数、试新架构、改优化器，每个想法都需要完整的训练-评估循环。
+
+Karpathy 基于 nanochat 做了一个更激进的项目：**autoresearch**。核心思想是把 ML 实验外包给 AI Agent：
+
+```
+传统 ML 研究：
+人类想出假设 → 人类改代码 → 人类跑训练 → 人类看结果 → 重复
+
+autoresearch：
+人类写 program.md 定义研究方向 → AI Agent 改代码 → 自动训练 → 自动评估 → 自动决定保留/回滚 → 重复
+```
+
+### 三个文件的极简设计
+
+autoresearch 只有三个核心文件：
+
+```
+autoresearch/
+├── prepare.py    # 数据准备 + dataloader + 评估（固定，Agent 不改）
+├── train.py      # 模型 + 优化器 + 训练循环（Agent 唯一可改的文件）
+└── program.md    # 给 Agent 的研究指令（人类编辑）
+```
+
+**`prepare.py`** 处理一次性数据准备（下载数据、训练 tokenizer）和运行时工具（dataloader、评估函数）。这个文件是固定的，Agent 不允许修改。
+
+**`train.py`** 包含完整的 GPT 模型定义、Muon + AdamW 优化器和训练循环 —— 全在一个文件里。这是 Agent 唯一可以修改的文件。默认配置是 `DEPTH=8`，`WINDOW_PATTERN="SSSL"`（交替的 banded attention）。
+
+**`program.md`** 是给 AI Agent 的指令文件。Karpathy 称之为「超轻量级 skill」。人类通过编辑这个 markdown 文件来「编程」研究方向 —— 你不直接碰 Python 代码，而是告诉 Agent「试试更大的学习率」「换一种 attention pattern」。
+
+### 自动实验循环
+
+autoresearch 的核心循环：
+
+```python
+# autoresearch 的实验循环（概念性伪代码）
+while True:
+    # 1. Agent 分析当前 train.py 和历史实验结果
+    proposed_change = agent.analyze_and_propose()
+
+    # 2. Agent 修改 train.py
+    agent.edit("train.py", proposed_change)
+
+    # 3. 固定 5 分钟训练预算（不含启动/编译时间）
+    result = train(budget="5min")
+
+    # 4. 评估 val_bpb（validation bits per byte）
+    bpb = evaluate(result)
+
+    # 5. 决定保留还是回滚
+    if bpb < best_bpb:
+        best_bpb = bpb
+        commit_change()  # 保留
+    else:
+        rollback()  # 回滚
+
+    # 每小时约 12 个实验，一夜约 100 个实验
+```
+
+关键设计决策：
+
+**固定 5 分钟时间预算**。不管 Agent 改了什么（模型大小、架构、超参数），每个实验都跑恰好 5 分钟。这让不同实验**直接可比** —— 不是比谁训得久，而是比谁在相同时间内学得更快。同时，这也自动适配你的硬件：5 分钟在 H100 上能跑的 step 数远多于 RTX 3090，所以 autoresearch 自动找到的是**你的硬件上的最优配置**。
+
+**单文件编辑范围**。只让 Agent 改 `train.py` 一个文件。这让 diff 容易审查，变更范围可控。如果 Agent 能改任意文件，很快就会变成不可维护的 spaghetti。
+
+**BPB 作为统一指标**。Bits per byte 与词表大小无关，所以 Agent 甚至可以改 tokenizer 词表大小，结果仍然可比。
+
+### 跑 autoresearch
+
+```bash
+git clone https://github.com/karpathy/autoresearch.git
+cd autoresearch
+
+# 安装依赖
+uv sync
+source .venv/bin/activate
+
+# 一次性数据准备
+python prepare.py
+
+# 启动自动实验（用 Claude 或 Codex 作为 Agent）
+# Agent 会自动读取 program.md，开始修改 train.py 并跑实验
+# 一夜之后回来看结果
+```
+
+autoresearch 在 nanochat 的 speedrun leaderboard 上已经产出了实际成果：Entry 6 用了 fp8 精度和 NVIDIA ClimbMix 数据集，把训练时间压到了 1.65 小时。
+
+> **💡 范式转变**：autoresearch 的本质是**你不再直接写 ML 代码，而是编写指导 Agent 做研究的指令**。`program.md` 就是你的「研究计划」，Agent 是你的「不需要睡觉的研究员」。
+
+## 从 nanoGPT 到 nanochat 的演进
+
+值得用一张表对比 nanoGPT 和 nanochat 的差异：
+
+| 维度 | nanoGPT | nanochat |
+|------|---------|----------|
+| 覆盖阶段 | 仅预训练 | 全栈（tokenizer → Chat UI） |
+| 代码量 | ~600 行 | ~8000 行 |
+| 产出物 | 文本补全模型 | 可对话的模型 |
+| 超参数 | 需手动设置多个 | 一个 --depth 参数 |
+| 优化器 | AdamW | AdamW + Muon |
+| 精度管理 | autocast | 显式 COMPUTE_DTYPE |
+| 评估 | loss 曲线 | CORE, BPB, HellaSwag, MMLU 等 |
+| 分布式 | 基础 DDP | DDP + FSDP |
+| UI | 无 | CLI + Web UI |
+| 数据集 | OpenWebText | FineWeb-Edu |
+| Speedrun | 无 | 有 leaderboard |
+| RL | 无 | 有（chat_rl.py） |
+
+nanochat 不是 nanoGPT 的简单扩展 —— 它是对「如何从零训练一个有用的语言模型」这个问题的完整回答。
+
+## 总结：$100 能买到什么
+
+nanochat 最有价值的地方不是省钱 —— 而是**降低理解门槛**。在 nanochat 之前，理解 LLM 训练全流程需要读几万行分散在不同项目里的代码。现在，8000 行代码，一个 repo，全部走通。
+
+$48 买到 GPT-2 等效能力。$100 买到能对话的模型。$1000 买到有数学和代码能力的模型。而且这个成本还在持续下降 —— autoresearch 正在自动化寻找更便宜的训练方案。
+
+如果你是 ML 工程师，nanochat 是最好的学习材料 —— 不是因为它代码写得优雅（虽然确实写得好），而是因为它**没有隐藏任何东西**。没有框架抽象，没有配置魔法，每一行代码都在做你看得懂的事情。
+
+如果你是研究员，autoresearch 指向了一个有趣的未来 —— ML 研究的日常工作（调参、试架构、跑 ablation）可能很快就会被 AI Agent 接管，人类研究员的工作重心转向写 `program.md` —— 定义研究方向，而不是写训练循环。
+
+```bash
+# 现在就开始
+git clone https://github.com/karpathy/nanochat.git
+cd nanochat && uv sync --extra gpu && source .venv/bin/activate
+
+# 5 分钟验证全流程
+OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=1 \
+    -m scripts.base_train -- --depth=12 --run="my_first_llm"
+```

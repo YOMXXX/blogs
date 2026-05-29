@@ -1,0 +1,638 @@
+---
+title: "pi-mono 实战：用 TypeScript 搭建统一多模型 AI Agent 工具箱"
+description: "pi-mono 是一个 GitHub 8.6K stars 的 TypeScript 全栈 AI Agent 工具箱，用 7 个内聚包覆盖统一 LLM API、编码 Agent CLI、终端和 Web UI、Slack Bot、vLLM 部署管理。本文从架构到实战，手把手带你跑通全流程。"
+column: "workshop"
+tags: ["pi-mono", "AI Agent", "TypeScript", "LLM API", "Coding Agent", "vLLM"]
+pubDate: 2026-05-29
+featured: false
+tldr: "pi-mono 是 GitHub 8.6K stars 的 TypeScript monorepo，用 7 个内聚包覆盖统一 LLM API、编码 Agent CLI、终端/Web UI、Slack Bot 和 vLLM 部署管理。一个 monorepo 从 LLM 调用到 GPU 部署全覆盖，不再拼凑多个独立库，完全开源可定制。"
+author: "YOMXXX"
+faq:
+  - q: "pi-mono 和 LangChain、LlamaIndex 这类框架有什么区别？"
+    a: "LangChain 和 LlamaIndex 专注于 RAG 和链式编排，pi-mono 的定位是全栈 Agent 工具箱。它不仅提供 LLM 调用层（pi-ai），还内置编码 Agent CLI、终端 UI、Web UI、Slack 集成和 GPU 部署管理。你用 LangChain 还需要自己搭 UI、写 CLI、配部署；pi-mono 开箱即用，7 个包无缝协作。两者可以互补，但 pi-mono 更适合想要一站式搭建 Agent 产品的团队。"
+  - q: "pi-mono 支持哪些 LLM 提供商？可以用本地模型吗？"
+    a: "pi-ai 内置支持 OpenAI、Anthropic、Google Gemini、Mistral、Groq、Ollama 等 6 个以上提供商。本地模型通过 Ollama 接入，也可以通过自定义配置文件 ~/.pi/agent/models.json 添加任何兼容 OpenAI Chat Completions API 的服务端点，包括 vLLM、TGI、LiteLLM 等自托管推理服务。切换提供商只需改一个 provider 参数，业务代码完全不动。"
+  - q: "coding-agent 和 Claude Code、Cursor Agent 有什么不同？"
+    a: "最大区别是开源和可定制性。Claude Code 是闭源商业产品，模型绑定 Anthropic；Cursor Agent 依赖 Cursor IDE。coding-agent 完全开源，支持任意 LLM 提供商，可以通过 skills、extensions、pi packages 三种机制扩展能力。你可以添加自定义工具、修改 Agent 行为、接入私有模型，这些在商业工具里做不到。缺点是生态成熟度和开箱体验不如商业产品。"
+  - q: "vllm-pods 适合什么场景？个人开发者需要吗？"
+    a: "vllm-pods 主要面向需要自托管 LLM 推理的团队。如果你用 API 调用 OpenAI 或 Anthropic，不需要这个包。但如果你的团队出于数据安全、成本控制或延迟要求需要自建推理服务，vllm-pods 能帮你管理 GPU 实例的启停、健康检查和负载均衡。个人开发者如果用 Ollama 跑本地小模型，直接用 pi-ai 的 Ollama 提供商即可，不需要 vllm-pods。"
+  - q: "pi-mono 的 session 共享机制会泄露我的代码吗？"
+    a: "不会。session 共享是完全可选的 opt-in 机制，默认关闭。只有你主动执行共享操作，session 数据才会上传到公开数据集。共享前你可以审查数据内容，决定哪些 session 可以公开。这个机制的目的是用真实编码任务数据改进 Agent 模型，而非自动收集用户代码。企业用户可以完全禁用此功能，所有数据留在本地。"
+---
+
+> **💡 一句话总结**：pi-mono 不是又一个 LLM wrapper，而是用 7 个 TypeScript 包覆盖了从 LLM 调用、编码 Agent、UI 到 GPU 部署的完整链路 —— 一个 monorepo 替代五个独立工具。
+
+## 问题：AI Agent 工具链的碎片化之痛
+
+搭一个能用的 AI Agent 工具链，你大概需要这些东西：
+
+- 一个多提供商 LLM 调用库（比如 LiteLLM）
+- 一个编码 Agent 框架（比如 Aider、SWE-agent）
+- 一个终端 UI 组件（比如 Ink）
+- 一个 Web UI（自己写 React）
+- 一个部署方案（Docker + 手动脚本）
+
+五个库，五套 API，五种错误处理方式，五个 GitHub Issues 要跟踪。它们之间的数据格式不兼容，类型定义不互通，升级一个可能把另一个搞挂。
+
+pi-mono 的回答是：**把这五层全塞进一个 TypeScript monorepo**。7 个包共享类型定义、统一错误处理、版本锁步发布。你不需要写胶水代码把它们粘在一起 —— 它们生来就是一起的。
+
+## 架构总览：7 个包各司其职
+
+```
+pi-mono/
+├── packages/
+│   ├── pi-ai/          # 统一多提供商 LLM API
+│   ├── coding-agent/   # 编码 Agent CLI
+│   ├── tui/            # 终端 UI 库（差分渲染）
+│   ├── web-ui/         # Web UI 库
+│   ├── slack-bot/      # Slack 集成
+│   ├── vllm-pods/      # vLLM GPU 部署管理
+│   └── shared/         # 公共工具、类型定义
+```
+
+每个包独立发布但共享 `shared` 包的类型和工具函数。monorepo 的好处在这里体现得淋漓尽致：`coding-agent` 依赖 `pi-ai` 做 LLM 调用，依赖 `tui` 做终端渲染，依赖 `shared` 做日志和配置 —— 全部是内部依赖，类型完全对齐，不存在版本不匹配的问题。
+
+## pi-ai：统一 LLM API 实战
+
+`pi-ai` 是整个工具箱的基础层。它做的事情和 LiteLLM 类似 —— 统一不同 LLM 提供商的 API —— 但用纯 TypeScript 实现，类型安全是一等公民。
+
+### 基本用法：一套代码切换提供商
+
+```typescript
+import { createProvider } from "@anthropic/pi-ai";
+
+// 用 Anthropic Claude
+const claude = createProvider({
+  provider: "anthropic",
+  model: "claude-sonnet-4-20250514",
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+// 用 OpenAI GPT
+const gpt = createProvider({
+  provider: "openai",
+  model: "gpt-4o",
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// 用 Google Gemini
+const gemini = createProvider({
+  provider: "google",
+  model: "gemini-2.5-pro",
+  apiKey: process.env.GOOGLE_API_KEY,
+});
+
+// 三个提供商，同一个调用接口
+async function chat(provider: LLMProvider, prompt: string) {
+  const response = await provider.chat({
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.7,
+    maxTokens: 2048,
+  });
+  return response.content;
+}
+
+// 切换提供商只需换一个变量
+const result = await chat(claude, "解释 TypeScript 的类型体操");
+```
+
+注意 `createProvider` 返回的对象遵循统一的 `LLMProvider` 接口。你的业务代码针对接口编程，切换提供商时只改配置，不改逻辑。
+
+### 流式输出
+
+```typescript
+const stream = await provider.chatStream({
+  messages: [{ role: "user", content: "写一个快排算法" }],
+  temperature: 0,
+});
+
+for await (const chunk of stream) {
+  process.stdout.write(chunk.content);
+}
+```
+
+流式 API 返回异步迭代器，可以直接用 `for await` 消费。每个 chunk 的数据结构在不同提供商间保持一致 —— OpenAI 的 `delta.content`、Anthropic 的 `content_block_delta`、Google 的 `candidates[0].content` 都被归一化为 `chunk.content`。
+
+### 工具调用（Function Calling）
+
+```typescript
+const tools = [
+  {
+    name: "get_weather",
+    description: "获取指定城市的天气",
+    parameters: {
+      type: "object",
+      properties: {
+        city: { type: "string", description: "城市名" },
+      },
+      required: ["city"],
+    },
+  },
+];
+
+const response = await provider.chat({
+  messages: [{ role: "user", content: "北京今天天气怎么样？" }],
+  tools,
+});
+
+if (response.toolCalls) {
+  for (const call of response.toolCalls) {
+    console.log(`调用工具: ${call.name}`);
+    console.log(`参数: ${JSON.stringify(call.arguments)}`);
+    // call.name === "get_weather"
+    // call.arguments === { city: "北京" }
+  }
+}
+```
+
+工具定义采用 JSON Schema 格式，和 OpenAI 的 Function Calling 规范一致。`pi-ai` 负责把它转换成各提供商的原生格式 —— Anthropic 的 `tool_use`、Google 的 `functionDeclarations`，开发者不需要关心差异。
+
+### 添加自定义提供商
+
+如果你的 LLM 服务兼容 OpenAI API 格式（比如 vLLM、TGI、LocalAI），可以直接注册为自定义提供商：
+
+```typescript
+const customProvider = createProvider({
+  provider: "openai-compatible",
+  model: "my-finetuned-llama",
+  baseUrl: "http://localhost:8000/v1",
+  apiKey: "not-needed-for-local",
+});
+```
+
+这对自托管模型的团队特别有用 —— 开发环境用 OpenAI，测试环境用自建 vLLM，生产环境用 Anthropic，代码完全一样。
+
+## coding-agent：编码 Agent CLI 详解
+
+`coding-agent` 是 pi-mono 的核心卖点之一。它不是一个 toy demo，而是一个功能完整的编码 Agent，定位对标 Claude Code、Aider、Codex CLI。
+
+### 默认工具集
+
+coding-agent 开箱自带 4 个核心工具：
+
+| 工具 | 功能 | 对应操作 |
+|------|------|---------|
+| `read` | 读取文件内容 | 读文件、查看目录结构 |
+| `write` | 写入完整文件 | 创建新文件、完整覆写 |
+| `edit` | 差分编辑 | 精确修改文件中的某几行 |
+| `bash` | 执行 shell 命令 | 运行测试、安装依赖、编译 |
+
+这四个工具覆盖了编码 Agent 95% 的操作需求。Agent 通过 LLM 的工具调用能力决定何时使用哪个工具，典型的执行流程是：
+
+```
+用户: "给这个 Express 应用加一个健康检查端点"
+  │
+  ├─ Agent 调用 read: 读取 src/app.ts, package.json
+  │
+  ├─ Agent 分析代码结构，生成修改方案
+  │
+  ├─ Agent 调用 edit: 在 app.ts 中添加 /health 路由
+  │
+  ├─ Agent 调用 bash: npm test (验证修改没有破坏测试)
+  │
+  └─ Agent 返回修改总结
+```
+
+### 三层扩展机制
+
+coding-agent 的真正威力在于扩展性。它提供三种扩展方式，从轻到重：
+
+**1. Skills（提示模板）**
+
+Skills 是最轻量的扩展方式 —— 本质是预定义的提示模板，让 Agent 在特定场景下遵循特定工作流。
+
+```json
+// ~/.pi/agent/skills/code-review.json
+{
+  "name": "code-review",
+  "trigger": "review this PR",
+  "prompt": "你是一个资深代码审查员。请按以下维度审查代码变更：\n1. 正确性：逻辑是否正确\n2. 安全性：是否有注入、泄露风险\n3. 性能：是否有 N+1 查询、内存泄漏\n4. 可读性：命名是否清晰、注释是否充分\n\n输出格式：每个问题给出文件路径、行号、问题描述和修复建议。"
+}
+```
+
+**2. Extensions（工具扩展）**
+
+Extensions 添加新的工具能力。比如给 Agent 加一个数据库查询工具：
+
+```typescript
+// extensions/db-query.ts
+import { defineExtension } from "@anthropic/coding-agent";
+
+export default defineExtension({
+  name: "db-query",
+  tools: [
+    {
+      name: "query_database",
+      description: "执行 SQL 查询并返回结果",
+      parameters: {
+        type: "object",
+        properties: {
+          sql: { type: "string", description: "要执行的 SQL 语句" },
+          database: { type: "string", description: "数据库名" },
+        },
+        required: ["sql"],
+      },
+      execute: async ({ sql, database }) => {
+        // 实际执行查询
+        const result = await db.query(sql, database);
+        return JSON.stringify(result, null, 2);
+      },
+    },
+  ],
+});
+```
+
+**3. Pi Packages（完整包集成）**
+
+直接引用 pi-mono 的其他包，比如在 coding-agent 里用 `vllm-pods` 管理 GPU 实例，或用 `slack-bot` 发通知。
+
+### 自定义模型配置
+
+coding-agent 默认用 Claude Sonnet，但你可以通过配置文件添加任意模型：
+
+```json
+// ~/.pi/agent/models.json
+{
+  "models": [
+    {
+      "id": "deepseek-coder-v3",
+      "provider": "openai-compatible",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "${DEEPSEEK_API_KEY}",
+      "maxTokens": 8192,
+      "supportsTools": true
+    },
+    {
+      "id": "local-qwen-32b",
+      "provider": "openai-compatible",
+      "baseUrl": "http://localhost:8000/v1",
+      "maxTokens": 4096,
+      "supportsTools": true
+    }
+  ]
+}
+```
+
+用环境变量 `${DEEPSEEK_API_KEY}` 引用密钥，避免明文写入配置文件。`supportsTools` 标记该模型是否支持工具调用 —— 不支持的模型会退化为纯文本模式。
+
+### Plan-First 工作流
+
+面对复杂任务，coding-agent 支持 plan-first 模式：先生成结构化执行计划，确认后再逐步执行。
+
+```
+> pi agent --plan "把这个 Express 应用从 JavaScript 迁移到 TypeScript"
+
+📋 执行计划：
+1. 分析当前项目结构和依赖
+2. 安装 TypeScript 相关依赖 (typescript, @types/node, @types/express, ts-node)
+3. 创建 tsconfig.json
+4. 逐文件重命名 .js → .ts 并添加类型注解
+   - src/app.js → src/app.ts
+   - src/routes/*.js → src/routes/*.ts
+   - src/middleware/*.js → src/middleware/*.ts
+5. 修改 package.json 的 scripts，使用 ts-node 和 tsc
+6. 运行 tsc --noEmit 检查类型错误并修复
+7. 运行测试套件确认迁移无破坏
+
+确认执行？(y/n)
+```
+
+这比让 Agent 直接开始改代码靠谱得多 —— 你能在执行前审查计划，避免 Agent 走弯路。
+
+## tui：差分渲染终端 UI
+
+`tui` 包提供终端 UI 组件，但和 Ink（React 驱动的终端 UI）不同，它用**差分渲染**策略 —— 只重绘变化的部分，不重绘整个屏幕。
+
+```typescript
+import { TerminalUI, TextBlock, Spinner, ProgressBar } from "@anthropic/tui";
+
+const ui = new TerminalUI();
+
+// 显示 Agent 思考状态
+const spinner = ui.addSpinner("正在分析代码结构...");
+
+// Agent 完成一步后更新
+spinner.stop();
+ui.addTextBlock({
+  title: "分析结果",
+  content: "发现 23 个 TypeScript 文件，4 个配置文件",
+  style: "info",
+});
+
+// 显示进度条
+const progress = ui.addProgressBar({
+  total: 23,
+  label: "迁移进度",
+});
+
+for (let i = 0; i < 23; i++) {
+  await migrateFile(files[i]);
+  progress.increment();
+}
+```
+
+差分渲染的好处是：终端不会闪烁。传统方式（清屏重绘）在快速更新时会明显闪烁，特别是在较慢的终端模拟器里。差分渲染只更新变化的字符位置，视觉上更流畅。
+
+## vLLM Pods：大多数工具箱忽视的领域
+
+这是 pi-mono 最独特的包。市面上几乎所有 AI Agent 工具箱都只管 LLM 调用，不管 LLM 部署。你要自建推理服务，得自己写 Docker Compose、Kubernetes 配置、健康检查脚本、负载均衡。
+
+`vllm-pods` 把这些运维操作封装成 TypeScript API：
+
+```typescript
+import { PodManager } from "@anthropic/vllm-pods";
+
+const manager = new PodManager({
+  gpuType: "A100",
+  maxPods: 3,
+  healthCheckInterval: 30000, // 30秒检查一次
+});
+
+// 启动一个 vLLM 推理实例
+const pod = await manager.createPod({
+  model: "meta-llama/Llama-3.1-70B-Instruct",
+  tensorParallelSize: 2,    // 2 GPU 张量并行
+  maxModelLen: 8192,
+  port: 8000,
+});
+
+// 检查状态
+const status = await pod.getStatus();
+console.log(`Pod 状态: ${status.state}`);     // running | starting | error
+console.log(`GPU 利用率: ${status.gpuUtil}%`);
+console.log(`已处理请求: ${status.requestCount}`);
+
+// 扩容：再加一个实例
+const pod2 = await manager.createPod({
+  model: "meta-llama/Llama-3.1-70B-Instruct",
+  tensorParallelSize: 2,
+  port: 8001,
+});
+
+// 缩容：移除一个实例
+await manager.removePod(pod2.id);
+```
+
+典型使用场景：
+
+- **开发团队自建推理服务**：用 vllm-pods 管理多个模型实例，不同项目用不同模型
+- **成本优化**：按需启停 GPU 实例，非工作时间自动缩容
+- **A/B 测试**：同时运行两个版本的微调模型，对比效果
+
+## Session 共享：用真实任务改进 Agent
+
+coding-agent 有一个独特的设计：**鼓励用户分享编码 session 数据**。
+
+这背后的逻辑是：当前 Agent 的训练数据和评测基准（SWE-bench、HumanEval）都是人造的 toy problem。真实世界的编码任务 —— 调试一个诡异的 race condition、把 monolith 拆成微服务、在遗留代码上加新功能 —— 这些任务的复杂度和 benchmark 完全不在一个量级。
+
+pi-mono 的方案是：
+
+1. **Opt-in 共享**：用户主动选择分享哪些 session
+2. **数据审查**：共享前可以查看完整的 session 内容，删除敏感信息
+3. **公开数据集**：共享的 session 数据构成公开的 OSS 数据集
+4. **模型改进**：用真实 session 数据微调和评测 Agent 模型
+
+```bash
+# 查看可共享的 session 列表
+pi session list
+
+# 审查某个 session 的内容
+pi session view <session-id>
+
+# 共享到公开数据集
+pi session share <session-id>
+```
+
+> **⚠️ 注意**：共享前务必审查 session 内容。编码 session 可能包含 API 密钥、数据库密码等敏感信息。pi-mono 会自动检测常见的密钥格式并标记，但不能保证 100% 覆盖。
+
+## 快速上手：从零跑通
+
+### 环境准备
+
+```bash
+# 克隆仓库
+git clone https://github.com/anthropics/pi-mono.git
+cd pi-mono
+
+# 安装依赖（使用 npm）
+npm install
+
+# 构建所有包
+npm run build
+
+# 类型检查
+npm run check
+```
+
+### 运行测试
+
+```bash
+# 完整测试套件
+./test.sh
+
+# 从源码直接运行 pi CLI
+./pi-test.sh
+```
+
+### 配置 LLM 提供商
+
+```bash
+# 设置 API 密钥（选一个即可）
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+export GOOGLE_API_KEY="AIza..."
+```
+
+### 启动编码 Agent
+
+```bash
+# 用默认配置启动
+./pi-test.sh agent
+
+# 指定模型
+./pi-test.sh agent --model claude-sonnet-4-20250514
+
+# 启用 plan-first 模式
+./pi-test.sh agent --plan "重构这个模块的错误处理"
+```
+
+### 在自己的项目中使用 pi-ai
+
+```bash
+# 在你的项目中安装 pi-ai
+npm install @anthropic/pi-ai
+```
+
+```typescript
+// src/index.ts
+import { createProvider } from "@anthropic/pi-ai";
+
+const provider = createProvider({
+  provider: "anthropic",
+  model: "claude-sonnet-4-20250514",
+  apiKey: process.env.ANTHROPIC_API_KEY!,
+});
+
+async function main() {
+  // 简单对话
+  const response = await provider.chat({
+    messages: [
+      { role: "system", content: "你是一个 TypeScript 专家。" },
+      { role: "user", content: "解释 conditional types 的工作原理" },
+    ],
+    temperature: 0.3,
+  });
+
+  console.log(response.content);
+
+  // 流式输出
+  const stream = await provider.chatStream({
+    messages: [
+      { role: "user", content: "用 TypeScript 实现一个 LRU Cache" },
+    ],
+  });
+
+  for await (const chunk of stream) {
+    process.stdout.write(chunk.content);
+  }
+}
+
+main();
+```
+
+## 与 Claude Code 的定位差异
+
+把 pi-mono 的 coding-agent 和 Claude Code 放在一起比较：
+
+| 维度 | pi-mono coding-agent | Claude Code |
+|------|---------------------|-------------|
+| 源码 | 开源，MIT 许可 | 闭源 |
+| LLM 支持 | 任意提供商，含本地模型 | 仅 Anthropic |
+| 扩展机制 | Skills + Extensions + Pi Packages | MCP + Slash Commands |
+| UI | 内置 TUI + Web UI | 终端 CLI |
+| 部署管理 | 内置 vllm-pods | 无 |
+| 数据主权 | 完全本地，可选共享 | 对话不离开本地 |
+| 成熟度 | 早期项目，生态较小 | 生产级，生态丰富 |
+
+简单来说：如果你只用 Anthropic 的模型、追求开箱即用的体验，Claude Code 更好。如果你需要接入多个提供商、定制 Agent 行为、管理自建推理服务，pi-mono 是更灵活的选择。
+
+两者不是非此即彼 —— 你完全可以用 pi-ai 做多提供商 LLM 调用层，同时用 Claude Code 做日常编码 Agent。
+
+## 实际场景：用 pi-mono 搭建内部编码助手
+
+假设你的团队需要一个内部编码助手，要求：
+
+1. 支持公司自建的微调模型（跑在 vLLM 上）
+2. 回退到 Claude Sonnet 处理复杂任务
+3. 通过 Slack 接收请求
+4. 有 Web 界面给非终端用户使用
+
+用 pi-mono 的方案：
+
+```typescript
+// internal-assistant.ts
+import { createProvider } from "@anthropic/pi-ai";
+import { CodingAgent } from "@anthropic/coding-agent";
+import { SlackBot } from "@anthropic/slack-bot";
+import { WebUI } from "@anthropic/web-ui";
+import { PodManager } from "@anthropic/vllm-pods";
+
+// 1. 管理自建模型
+const pods = new PodManager({ gpuType: "A100", maxPods: 2 });
+const internalPod = await pods.createPod({
+  model: "company/finetuned-coder-34b",
+  port: 8000,
+});
+
+// 2. 配置多提供商
+const internalModel = createProvider({
+  provider: "openai-compatible",
+  model: "company-coder",
+  baseUrl: "http://localhost:8000/v1",
+});
+
+const claudeFallback = createProvider({
+  provider: "anthropic",
+  model: "claude-sonnet-4-20250514",
+  apiKey: process.env.ANTHROPIC_API_KEY!,
+});
+
+// 3. 创建 Agent，优先用内部模型，复杂任务回退 Claude
+const agent = new CodingAgent({
+  primaryProvider: internalModel,
+  fallbackProvider: claudeFallback,
+  fallbackThreshold: 0.7, // 置信度低于 0.7 时回退
+});
+
+// 4. Slack 集成
+const bot = new SlackBot({
+  token: process.env.SLACK_BOT_TOKEN!,
+  agent,
+  channels: ["#dev-assistant"],
+});
+
+// 5. Web UI
+const webui = new WebUI({
+  agent,
+  port: 3000,
+  auth: { type: "oauth", provider: "google" },
+});
+
+await Promise.all([bot.start(), webui.start()]);
+console.log("内部编码助手已启动");
+```
+
+这段代码用到了 pi-mono 的 5 个包：`pi-ai`、`coding-agent`、`slack-bot`、`web-ui`、`vllm-pods`。如果没有 monorepo 的统一架构，你需要自己写大量的胶水代码来串联这些功能。
+
+## 踩坑记录
+
+在实际使用 pi-mono 过程中，有几个坑值得注意：
+
+**1. Node.js 版本要求**
+
+pi-mono 使用 ES modules 和较新的 Node.js API，要求 Node.js 18+。用 Node.js 16 会在 `npm run build` 阶段报错，错误信息不明显（ERR_UNKNOWN_FILE_EXTENSION）。
+
+**2. 构建顺序依赖**
+
+由于包之间存在依赖关系（`coding-agent` 依赖 `pi-ai` 和 `tui`），首次 `npm run build` 必须完整跑一次。如果只改了 `pi-ai` 的代码，需要重新构建依赖它的包：
+
+```bash
+# 只重建 pi-ai 和依赖它的包
+npm run build --workspace=packages/pi-ai
+npm run build --workspace=packages/coding-agent
+```
+
+**3. API 密钥格式校验**
+
+`pi-ai` 会在创建 provider 时校验 API 密钥格式。Anthropic 的密钥必须以 `sk-ant-` 开头，OpenAI 的必须以 `sk-` 开头。如果你用环境变量传密钥，注意不要带多余的引号或换行符：
+
+```bash
+# 正确
+export ANTHROPIC_API_KEY=sk-ant-abc123
+
+# 错误（多了引号，会被当作密钥的一部分）
+export ANTHROPIC_API_KEY="sk-ant-abc123"
+```
+
+**4. vllm-pods 需要 Docker**
+
+`vllm-pods` 底层用 Docker 管理容器。确保本地安装了 Docker 并且 Docker daemon 正在运行，否则 `createPod` 会抛出连接错误。
+
+## 总结
+
+pi-mono 的价值不在于它的任何一个单独包有多强 —— `pi-ai` 比不过成熟的 LiteLLM，`coding-agent` 比不过 Claude Code 的开箱体验。它的价值在于**集成**：7 个包共享类型系统、统一错误处理、版本锁步发布，从 LLM 调用到 GPU 部署一个 monorepo 搞定。
+
+适合 pi-mono 的团队画像：
+
+- 需要接入多个 LLM 提供商（不想被单一厂商锁定）
+- 有自建推理服务的需求（vLLM、TGI）
+- 想要深度定制 Agent 行为（不满足于商业工具的黑箱）
+- TypeScript 技术栈，希望工具链语言统一
+
+不适合的场景：
+
+- 只用一个 LLM 提供商 —— 直接用官方 SDK 更简单
+- 追求开箱即用 —— Claude Code、Cursor 更成熟
+- Python 技术栈 —— pi-mono 是纯 TypeScript，没有 Python binding
+
+项目还在早期阶段（GitHub 8.6K stars），API 可能会有 breaking changes。但它代表了一个有趣的方向：**把 AI Agent 工具链的碎片拼成一个内聚的整体**。如果你正在搭建 Agent 基础设施，值得关注。
