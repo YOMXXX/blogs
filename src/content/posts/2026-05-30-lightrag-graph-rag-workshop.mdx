@@ -1,0 +1,302 @@
+---
+title: "LightRAG 实战：用知识图谱给 RAG 装上多跳推理大脑"
+description: "LightRAG 把图结构引入 RAG，文档分块后抽取实体与关系建知识图谱，检索时结合低层与高层双层检索，再融合图上下文与向量结果。本文从原理到 Ollama 本地部署、Neo4j 图存储、四种检索模式对比，给出完整实战代码。"
+column: "workshop"
+tags: ["RAG", "LightRAG", "知识图谱", "Graph-RAG", "Ollama", "Neo4j", "检索增强"]
+pubDate: 2026-05-30
+featured: false
+tldr: "传统向量 RAG 把文档切成孤立 chunk，遇到多跳问答和需要全局理解的查询就力不从心。LightRAG 在分块基础上用 LLM 抽取实体与关系构建知识图谱，检索时用低层（具体实体）+ 高层（主题概念）双层策略融合图结构与向量结果。相比微软 GraphRAG 更轻量、增量更新成本低、建索引 token 消耗更少。本文从核心原理讲到 Ollama 本地部署、Neo4j 图存储、增量插入与 naive/local/global/hybrid 四种模式对比，给出可跑的完整代码。"
+author: "YOMXXX"
+faq:
+  - q: "LightRAG 和传统向量 RAG 的核心区别是什么？"
+    a: "传统向量 RAG 把文档切成固定大小的 chunk，各自独立做向量检索，chunk 之间没有显式关联。LightRAG 在分块之上额外做一步：用 LLM 从每个 chunk 抽取实体和实体间的关系，构建一张知识图谱。检索时不仅匹配语义相似的 chunk，还能沿图上的关系路径找到关联实体，因此在多跳问答和需要全局理解的查询上表现明显更好。"
+  - q: "LightRAG 的四种检索模式 naive/local/global/hybrid 怎么选？"
+    a: "naive 是纯向量检索，不用图，最快但最浅；local 偏向具体实体的低层检索，适合问某个具体对象的细节；global 偏向主题和概念的高层检索，适合需要全局把握的概括性问题；hybrid 同时融合低层和高层，是大多数场景的默认推荐。不确定时先用 hybrid，对延迟敏感且问题简单时退回 naive。"
+  - q: "LightRAG 相比微软 GraphRAG 有什么优势？"
+    a: "主要是更轻量和更省钱。GraphRAG 在建索引阶段要做社区检测、生成社区摘要，token 消耗很大，增量更新往往需要重建。LightRAG 的图谱结构更简单，新增文档时只需对增量文档抽取实体关系并合并进现有图，不必重建整个索引，因此建索引的 token 成本和增量更新成本都低很多。"
+  - q: "可以完全用本地模型跑 LightRAG 吗？"
+    a: "可以。LightRAG 通过函数参数注入 LLM 和 embedding 函数，只要符合调用约定即可。用 Ollama 拉一个生成模型（如 qwen2.5 或 llama3.1）和一个嵌入模型（如 nomic-embed-text），把对应的异步调用函数传给 LightRAG 实例，全程不依赖 OpenAI，适合数据敏感或离线场景。"
+  - q: "LightRAG 支持哪些存储后端？"
+    a: "默认用本地文件做 KV 存储和向量存储，零依赖、开箱即用，适合原型验证。生产环境可以替换为更专业的后端：图存储支持 Neo4j，向量存储支持 PGVector、Milvus 等，KV 存储也可换成 Redis、PostgreSQL。这些后端通过环境变量或初始化参数配置，业务代码基本不用改。"
+---
+
+> **💡 一句话总结**：传统 RAG 把文档切成一盘散沙似的 chunk，问题一旦需要跨多个片段串联推理就抓瞎。LightRAG 在分块之上抽取实体与关系建成知识图谱，让检索既能精确定位实体细节，又能从主题概念层面把握全局——这就是图结构给 RAG 带来的多跳推理能力。
+
+## 痛点：向量 RAG 为什么答不好「关系型」问题
+
+先看一个典型场景。你把一本公司内部技术手册灌进朴素向量 RAG，然后问：
+
+> 「负责支付网关的那个团队，他们用的消息队列是哪个，这个队列又是谁在维护？」
+
+这是一个三跳问题：支付网关团队 → 用的消息队列 → 队列的维护方。答案散落在手册的三个不同章节里。朴素向量 RAG 的工作方式是：把问题向量化，去匹配语义最相似的几个 chunk。问题在于——
+
+- 「支付网关团队」那段和「消息队列维护方」那段，**语义相似度可能并不高**，向量检索很可能只召回前者，漏掉后者。
+- 即使两段都召回了，chunk 之间**没有显式的关联**，模型得自己在上下文里碰运气拼接。
+
+```
+朴素向量 RAG 的盲区：
+
+文档 → 切成固定大小 chunk → 各自向量化 → 存入向量库
+                                              ↓
+查询 → 向量化 → 找 top-k 最相似 chunk → 喂给 LLM
+
+问题：chunk 之间是「孤岛」，没有关系边
+      多跳问答 / 全局概括类问题 → 召回不全、推理断链
+```
+
+根因不在 embedding 模型不够强，而在**架构**：朴素 RAG 把文档当成线性的、互不相干的文本片段，而真实知识是**网状的**——实体之间有大量「属于」「调用」「维护」「依赖」这样的关系。丢掉这层关系结构，多跳推理就无从谈起。
+
+## LightRAG 的思路：在分块之上叠一层知识图谱
+
+LightRAG 来自香港大学 HKUDS 团队，思路非常直接：**别让 chunk 当孤岛，给它们之间补上关系边。**
+
+它的核心流程可以拆成索引和查询两个阶段。
+
+### 索引阶段：从文本里「长」出一张图
+
+```
+原始文档
+   ↓
+① 文档切分（chunking）
+   ↓
+② 对每个 chunk 用 LLM 抽取实体和关系
+     实体：支付网关团队、RocketMQ、中间件组 …
+     关系：(支付网关团队)--[使用]-->(RocketMQ)
+           (RocketMQ)--[维护方]-->(中间件组)
+   ↓
+③ 合并去重，构建知识图谱（节点=实体，边=关系）
+     同时为实体、关系、chunk 各自建向量索引
+   ↓
+④ 落盘：图存储 + 向量存储 + KV 存储
+```
+
+关键在第 ② 步：LightRAG 让 LLM 不只是被动地被检索，而是在建索引时主动「读懂」文档，把里面的实体和关系结构化抽出来。这些关系边就是后续多跳推理的「轨道」。
+
+### 查询阶段：低层 + 高层的双层检索
+
+这是 LightRAG 最有特色的设计。它把检索拆成两个层次：
+
+| 层次 | 检索对象 | 回答的问题类型 | 例子 |
+|------|---------|--------------|------|
+| **低层检索（local）** | 具体实体、具体关系 | 「某个东西的细节是什么」 | RocketMQ 的维护方是谁 |
+| **高层检索（global）** | 主题、概念、全局摘要 | 「整体上是怎么回事」 | 公司的中间件技术栈整体格局 |
+
+- **低层检索**：从查询里提取出具体的实体关键词，去图里精确定位对应节点，再沿关系边扩展到邻接实体——这正是多跳问答需要的能力。
+- **高层检索**：从查询里提取出概念性的主题关键词，匹配到图中更宏观的概念簇和关系群，用于需要全局把握的概括性问题。
+
+`hybrid` 模式则把两层的检索结果连同向量召回的原始 chunk 一起融合，再喂给 LLM 生成答案。一句话：**既见树木，又见森林。**
+
+### 和微软 GraphRAG 比，轻在哪
+
+很多人会拿 LightRAG 和微软的 GraphRAG 对比。两者都引入了图，但取舍不同：
+
+| 维度 | 微软 GraphRAG | LightRAG |
+|------|--------------|----------|
+| 图谱构建 | 实体关系 + 社区检测 + 社区摘要 | 实体关系 + 双层关键词，结构更简单 |
+| 建索引 token 成本 | 较高（要生成大量社区摘要） | 较低 |
+| 增量更新 | 往往需要重建索引 | 支持增量插入，只处理新增文档 |
+| 上手复杂度 | 较重 | 轻量，本地零依赖即可跑 |
+
+> **💡 提示**：以上为定性对比。GraphRAG 的社区摘要在某些超大规模、强全局概括的场景有其价值；LightRAG 的取舍是用更简单的双层检索换取低成本和增量友好，对大多数工程团队的日常 RAG 需求更划算。
+
+## 环境搭建：本地零成本起步
+
+先装包：
+
+```bash
+pip install lightrag-hku
+# 若要用 Neo4j / PGVector 等后端，按需安装对应驱动
+pip install neo4j
+```
+
+本文走「全本地」路线，用 Ollama 跑模型，数据不出本机。先准备 Ollama：
+
+```bash
+# 安装并启动 Ollama 后，拉两个模型
+ollama pull qwen2.5            # 负责实体抽取 + 答案生成
+ollama pull nomic-embed-text  # 负责向量嵌入
+```
+
+## 实战一：用 Ollama 本地跑通 LightRAG
+
+下面是最小可用骨架。注意 LightRAG 的 LLM 函数和 embedding 函数都是**注入**进去的，所以换模型只是换函数，业务逻辑不动。
+
+> 以下代码以 LightRAG 公开 API 为蓝本，部分辅助函数签名为**示意**，实际以你安装版本的文档为准。
+
+```python
+import os
+import asyncio
+from lightrag import LightRAG, QueryParam
+from lightrag.llm.ollama import ollama_model_complete, ollama_embed
+from lightrag.utils import EmbeddingFunc
+
+WORKING_DIR = "./rag_workspace"
+os.makedirs(WORKING_DIR, exist_ok=True)
+
+async def build_rag():
+    rag = LightRAG(
+        working_dir=WORKING_DIR,
+        # 生成模型：本地 qwen2.5
+        llm_model_func=ollama_model_complete,
+        llm_model_name="qwen2.5",
+        llm_model_kwargs={"host": "http://localhost:11434"},
+        # 嵌入模型：本地 nomic-embed-text
+        embedding_func=EmbeddingFunc(
+            embedding_dim=768,         # nomic-embed-text 维度
+            max_token_size=8192,
+            func=lambda texts: ollama_embed(
+                texts,
+                embed_model="nomic-embed-text",
+                host="http://localhost:11434",
+            ),
+        ),
+    )
+    # 新版本需要显式初始化存储
+    await rag.initialize_storages()
+    return rag
+```
+
+> **⚠️ 注意**：`embedding_dim` 必须和嵌入模型实际输出维度一致（nomic-embed-text 是 768）。填错会在写向量库时报维度不匹配。
+
+## 实战二：插入文档建索引
+
+`insert` 会触发完整的「切分 → 抽取实体关系 → 建图 + 向量索引」流程。第一次插入会调用 LLM 做实体抽取，耗时主要在这里。
+
+```python
+async def main():
+    rag = await build_rag()
+
+    doc = """
+    支付网关团队负责公司的在线交易入口，他们使用 RocketMQ 作为消息队列
+    来削峰填谷。RocketMQ 的日常运维由中间件组负责，中间件组同时也维护
+    Redis 集群。风控团队订阅了支付网关产生的交易消息，用于实时反欺诈。
+    """
+
+    # 插入即建索引：切分 + LLM 抽取实体关系 + 建图 + 向量化
+    await rag.insert(doc)
+    print("索引构建完成，知识图谱已落盘到 working_dir")
+
+asyncio.run(main())
+```
+
+跑完后，去 `working_dir` 里能看到图存储、向量存储、KV 存储对应的文件。此时图里已经有了 `支付网关团队`、`RocketMQ`、`中间件组`、`风控团队` 这些节点，以及它们之间的 `使用`、`维护`、`订阅` 等关系边。
+
+## 实战三：四种检索模式对比
+
+现在回到开头那个三跳问题，看四种模式的差异。`QueryParam` 的 `mode` 参数有 `naive / local / global / hybrid` 四种。
+
+```python
+async def compare_modes(rag):
+    question = "支付网关团队用的消息队列是哪个，这个队列由谁维护？"
+
+    for mode in ["naive", "local", "global", "hybrid"]:
+        ans = await rag.query(
+            question,
+            param=QueryParam(mode=mode),
+        )
+        print(f"\n===== mode = {mode} =====")
+        print(ans)
+```
+
+四种模式的定性表现：
+
+| mode | 是否用图 | 这个三跳问题上的表现 | 适用场景 |
+|------|---------|-------------------|---------|
+| `naive` | 否 | 可能只召回「用 RocketMQ」，漏掉维护方 | 简单事实、对延迟敏感 |
+| `local` | 是（低层） | 能沿 `RocketMQ--[维护]-->中间件组` 补全 | 问具体实体细节、多跳 |
+| `global` | 是（高层） | 偏概念，细节问题上反而不如 local | 全局概括、主题归纳 |
+| `hybrid` | 是（双层） | 综合最稳，细节 + 上下文都全 | 默认推荐 |
+
+可以明显看到：朴素 `naive` 在这种关系型问题上容易断链，而 `local` 和 `hybrid` 借助图上的关系边，能把「队列是谁维护」这一跳补齐。
+
+## 实战四：增量更新——LightRAG 的省钱杀手锏
+
+真实业务里文档是持续新增的。LightRAG 的增量插入只处理**新增文档**，对其抽取实体关系后合并进现有图，不重建整个索引。
+
+```python
+async def incremental_update(rag):
+    new_doc = """
+    2026 年起，中间件组将 RocketMQ 升级到 5.0 版本，并引入了
+    Apache Pulsar 做多租户隔离试点。Pulsar 的试点由新成立的
+    流计算小组牵头。
+    """
+    # 增量插入：只对 new_doc 做实体抽取并合并进现有图
+    await rag.insert(new_doc)
+
+    # 新关系立刻可查：Pulsar--[试点牵头]-->流计算小组
+    ans = await rag.query(
+        "谁在牵头 Pulsar 的试点？和中间件组是什么关系？",
+        param=QueryParam(mode="hybrid"),
+    )
+    print(ans)
+```
+
+新文档里的 `Apache Pulsar`、`流计算小组` 等实体会被抽取出来，和已有的 `中间件组`、`RocketMQ` 自动连成一张更大的图。**没有重建，没有全量重算 embedding**，这正是 LightRAG 相比 GraphRAG 在迭代型知识库上的成本优势。
+
+## 实战五：换上 Neo4j 做图存储
+
+本地文件存储适合原型，节点和关系上规模后建议换 Neo4j：图查询性能更好，还能用 Neo4j Browser 可视化你的知识图谱。
+
+```bash
+# 用 Docker 起一个 Neo4j
+docker run -d --name lightrag-neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/your_password \
+  neo4j:latest
+```
+
+LightRAG 通过环境变量切换图存储后端（具体变量名以你的版本文档为准，下为**示意**）：
+
+```python
+import os
+# 切换图存储为 Neo4j（变量名按版本文档为准）
+os.environ["NEO4J_URI"] = "bolt://localhost:7687"
+os.environ["NEO4J_USERNAME"] = "neo4j"
+os.environ["NEO4J_PASSWORD"] = "your_password"
+
+rag = LightRAG(
+    working_dir=WORKING_DIR,
+    graph_storage="Neo4JStorage",     # 指定图存储后端
+    llm_model_func=ollama_model_complete,
+    # ... 其余配置同前
+)
+await rag.initialize_storages()
+```
+
+切换后，索引和查询的业务代码完全不用改——这正是 LightRAG 把存储抽象成可插拔后端的好处。同理，向量存储可以换成 PGVector、Milvus，KV 存储可换 Redis 或 PostgreSQL。
+
+## 生产环境的几条实用建议
+
+1. **实体抽取模型别太小**。建索引阶段的实体关系抽取质量直接决定图的质量。本地跑建议至少用 7B 级别（qwen2.5、llama3.1），太小的模型抽出来的关系噪声大，图会「脏」。
+2. **分块大小要调**。chunk 太大，单次抽取实体过多容易漏；太小则上下文不足，关系抽不全。先用默认值跑通，再针对你的文档类型微调。
+3. **首次建索引可能很慢**。因为每个 chunk 都要过一次 LLM 做抽取。大文档库建议先小批量验证抽取质量，再全量灌入；能并发就开并发。
+4. **优先 hybrid，按需降级**。除非问题极简单或对延迟极敏感，否则默认 `hybrid`。延迟敏感的简单事实查询可退回 `naive` 省一次图检索。
+5. **图存储尽早上 Neo4j**。一旦节点上万，本地文件图存储的检索会变慢，Neo4j 的图遍历优势会越来越明显，顺带还能可视化排查图质量。
+
+## 适用场景与局限
+
+**适合 LightRAG 的场景：**
+
+- 多跳问答（答案要跨多个片段串联）。
+- 需要全局理解的概括性问题（高层检索发挥作用）。
+- 知识库持续增量更新、希望控制建索引成本。
+- 数据敏感、要求全本地部署（Ollama + 本地存储）。
+
+**不那么适合的场景：**
+
+- 纯粹的单跳事实查询，朴素向量 RAG 已经够用，上图谱是过度设计。
+- 文档实体稀疏、关系寥寥（比如纯叙事文本），抽不出多少有用的边，图的收益有限。
+- 对建索引延迟极度敏感且文档量巨大——实体抽取的 LLM 调用成本要提前评估。
+
+> **⚠️ 提醒**：图谱质量高度依赖抽取模型。如果发现答案变差，先去 Neo4j 里看看图——很多时候问题不在检索，而在建索引时实体关系就抽错了。
+
+## 小结
+
+LightRAG 的价值可以浓缩成一句话：**用一层轻量知识图谱，给向量 RAG 补上它最缺的「关系」维度。**
+
+- **核心创新**：分块之上抽取实体关系建图 + 低层（具体实体）/ 高层（主题概念）双层检索。
+- **四种模式**：`naive` 纯向量、`local` 重细节、`global` 重全局、`hybrid` 双层融合（默认选它）。
+- **工程优势**：相比 GraphRAG 更轻、建索引 token 更省、增量更新不重建。
+- **部署灵活**：LLM 和 embedding 都可注入，本地 Ollama 即可跑；存储后端可插拔，生产上 Neo4j。
+
+如果你的 RAG 总在「关系型」「多跳」「要全局视角」的问题上翻车，LightRAG 值得一试——它不追求最复杂的图算法，而是用最务实的方式，把知识网络的那张「关系网」补回来。

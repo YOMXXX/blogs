@@ -1,0 +1,144 @@
+---
+title: "2026 AI Agent 框架星标竞赛：OpenClaw、Hermes 与传统框架的格局"
+description: "横评 2026 年 AI Agent 框架格局：OpenClaw 登顶 GitHub 史上最多星标，Hermes Agent 增速更猛，LangGraph 与 Microsoft Agent Framework 守住企业生产，附按场景选型建议与安全风险提醒。"
+column: "tools"
+tags: ["AI-Agent", "OpenClaw", "Hermes-Agent", "LangGraph", "Microsoft-Agent-Framework", "Agent-框架", "选型"]
+pubDate: 2026-05-30
+featured: false
+tldr: "2026 年 AI Agent 框架星标榜被 OpenClaw（37.3 万星，GitHub 史上第一）和 Hermes Agent（增速更猛）改写，但企业生产仍属 LangGraph 与 Microsoft Agent Framework。本文横向对比定位、成熟度与风险，给出按场景的选型清单，并客观指出 OpenClaw 的权限与供应链安全隐忧。"
+author: "YOMXXX"
+faq:
+  - q: "OpenClaw 真的是 GitHub 史上星标最多的项目吗？"
+    a: "是的。截至 2026 年 5 月 21 日的实时数据，OpenClaw 已达 373,616 stars，于 2026 年 4 月超过 React 登顶 GitHub 史上最多星标项目。它从 2026 年 1 月 30 日重新发布后 48 小时即破 10 万星，是典型的现象级增长，但星标数不等同于生产成熟度。"
+  - q: "为什么说 Hermes Agent 的增速已经超过 OpenClaw？"
+    a: "Hermes Agent 由 Nous Research 于 2026 年 2 月 25 日发布，12 周后达到 160,175 stars。按相同周龄横向对比，它的星标增速已超过当年同期的 OpenClaw。其差异化在于跨会话持久记忆与从成功任务中沉淀的过程性技能文件，更适合需要长期积累的 agent。"
+  - q: "个人自动化和企业生产应该分别选哪个框架？"
+    a: "个人助理与本地自动化可选 OpenClaw，常驻在线、接 50+ 消息平台且能自写技能；需要长期记忆的个人 agent 可选 Hermes。企业生产建议用 LangGraph（精细控制流、checkpoint）或 Microsoft Agent Framework（合并 AutoGen 与 Semantic Kernel 的统一企业框架），二者在可观测性与稳定性上更可靠。"
+  - q: "OpenClaw 存在哪些安全风险，能否上生产？"
+    a: "OpenClaw 要求宽泛权限——执行 shell、写并运行代码、浏览网页填表、控制智能家居，且技能仓库缺乏对恶意提交的严格审查，存在供应链投毒与权限滥用风险。建议仅在隔离环境、最小权限、人工审计技能来源的前提下用于个人场景，不建议直接接入企业敏感系统或生产数据。"
+  - q: "不会写代码的团队想快速搭 agent，该用什么？"
+    a: "可视化构建器更合适。Langflow（146k）、Dify（136k）、Flowise（51k）以拖拽方式编排 RAG、工具调用与多步流程，适合产品、运营或非工程团队快速做原型与内部工具。但复杂控制流、严格测试与定制能力仍弱于代码框架，规模化后通常需要迁移到 LangGraph 这类代码框架。"
+---
+
+> 一句话总结：2026 年 AI Agent 框架的星标榜被 OpenClaw 和 Hermes Agent 改写，但「星标第一」和「生产可用」是两件事——选型要看场景，不要看排行榜。
+
+## 2026 年 Agent 框架格局：一场被消费级产品搅动的竞赛
+
+过去两年，AI Agent 框架的竞争还是 LangChain、LlamaIndex、AutoGen 这些「工程师工具」之间的内卷。到了 2026 年，格局被两个面向终端用户的项目彻底搅动：**OpenClaw** 以 373,616 stars 成为 GitHub 史上星标最多的项目，**Hermes Agent** 则以更陡峭的增速逼近。
+
+与此同时，企业侧的传统框架并没有退场。LangGraph 在 2026 年 5 月发布 v1.2，Microsoft Agent Framework 在 Q1 完成 GA，可视化构建器（Langflow、Dify、Flowise）在星标 top5 里占了三席。换句话说，市场正在分层：**消费级 agent 抢星标，企业级框架抢生产，可视化构建器抢「不会写代码的人」。**
+
+行业背景也在放大这件事。GitHub Octoverse 2025 报告显示，平台上已有 430 万+ AI 相关仓库，LLM 聚焦项目同比增长 178%。Gartner 预测，到 2026 年底将有 40% 的企业应用内置任务专用 AI agent，而 2025 年这个比例还&lt;5%。需求侧的爆发，正是这场星标竞赛的底层驱动力。
+
+## 星标榜单横向对比
+
+下面这张表把主流项目放在同一坐标系里对比。星标数为 2026 年 5 月的实时/近期数据，仅供量级参考。
+
+| 项目 | Stars | 主语言 | 定位 | 成熟度 |
+|------|-------|--------|------|--------|
+| OpenClaw | 373,616 | TypeScript | 常驻个人 agent，接 50+ 消息平台，自写技能 | 现象级，生产风险高 |
+| Hermes Agent | 160,175 | Python | 带持久记忆的长期 agent，沉淀过程性技能 | 新锐，增速最快 |
+| Langflow | ~146k | Python | 可视化 agent/RAG 构建器 | 成熟 |
+| Dify | ~136k | Python | 可视化 LLMOps 平台 | 成熟 |
+| Flowise | ~51k | TypeScript | 可视化 agent 编排 | 成熟 |
+| LangGraph | —（库） | Python | 精细控制流 + checkpoint 的代码框架 | 企业生产级 |
+| Microsoft Agent Framework | —（库） | Python/.NET | 合并 AutoGen + Semantic Kernel 的统一企业框架 | 企业生产级（Q1 GA） |
+| NemoClaw | ~20k | TypeScript | OpenClaw 类衍生 | 早期 |
+| Moltworker | ~9.9k | TypeScript | Cloudflare 边缘 agent | 早期 |
+| ZeroClaw / OpenFang / IronClaw | — | Rust | 性能敏感的高性能 agent | 早期，梯队收敛 |
+
+> **💡 提示**：注意 LangGraph 和 Microsoft Agent Framework 是「库/框架」，它们的价值不在星标绝对值，而在控制力与企业特性。把它们和 OpenClaw 这种「即装即用产品」直接比星标，是不公平的对比。
+
+一个反直觉的观察是：**发布频率与星标几乎不相关。** OpenClaw 每月发布 62 个 release，而 NemoClaw（20k stars）和 Moltworker（9.9k stars）是零 release。星标更多由叙事、传播和「能立刻用上」决定，而非工程节奏。
+
+还有一个语言层面的错觉值得拆穿：TypeScript 阵营的总星标权重（约 470k）几乎全靠 OpenClaw 一个项目撑起来。**把 OpenClaw 剔除后，Python 在项目数量（8 个项目）和整体质量上都重新占优。** Rust 梯队（ZeroClaw、OpenFang、IronClaw）则说明，性能敏感的细分场景正在向 Rust 收敛。
+
+## OpenClaw 现象拆解：约一小时的原型，如何登顶
+
+OpenClaw 的起源带着典型的黑客气质。2025 年 11 月，Peter Steinberger 用大约一个小时做出原型——一个**跑在你自己硬件上的 TypeScript agent**，通过 WhatsApp、Telegram、Slack 等 50+ 消息平台直接跟你对话。2026 年 1 月 30 日重新发布后，48 小时内星标破 10 万，随后一路登顶。
+
+它的能力清单确实诱人：
+
+- **常驻在线**：不是一次性对话，而是持续运行的助手。
+- **浏览网页、填表**：能完成真实的网页操作。
+- **执行 shell、写并运行代码**：等于把一个能自动化的开发环境交给它。
+- **控制智能家居**：打通物理世界的自动化。
+- **自写新技能**：最大亮点——它能**自己编写新技能来扩展自身能力**，这让它从「工具」变成了「会成长的助手」。
+
+这套能力组合解释了为什么普通用户也愿意点 star：它不需要你写代码就能用，且想象空间巨大。
+
+> **⚠️ 安全警告**：OpenClaw 最值得警惕的恰恰是它最强的地方。它要求**宽泛的系统权限**——能执行任意 shell、写并运行代码、控制家居设备。安全研究者对此有合理担忧：一旦被诱导执行恶意指令，破坏面极大。更关键的是，它的**技能仓库缺乏对恶意提交的严格审查**，「自写技能 + 开放技能市场」叠加后，构成了典型的供应链投毒风险。任何「自动安装第三方技能」的便利，都是潜在的攻击入口。
+
+因此对 OpenClaw 的务实态度是：**当个人玩具和实验平台用，可以；接企业敏感系统或生产数据，不要。** 真要用，请放在隔离环境、最小权限、人工审计每一个技能来源。
+
+## Hermes Agent：用「记忆」做差异化
+
+如果说 OpenClaw 赢在「能立刻用、能自我扩展」，那 Hermes Agent 赢在**时间维度**。
+
+Nous Research 于 2026 年 2 月 25 日发布 Hermes Agent，12 周后达到 160,175 stars，按相同周龄对比，增速已经超过当年的 OpenClaw。它的核心差异化是两点：
+
+1. **跨会话持久记忆**：不像多数 agent「关掉就忘」，Hermes 在会话之间保留记忆，能记住你是谁、之前做过什么。
+2. **过程性技能文件（procedural skill files）**：从**成功完成的任务**中提炼出可复用的过程，写成技能文件。这意味着它用得越久、完成的任务越多，能力沉淀越厚。
+
+这条路线和 OpenClaw 的「现写现用技能」形成有趣对照：OpenClaw 是**广度优先**（接入一切、能力外扩），Hermes 是**深度优先**（积累记忆、沉淀经验）。对于需要长期陪伴、随时间变聪明的个人 agent，Hermes 的范式更对路。
+
+## 企业生产：LangGraph 与 Microsoft Agent Framework
+
+星标榜热闹，但真正要把 agent 跑进生产的团队，目光会落在两个「不靠星标说话」的框架上。
+
+**LangGraph v1.2（2026 年 5 月）** 这一版把工程化做得更扎实：
+
+- **每节点超时 / 错误恢复 / 优雅关闭**：让长链路 agent 在某个节点卡住或失败时可控、可恢复，而不是整条链崩掉。
+- **新增 DeltaChannel**：显著降低长线程 checkpoint 的开销，长对话场景下的状态持久化更省资源。
+- **以 content-block 为中心的流式 API v3**：流式输出粒度更细，便于做实时 UI 与中间结果展示。
+
+LangGraph 的核心卖点始终是**对控制流的精细掌控**——你能显式定义图、节点、状态与回退路径，这正是生产环境最需要的可预测性。
+
+**Microsoft Agent Framework（2026 Q1 GA）** 则走整合路线，把 **AutoGen + Semantic Kernel 合并为统一框架**，支持多 agent 对话与一整套企业特性（身份、合规、可观测性、与 Azure 生态打通）。对已经在微软技术栈里的企业，它是「开箱即用且有厂商背书」的稳妥选择。
+
+> **💡 提示**：企业选型的真正分水岭不是「哪个星标高」，而是「出问题时能不能 debug、能不能审计、能不能回滚」。OpenClaw 这类产品在这三点上都偏弱，而 LangGraph / Microsoft Agent Framework 正是为这三点而生。
+
+## 可视化构建器：给「不写代码的人」的入口
+
+星标 top5 里有 3 个是可视化构建器，这本身就是一个强信号：**大量需求来自非工程团队。**
+
+- **Langflow（~146k）**：拖拽式编排 agent 与 RAG 流程，社区活跃，组件丰富。
+- **Dify（~136k）**：更偏 LLMOps 平台，集应用编排、数据集管理、可观测于一体，适合企业内部快速搭建 AI 应用。
+- **Flowise（~51k）**：TypeScript 生态的可视化编排，轻量易上手。
+
+它们的价值在于**把搭建门槛降到拖拽级别**，让产品经理、运营、数据分析师也能拼出可用的 agent 原型。代价是：复杂控制流、严格测试、深度定制的能力弱于代码框架。常见路径是「可视化构建器做 PoC 与内部工具，验证后再迁到 LangGraph 做生产」。
+
+## 按场景的选型建议
+
+把上面的对比收敛成一张可执行的清单：
+
+| 你的场景 | 推荐 | 理由 |
+|----------|------|------|
+| 个人助理 / 本地自动化 / 接消息平台 | **OpenClaw** | 常驻在线、50+ 平台、自写技能，开箱即用 |
+| 需要长期记忆、越用越聪明的个人 agent | **Hermes Agent** | 持久记忆 + 过程性技能沉淀 |
+| 企业生产，需精细控制流与可恢复性 | **LangGraph** | 节点级超时/恢复、checkpoint、流式 v3 |
+| 企业生产，已在微软技术栈 / 要多 agent + 合规 | **Microsoft Agent Framework** | AutoGen+SK 统一，企业特性齐全 |
+| 非工程团队快速原型 / 内部工具 | **可视化构建器**（Langflow/Dify/Flowise） | 拖拽即用，门槛最低 |
+| 性能敏感、资源受限的边缘场景 | **Rust 梯队**（ZeroClaw/OpenFang/IronClaw） | 高性能，但生态尚早 |
+
+补充三条硬性提醒：
+
+1. **不要用星标当成熟度指标。** 星标衡量的是关注度和传播，不是稳定性。生产选型请看 release 节奏、issue 响应、可观测性与文档质量。
+2. **OpenClaw 上生产前先过安全关。** 隔离环境、最小权限、人工审计技能来源，三者缺一不可。
+3. **可视化构建器是起点不是终点。** 复杂度上来后，准备好向代码框架迁移的路径。
+
+## 趋势判断
+
+从这场竞赛能读出几个方向：
+
+- **消费级 agent 正在「破圈」**：OpenClaw 证明面向终端用户、零门槛、能自我扩展的 agent 能拿到远超工程工具的关注度。未来会有更多「装上就能用」的 agent 产品。
+- **记忆是下一个主战场**：Hermes 的增速说明，「会记住、会积累」的 agent 更有长期价值。预计 2026 下半年记忆/技能沉淀会成为各框架的标配能力。
+- **企业侧走向整合**：Microsoft Agent Framework 合并 AutoGen 与 Semantic Kernel，是行业从「百花齐放」走向「统一收敛」的标志。LangGraph 持续打磨工程细节，也是同一逻辑。
+- **语言分层成型**：TypeScript 靠消费级产品（OpenClaw）撑权重，Python 守住数量与质量基本盘，Rust 在性能敏感细分收敛。三者各占生态位。
+- **安全成为不可回避的议题**：能力越强、权限越宽、技能市场越开放，攻击面越大。结合 Gartner 对 40% 企业内置 agent 的预测，agent 安全将从「附属话题」变成「准入门槛」。
+
+## 小结
+
+2026 年的 AI Agent 框架格局，可以用一句话概括：**星标被消费级产品改写，生产仍属企业级框架，可视化构建器吃下非工程人群。** OpenClaw 是现象，Hermes 是新锐，LangGraph 与 Microsoft Agent Framework 是定海神针，Langflow/Dify/Flowise 是普惠入口。
+
+选型时请记住：排行榜回答的是「谁最受关注」，而你真正要回答的是「在我的场景里，谁最可靠」。把场景、成熟度和安全风险三者放在一起权衡，比盯着星标数字有意义得多。尤其是对 OpenClaw——它越强大，越值得你在接入前问一句：我真的愿意把这些权限交出去吗？
