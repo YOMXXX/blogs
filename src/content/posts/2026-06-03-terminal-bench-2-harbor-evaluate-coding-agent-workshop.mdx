@@ -1,0 +1,135 @@
+---
+title: "用 Harbor 跑 Terminal-Bench 2.0：给你的 coding agent 做一次真实评测"
+description: "公开榜单上 53% 的 agent，放进你的项目可能只有 20%。本文用 Harbor 框架跑 Terminal-Bench 2.0，从安装、接入自己的 agent、解读失败轨迹到编写贴合业务的自定义任务，给出完整可运行流程。"
+column: "workshop"
+tags: ["Terminal-Bench", "Harbor", "Agent 评测", "coding agent", "基准测试", "Claude Code", "AI 评测"]
+pubDate: 2026-06-03
+featured: false
+tldr: "选 coding agent 时大家都看公开榜单，但榜单上的 53% 放进你自己的代码库可能只剩 20%——因为评测任务和你的真实场景对不上。Terminal-Bench 2.0（Laude Institute 出品，已被 Claude Opus 4.5、GPT-5.2-Codex 的发布引用）配套的 Harbor 框架，让你能在容器里用真实终端任务评测任意 agent，还能写贴合自己业务的自定义任务。本文给出完整实战：安装 Harbor、跑通第一次评测、切换模型与 agent、读懂失败轨迹、编写自定义任务、以及云端并行加速。最后是五个避坑点。"
+author: "YOMXXX"
+faq:
+  - q: "Terminal-Bench 2.0 相比 1.0 改了什么？为什么值得切过去？"
+    a: "2.0 的核心改进是任务质量和可复现性。原版（beta，约 100 个任务）里混进了一些问题任务：有的因为人为原因根本无解、有的设了任意阈值、有的鲁棒性差（环境稍变就失败）。2.0 大幅提升了任务质量与验证严格度，让分数更可信、更能反映 agent 的真实能力。同时它由新的 Harbor 框架运行，支持云端容器、并行 rollout、以及 RL/SFT 数据接口。现在几乎所有前沿实验室都用它，Claude Opus 4.5 和 GPT-5.2-Codex 的发布都把它列为首要基准——切过去是为了和行业对齐。"
+  - q: "Harbor 和 Terminal-Bench 是什么关系？"
+    a: "Terminal-Bench 是「基准」——一组在容器化终端环境里的真实任务（编译代码、调试异步、解决安全漏洞、训练分类器等）和对应的验证脚本。Harbor 是「运行框架」——负责把任务跑起来：拉起容器、装进你的 agent、执行、用验证脚本判定通过与否、汇总分数。简单说 Terminal-Bench 是考卷，Harbor 是考场和监考。Harbor 的设计目标是通用——任何能装进容器的 agent 都能接，还支持把单机评测一键扩展到云端 100 个并行环境。"
+  - q: "评测一次要花多少钱？"
+    a: "主要成本是模型 API 调用。Terminal-Bench 2.0 的任务不少是多步、长链的（要反复执行命令、读报错、改代码），单个任务可能消耗几万到几十万 token，跑完整个数据集的 API 费用从几美元到几十美元不等，取决于模型单价和任务数。省钱办法：先用 `--n-tasks` 或任务子集小规模试跑验证流程，再跑全量；评测便宜模型时可以全量，评测贵模型时按需抽样。云端并行（Daytona）会额外产生容器费用，但能把几小时压到几分钟。"
+  - q: "我用的不是 Claude Code，是自研 agent，能评测吗？"
+    a: "能，这正是 Harbor 的设计初衷——它支持任何能安装进容器的 agent。内置适配了 Claude Code、Gemini CLI、Codex CLI 等常见 scaffold，通过 `--agent` 指定。自研 agent 需要写一个适配层：定义如何在容器里安装你的 agent、如何把任务指令传给它、如何启动它执行。官方文档有 custom agent 的接口规范，本质上是实现一个「在容器内运行你的 agent 并完成任务」的入口。一旦适配好，你的 agent 就能和 Claude Code 等跑在同一套任务上做苹果对苹果的比较。"
+  - q: "公开榜单已经有分数了，我为什么还要自己跑？"
+    a: "因为公开分数反映的是「通用任务上的平均能力」，不是「你的场景下的能力」。一个在 Terminal-Bench 上拿 50% 的 agent，在你以 Rust 为主、CI 流程特殊、依赖管理复杂的项目里可能只有 20%。自己跑的真正价值有两个：一是用 `--agent` 横比不同 agent/模型在同一标准下的真实差距，避免被厂商挑过的跑分误导；二是写自定义任务，把你团队最常踩的真实场景（你们特有的构建、部署、调试模式）变成可量化的回归测试。这比看榜单有用得多。"
+---
+
+> **💡 一句话总结**：公开榜单告诉你 agent 在「通用任务」上多强，但选型要的是它在「你的场景」上多强。Harbor + Terminal-Bench 2.0 让你能亲手量化这件事，还能把你团队的真实痛点写成自定义任务。
+
+## 一、为什么不能只看公开榜单
+
+选 coding agent 时，几乎所有人第一步都是看 Terminal-Bench、SWE-Bench 这类榜单。问题是：**榜单分数反映的是通用任务上的平均能力，不是你的场景。**
+
+一个在 Terminal-Bench 2.0 上拿 50% 的 agent，放进你的代码库——满是特有的构建流程、冷门依赖、内部约定——可能只剩 20%。更别说厂商发布时往往挑对自己有利的配置和任务子集。
+
+所以认真的选型应该自己跑评测。好消息是，Terminal-Bench 2.0 配套的 **Harbor** 框架让这件事变得不难。它是 Laude Institute 出品、被 Claude Opus 4.5 与 GPT-5.2-Codex 发布引用的行业标准基准——用它评测，等于和前沿实验室站在同一把尺子上。
+
+## 二、Terminal-Bench 2.0 + Harbor 是什么
+
+拆开看很清楚：
+
+- **Terminal-Bench 2.0 是考卷**：一组容器化终端环境里的真实任务——编译项目、调试异步代码、解决安全漏洞、训练文本分类器、修复 Python 依赖等，每个任务配一个验证脚本判定是否真正完成。
+- **Harbor 是考场**：负责拉起容器、把 agent 装进去、执行、用验证脚本判定、汇总分数。它支持任何能装进容器的 agent，还能把本地评测扩展到云端并行。
+
+下面进入实战。
+
+## 三、安装并跑通第一次评测
+
+Harbor 以 Python 包分发。安装（以官方 quickstart 为准）：
+
+```bash
+# 推荐用 uv，干净隔离
+uv tool install harbor
+# 或者 pip
+pip install harbor
+
+harbor --version
+```
+
+跑评测前需要 Docker（本地容器）和模型 API key。最小一次评测：
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-xxx
+
+harbor run \
+  --dataset terminal-bench@2.0 \
+  --agent claude-code \
+  --model anthropic/claude-opus-4-5 \
+  --n-tasks 5          # 先跑 5 个任务验证流程，别一上来全量
+```
+
+`--dataset terminal-bench@2.0` 指定基准版本，`--agent` 指定 agent scaffold，`--model` 指定底层模型，`--n-tasks` 限制任务数先小规模试跑。跑完 Harbor 会输出每个任务的通过/失败和总分。
+
+> **⚠️ 提醒**：Terminal-Bench 2.0 的任务多是多步长链的，单任务可能消耗几万到几十万 token。先用 `--n-tasks` 小跑验证流程，确认无误再跑全量，能避免一次性烧掉大笔 API 费用。
+
+## 四、横比不同 agent 与模型
+
+评测的真正价值在于**苹果对苹果的对比**。同一套任务，换 agent、换模型，看真实差距：
+
+```bash
+# 同一模型，对比不同 agent scaffold
+harbor run --dataset terminal-bench@2.0 --agent claude-code  --model anthropic/claude-opus-4-5 --n-tasks 20
+harbor run --dataset terminal-bench@2.0 --agent gemini-cli   --model google/gemini-3.1-pro     --n-tasks 20
+harbor run --dataset terminal-bench@2.0 --agent codex-cli    --model openai/gpt-5.2-codex       --n-tasks 20
+```
+
+把三次结果放一起，你会发现一个常被忽视的事实：**agent scaffold（怎么调度工具、怎么处理报错、怎么管上下文）对成绩的影响，常常不亚于底层模型本身**。同一个模型套不同 scaffold，分数能差出一截。这正是你自己跑评测才能看到、榜单单行分数掩盖掉的信息。
+
+## 五、读懂失败轨迹
+
+分数只是起点，**失败轨迹（trace）才是金矿**。Harbor 会为每次运行保存完整执行记录——agent 执行了哪些命令、看到什么输出、怎么决策。失败任务的 trace 通常暴露固定的失败模式：
+
+- 误读报错：把一个依赖缺失的报错理解成代码逻辑问题，南辕北辙；
+- 死循环：反复尝试同一个失败命令，不会换思路；
+- 过早收手：没跑验证就宣布完成；
+- 环境误判：假设了某个工具存在，实际容器里没装。
+
+把同类失败归一归，你就知道这个 agent 在你的场景里的系统性短板在哪——这比一个总分有用得多。
+
+## 六、写贴合业务的自定义任务
+
+这是整套工具最有长期价值的用法。Terminal-Bench 任务本质是一个目录，包含：任务指令、初始环境（Dockerfile）、验证脚本。你可以照着这个结构，把团队最常踩的真实场景写成任务：
+
+```text
+tasks/fix-our-flaky-build/
+├── task.yaml          # 任务描述与指令
+├── Dockerfile         # 还原你们的真实构建环境
+├── solution.sh        # 参考解法（可选，用于校准）
+└── tests/
+    └── verify.sh      # 验证脚本：构建成功且测试通过才算过
+```
+
+把你们特有的「构建总在某步挂掉」「这个内部 CLI 的用法」「这套部署流程」做成任务集，就得到了一套**贴合自己业务的 agent 回归测试**。以后每次想换 agent 或升级模型，跑一遍就知道在你的真实场景下是进步还是退步——而不是赌一个公开榜单分数。
+
+## 七、云端并行加速
+
+全量任务在单机串行跑可能要几小时。Harbor 支持云端并行（如 Daytona），把环境数拉到上百个：
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-xxx
+export DAYTONA_API_KEY=dtn-xxx
+
+harbor run \
+  --dataset terminal-bench@2.0 \
+  --agent claude-code \
+  --model anthropic/claude-opus-4-5 \
+  --n-concurrent 100      # 100 个并行环境，几小时压到几分钟
+```
+
+代价是额外的云容器费用，但当你要频繁回归（比如每次模型升级都重测）时，这笔时间账很划算。
+
+## 八、五个避坑清单
+
+1. **永远先小跑**：用 `--n-tasks` 验证流程和环境，再跑全量，否则容易在配置错误上白烧 token。
+2. **trace 比分数重要**：分数用来排序，trace 用来理解为什么——失败轨迹才是改进依据。
+3. **agent 和模型分开看**：scaffold 的影响常被低估，横比时固定一个变量。
+4. **自定义任务才是护城河**：公开任务对齐行业，自定义任务对齐业务，后者决定你的选型是否真的对。
+5. **成本要预估**：长链任务 token 消耗大，评测贵模型前先估算费用、必要时抽样。
+
+选 coding agent 不该靠看榜单拍板。用 Harbor 跑一次、读几个失败轨迹、再写两个自己的任务——你对「哪个 agent 真正适合我们」的判断，会比任何公开排行榜都靠谱。
