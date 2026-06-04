@@ -1,0 +1,176 @@
+---
+title: "Mellum2 实战：把 JetBrains 的 12B MoE 代码模型跑在自己机器上"
+description: "JetBrains 开源了 Mellum2——12B 总参、2.5B 激活的 MoE 代码模型，Apache 2.0、单卡 H100 可跑。本文给出 vLLM 部署、FIM 代码补全、工具调用 Agent、IDE 接入的完整可运行代码与避坑清单。"
+column: "workshop"
+tags: ["Mellum2", "JetBrains", "开源模型", "代码补全", "MoE", "vLLM", "FIM"]
+pubDate: 2026-06-04
+featured: false
+tldr: "2026 年 6 月 JetBrains 把 Mellum2 开源了——12B 总参、每 token 仅激活 2.5B 的 MoE 代码模型，Apache 2.0、六个变体（Base/Instruct/Thinking），单张 H100/H200/A100 约 29GB 显存就能跑。它是 IDE 里 4B 稠密补全模型 Mellum 的继任者，从单纯补全升级成完整编码模型。本文给四段直接能跑的代码：用 vLLM 起服务、用 FIM 做代码中段填充、写带工具调用的 Agent 循环、接进编辑器当本地 Copilot，最后列五个最容易踩的坑。"
+author: "YOMXXX"
+faq:
+  - q: "Mellum2 的 MoE 架构对自部署意味着什么？为什么 12B 模型只要 29GB 显存？"
+    a: "Mellum2 是混合专家（MoE）模型，12B 是所有专家权重加起来的总参数，但每个 token 前向只激活其中约 2.5B。显存占用主要由「全部专家权重要常驻」决定，所以 12B 权重在 BF16 下约占 24GB，加上 KV cache 和激活，单卡 H100/H200/A100 约 29GB 够用。计算量却只按 2.5B 激活参数算，因此推理延迟接近一个 2-3B 稠密模型，比同等总参的稠密模型快一倍以上。这正是 MoE 的核心红利：用大模型的容量、小模型的推理成本。"
+  - q: "Mellum2 的六个变体我该选哪个？Base、Instruct、Thinking 有什么区别？"
+    a: "Base 是预训练底座，适合自己做继续预训练或 SFT，不建议直接用于对话。Instruct 是经过指令微调和 RL 的版本，给出直接、低延迟的答案，适合代码补全、重构、问答这类「要快」的场景。Thinking 在回答前会生成推理链，适合多步调试、复杂重构、需要解释的场景，但延迟更高。日常 IDE 补全选 Instruct，疑难 bug 分析选 Thinking。Base 留给要自己训练的团队。"
+  - q: "FIM（Fill-in-the-Middle）和普通的对话补全有什么不一样？为什么代码补全要用它？"
+    a: "FIM 让模型在「已知前文 + 已知后文」的情况下补中间，这正是编辑器里的真实场景——你的光标前后都有代码。普通对话补全只能续写结尾，无法利用光标后面的上下文。Mellum2 在训练时见过大量 FIM 格式样本，用专门的 `<fim_prefix>`、`<fim_suffix>`、`<fim_middle>` 标记把前后文和待填位置拼起来，补全质量明显高于把代码硬塞进对话模板。做 IDE 集成必须用 FIM。"
+  - q: "Mellum2 能不能替代 Cursor 或 Copilot？它和这些商业工具差在哪？"
+    a: "能替代「补全引擎」这一层，但替代不了整套产品体验。Mellum2 提供的是模型能力，你还需要自己实现：上下文收集（把相关文件、符号、最近编辑喂给模型）、补全触发与防抖、多候选排序、IDE 插件 UI。Cursor/Copilot 的护城河有一半在这些工程细节上。对于注重数据私有、想完全自托管、或要在内网离线环境用的团队，Mellum2 + 自建插件是真香方案；对个人开发者图省事，商业工具仍更顺手。"
+  - q: "Mellum2 是 Apache 2.0，可以商用吗？拿它做产品有没有许可风险？"
+    a: "可以商用，且几乎没有许可风险。Apache 2.0 是最宽松的开源许可之一，允许商用、修改、闭源分发、二次售卖，只要保留版权声明和许可文本即可，没有月活/营收阈值这类附加条款。这和很多走「开放权重 + 商用阈值」路线的国产/大厂模型不同——JetBrains 这次是真·开源。你可以放心把它嵌进商业 IDE 插件或内部平台。"
+---
+
+> **💡 一句话总结**：Mellum2 把「IDE 级代码补全模型」第一次以 Apache 2.0 完整开源，12B MoE 只激活 2.5B、单卡可跑。本文给你四段能直接运行的代码，把它从下载变成可用。
+
+## 一、为什么这次值得动手
+
+2026 年 6 月，JetBrains 把 Mellum2 开源了。这件事对开发者的分量，和又一个通用大模型刷榜不一样。
+
+JetBrains 是少数「靠开发者工具吃饭」的公司，它的 IDE 里早就内置了一个 4B 的稠密模型 Mellum 做行内补全。Mellum2 是它的继任者，但定位变了——从「只会补全」升级成完整的编码模型，能补全、能对话、能调用工具。关键参数：
+
+- **12B 总参的 MoE**，每 token 只激活约 2.5B，推理延迟接近 2-3B 稠密模型；
+- **Apache 2.0**，无任何商用阈值，可闭源分发；
+- **六个变体**：Base、Instruct、Thinking 各自的检查点，覆盖从继续训练到低延迟补全到深度推理；
+- **单卡可跑**：H100/H200/A100 约 29GB 显存，vLLM 与 SGLang 都已原生支持。
+
+一句话：这是第一个你可以完全自托管、零许可负担、还专门为代码优化的「IDE 大脑」。下面进代码。
+
+## 二、用 vLLM 起一个 OpenAI 兼容服务
+
+最快的上手方式是用 vLLM 把 Instruct 变体起成 OpenAI 兼容端点：
+
+```bash
+pip install "vllm>=0.8.0"
+
+# 单卡 H100/H200/A100 即可，约 29GB 显存
+vllm serve JetBrains/Mellum2-12B-A2.5B-Instruct \
+  --max-model-len 32768 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  --port 8000
+```
+
+起好后就是标准的 OpenAI 协议，任何 OpenAI SDK 都能直连：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="JetBrains/Mellum2-12B-A2.5B-Instruct",
+    messages=[
+        {"role": "system", "content": "你是一个简洁的 Python 编码助手。"},
+        {"role": "user", "content": "写一个带指数退避的 HTTP 重试装饰器。"},
+    ],
+    temperature=0.2,
+    max_tokens=512,
+)
+print(resp.choices[0].message.content)
+```
+
+> **💡 提示**：代码任务把 `temperature` 调到 0.1–0.3，补全更稳定；只有要「多样化候选」时才调高。
+
+## 三、FIM：真正的代码补全姿势
+
+IDE 里的补全场景是「光标前有代码、光标后也有代码，要补中间」。这叫 Fill-in-the-Middle（FIM），不能用对话模板硬凑。Mellum2 训练时见过大量 FIM 样本，用专门的标记拼接：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+prefix = """def fetch_user(uid: int) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+"""
+suffix = """
+    conn.close()
+    return result
+"""
+
+# Mellum2 的 FIM 格式：prefix + suffix + middle 标记
+fim_prompt = f"<fim_prefix>{prefix}<fim_suffix>{suffix}<fim_middle>"
+
+resp = client.completions.create(
+    model="JetBrains/Mellum2-12B-A2.5B-Instruct",
+    prompt=fim_prompt,
+    max_tokens=128,
+    temperature=0.2,
+    stop=["<fim_prefix>", "<fim_suffix>", "<fim_middle>", "<|endoftext|>"],
+)
+print(resp.choices[0].text)  # 模型补出查询并赋值 result 的中段代码
+```
+
+注意这里用的是 `completions`（补全端点）而不是 `chat.completions`——FIM 是纯文本续写，不走对话模板。`stop` 一定要带上 FIM 标记，否则模型可能续写出多余内容。
+
+## 四、给它装上工具：一个能查文件的 Agent 循环
+
+Instruct 变体支持工具调用（vLLM 起服务时已开 `--enable-auto-tool-choice`）。下面是一个最小 Agent：让模型决定何时读文件，再基于文件内容回答。
+
+```python
+import json
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+def read_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()[:4000]  # 截断，避免超上下文
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "读取一个本地文本/代码文件的内容",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+}]
+
+messages = [{"role": "user", "content": "看一下 ./config.py，告诉我超时设了多少秒。"}]
+
+while True:
+    resp = client.chat.completions.create(
+        model="JetBrains/Mellum2-12B-A2.5B-Instruct",
+        messages=messages, tools=tools, temperature=0.1,
+    )
+    msg = resp.choices[0].message
+    messages.append(msg)
+    if not msg.tool_calls:
+        print(msg.content)          # 模型给出最终答案，结束
+        break
+    for call in msg.tool_calls:     # 执行模型请求的工具
+        args = json.loads(call.function.arguments)
+        result = read_file(args["path"])
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": result,
+        })
+```
+
+这个循环就是所有 coding agent 的骨架：模型请求工具 → 你执行 → 把结果喂回 → 直到模型不再请求工具。换成 `run_shell`、`grep_repo` 等工具，它就成了一个能在你代码库里干活的本地 Agent。
+
+## 五、接进编辑器当本地 Copilot
+
+如果只想要行内补全，最轻量的做法是写一个薄薄的 HTTP 适配层：编辑器插件把光标前后文发过来，服务端拼成 FIM 喂给 Mellum2，返回补全。VS Code 侧可以复用任何「自定义补全后端」的扩展（如支持自定义 endpoint 的 Continue），把 endpoint 指向上面 vLLM 的地址即可。核心只有三步：
+
+1. 插件采集 `prefix`（光标前）和 `suffix`（光标后），可加上当前文件路径和最近编辑的几个文件做上下文；
+2. 服务端按 `<fim_prefix>...<fim_suffix>...<fim_middle>` 拼接，调 `completions`，`max_tokens` 设小（如 64–128）保证响应快；
+3. 加防抖（停止输入 200ms 再请求）和取消（光标移动就取消上一个请求），否则补全会卡顿。
+
+## 六、五个最容易踩的坑
+
+1. **用错端点**：FIM 补全必须走 `completions`，不要塞进 `chat.completions` 的对话模板，否则模型会「聊天式」回答而不是补代码。
+2. **忘了设 stop**：FIM 不加 `stop` 标记，模型会续写出 `<fim_prefix>` 之类的训练标记或多余代码段。
+3. **变体选错**：拿 Base 直接做补全会得到混乱输出——Base 没经过指令对齐，必须用 Instruct 或自己 SFT 后的版本。
+4. **上下文给太多**：补全场景追求低延迟，把整个仓库塞进去会让首 token 延迟飙到几秒。只给相关片段，控制在几千 token。
+5. **量化期望过高**：INT4 量化能把显存压到 16GB 以下、塞进消费级显卡，但代码补全对精度敏感，量化后建议用 SWE-bench 子集或自己的真实补全样本实测一遍再上生产，别盲信「质量无损」。
+
+## 结语
+
+Mellum2 的意义不在跑分，而在它把「IDE 级代码大脑」彻底开源、零许可负担、单卡可跑。对想要数据私有、内网离线、或干脆自建编程工具的团队，这是第一块可以放心嵌进产品的拼图。把上面四段代码跑通，你就拥有了一个完全属于自己的本地 Copilot 后端。
