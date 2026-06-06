@@ -1,0 +1,157 @@
+---
+title: "实战工坊：双 3090 跑 Qwen3.6-27B，llama.cpp 与 vLLM 全流程调优"
+description: "把 Qwen3.6-27B 塞进两张 3090，做成一个能在 llama.cpp 与 vLLM、不同量化间热切换的 OpenAI 兼容端点。本文给全套 flag、张量并行配置、MTP 投机解码的 per-position 接受率解读，以及一路踩过的坑。"
+column: "workshop"
+tags: ["Qwen3.6", "vLLM", "llama.cpp", "双卡部署", "投机解码", "MTP", "量化"]
+pubDate: 2026-06-06
+featured: false
+tldr: "两张 3090（48GB 总显存）跑 27B 模型，关键不在「能不能跑」，而在「怎么跑得快又稳」。本文把 Qwen3.6-27B 做成一个 OpenAI 兼容端点，热切换四种后端/量化组合——llama.cpp 的 Q6_K 与 Q8_0、vLLM 的 INT4 与 INT8，给出每种的完整 flag、双卡张量并行配置，重点拆解 MTP 投机解码的 per-position 接受率怎么读、怎么调，以及远程访问与一路踩过的坑。一篇能直接照着抄的本地双卡部署手册。"
+author: "YOMXXX"
+faq:
+  - q: "27B 模型放进 2 张 3090（48GB），量化怎么选？"
+    a: "看你要质量还是要吞吐。BF16 的 27B 权重约 54GB，48GB 放不下，必须量化。INT8 / Q8_0 约 27GB，质量几乎无损，是双 3090 的稳妥默认，留给 KV Cache 和批处理的余量也够。INT4 / Q6_K 更省显存、能开更大 batch 或更长上下文，但质量会有可感知的下降，尤其在代码和多步推理上。建议先用 Q8_0 / INT8 拿质量基线，显存吃紧或要更高并发时再降到 4-bit，并在你的真实任务上对比掉点幅度，别只看困惑度。"
+  - q: "llama.cpp 和 vLLM 在双卡上各自强在哪？"
+    a: "vLLM 强在吞吐与并发：它的 PagedAttention、连续批处理、张量并行在多卡高并发场景下明显占优，适合做服务后端。llama.cpp 强在灵活与省心：GGUF 量化格式丰富、显存控制精细、对异构与部分 offload 友好，单用户或显存紧张时体验更好，启动也轻。一个实用结论是：要对外提供并发服务用 vLLM，本地自用、调试、或想精细抠显存用 llama.cpp。把两者做成可热切换的端点，就能按场景挑。"
+  - q: "MTP 投机解码的 per-position 接受率是什么，为什么重要？"
+    a: "MTP（多 token 预测）让模型一次提议未来多个 token，再由模型自身验证、接受其中正确的部分，从而一步生成多个 token 加速解码。per-position 接受率指第 1、第 2、第 3… 个提议位置各自被接受的比例。它重要是因为接受率直接决定加速比：越靠后的位置接受率越低，通常呈递减。知道你的实际接受率曲线，才能合理设置「一次提议几个 token」——提议过多，后面位置接受率太低，验证开销反而拖慢；提议过少，又吃不满 MTP 的红利。"
+  - q: "为什么要把多个后端做成「热切换」的同一个端点？"
+    a: "因为不同任务的最优后端不同，而你不想为每个改一次客户端配置。把 llama.cpp Q6_K/Q8_0、vLLM INT4/INT8 都挂在一个 OpenAI 兼容网关后面，用 model 名路由，客户端永远只对一个地址、一套接口说话，切后端只是换个 model 字段。这样你能在同一套评测脚本里直接横向比四种组合的质量与速度，线上也能按负载在「高质量低并发」和「低质量高吞吐」之间秒切，不用重启客户端。"
+  - q: "双卡部署最容易踩的坑有哪些？"
+    a: "几个高频坑：一是张量并行要求显存均衡，两张卡型号/显存不一致时，vLLM 的 tensor-parallel 会按最小公约数受限，llama.cpp 则要手动用张量分割比例（-ts）调平。二是别让显卡跨 NUMA 或走慢速 PCIe，张量并行通信量大，PCIe 带宽不足会吃掉多卡收益。三是 KV Cache 显存常被低估，长上下文下它能反超权重，留余量或开 KV 量化。四是投机解码不是无脑开就快，接受率低的任务上它可能负优化，要实测。"
+---
+
+> **💡 一句话总结**：两张 3090 跑 27B，比的不是「能不能跑」而是「调得好不好」。本文把 Qwen3.6-27B 做成一个能在 llama.cpp/vLLM、不同量化间热切换的 OpenAI 兼容端点，给全套 flag、张量并行配置，并把最难找的 MTP per-position 接受率数据讲透。
+
+## 一、目标：一个端点，四种后端
+
+双 3090 是本地玩家最常见的「够用又不奢侈」配置——48GB 总显存，跑 27B 量化版绰绰有余，但要跑得又快又稳，需要把后端和量化都调对。
+
+本文的目标形态是：**一个 OpenAI 兼容端点，背后热切换四种组合**——
+
+- `llama.cpp` + **Q6_K**（省显存，能开更大上下文）
+- `llama.cpp` + **Q8_0**（接近无损，本地自用首选）
+- `vLLM` + **INT4**（高吞吐、激进省显存）
+- `vLLM` + **INT8**（高吞吐、质量稳）
+
+这样既能在同一套评测里横向比，也能线上按负载秒切。下面从环境到调优一步步搭。
+
+## 二、硬件与基线
+
+两张 3090，确认它们走的是像样的 PCIe 通道、最好同一 NUMA 节点——张量并行的卡间通信量很大，PCIe 带宽不足会直接吃掉多卡收益。
+
+先记住 27B 在不同精度下的权重显存量级（用来判断余量）：
+
+- BF16：约 54GB —— 48GB **放不下**，量化是必选项
+- INT8 / Q8_0：约 27GB —— 留给 KV Cache 和批处理的余量充足
+- INT4 / Q6_K：约 14–20GB —— 余量更大，可开更长上下文或更大 batch
+
+> **⚠️ 别忘了 KV Cache**：长上下文下 KV Cache 会迅速膨胀，甚至反超权重显存。下面每种后端都给了控制它的手段。
+
+## 三、vLLM：双卡张量并行 + 投机解码
+
+vLLM 强在吞吐与并发，是对外服务的首选后端。双卡用张量并行，关键是 `--tensor-parallel-size 2`：
+
+```bash
+# vLLM + INT8，双卡张量并行，OpenAI 兼容端口 8001
+vllm serve Qwen/Qwen3.6-27B-Instruct \
+  --quantization int8 \
+  --tensor-parallel-size 2 \        # 两张卡做张量并行
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8 \            # KV Cache FP8，省一半 KV 显存
+  --gpu-memory-utilization 0.90 \  # 给系统留 10% 余量，别打满
+  --port 8001
+```
+
+INT4 版只需把 `--quantization` 换成对应格式（如 `awq` / `gptq`），其余照旧，端口换 8002 以便和 INT8 并存。
+
+**开启 MTP 投机解码。** Qwen3.6 自带 MTP（多 token 预测）头，可以做自投机解码——模型一次提议未来多个 token，再由自身验证接受其中正确的部分，一步吐多个 token：
+
+```bash
+vllm serve Qwen/Qwen3.6-27B-Instruct \
+  --quantization int8 --tensor-parallel-size 2 \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
+  --port 8001
+```
+
+`num_speculative_tokens` 就是「一次提议几个 token」。它不是越大越好——这正是下一节要讲的接受率问题。
+
+## 四、读懂 MTP 的 per-position 接受率
+
+这是整篇里最值钱、网上最难找的部分。
+
+MTP 一次提议 `k` 个 token，每个位置被接受的概率不同。把第 1、2、3… 个提议位置各自的接受率画出来，你会看到一条**递减曲线**——位置越靠后，模型自己也越没把握，接受率越低。一组典型的形态（具体数值因任务而异）是：
+
+- 位置 1：接受率高，约 80–90%
+- 位置 2：明显回落，约 55–70%
+- 位置 3：进一步降到约 35–50%
+- 位置 4 及以后：很多任务已 &lt;30%
+
+为什么这条曲线决定一切？因为**加速比 = 平均每步真正被接受的 token 数**。如果你把 `num_speculative_tokens` 设成 4，但位置 3、4 的接受率已经很低，那这两个位置的提议大概率被拒，验证它们的算力就白花了——提议过多反而负优化。
+
+**调优方法**：从 `num_speculative_tokens=3` 起，在你的真实任务上测平均接受 token 数和端到端吞吐。代码、结构化输出这类「下一个 token 高度可预测」的任务，接受率曲线更平、可以提议更多；自由发挥的创作类任务曲线陡、提议 2–3 个就够。**接受率低于某个点，投机解码就是负优化，该关就关。**
+
+## 五、llama.cpp：精细控显存与多卡分割
+
+llama.cpp 强在灵活与省心，本地自用、调试、抠显存时体验更好。双卡靠张量分割：
+
+```bash
+# llama.cpp + Q8_0，双卡，张量分割
+./llama-server \
+  -m ./Qwen3.6-27B-Q8_0.gguf \
+  --split-mode row \           # 按行张量分割，跨卡并行计算
+  -ts 1,1 \                    # 两张卡 1:1 分配；显存不均时调比例如 0.9,1.1
+  -ngl 99 \                    # 尽量全部层上 GPU
+  --ctx-size 32768 \
+  --flash-attn \               # 长上下文必开，压注意力显存峰值
+  --port 8080
+```
+
+Q6_K 版把模型文件换成 `Q6_K.gguf` 即可，能腾出更多显存开更长上下文或更大 batch。
+
+几个 llama.cpp 双卡要点：
+
+- **`-ts`（tensor split）**：两卡显存或负载不均时，手动调比例把它们配平。这是 llama.cpp 比 vLLM 灵活的地方——可以非均匀分割。
+- **`--split-mode`**：`row` 做张量级并行（通信多但利用率高），`layer` 做层级切分（通信少但负载可能不均），按你的 PCIe 带宽选。
+- **KV Cache 量化**：显存紧张时加 `--cache-type-k q8_0 --cache-type-v q8_0`，本地场景通常安全。
+
+## 六、把四个后端缝成一个端点
+
+四个服务跑在不同端口（vLLM 8001/8002、llama.cpp 8080/8081），前面挂一个 OpenAI 兼容网关按 `model` 名路由。最省事的是用 LiteLLM proxy：
+
+```yaml
+# litellm_config.yaml —— 一个地址，按 model 名路由到四个后端
+model_list:
+  - model_name: qwen-vllm-int8
+    litellm_params: {model: openai/Qwen3.6-27B, api_base: http://localhost:8001/v1}
+  - model_name: qwen-vllm-int4
+    litellm_params: {model: openai/Qwen3.6-27B, api_base: http://localhost:8002/v1}
+  - model_name: qwen-llama-q8
+    litellm_params: {model: openai/Qwen3.6-27B, api_base: http://localhost:8080/v1}
+  - model_name: qwen-llama-q6
+    litellm_params: {model: openai/Qwen3.6-27B, api_base: http://localhost:8081/v1}
+```
+
+```bash
+litellm --config litellm_config.yaml --port 4000
+```
+
+之后客户端永远只对 `http://你的机器:4000` 说话，切后端只改 `model` 字段。要远程访问，别直接裸暴露端口——在前面套一层带鉴权的反向代理（Caddy/Nginx + token），或走 Tailscale 这类私有网络，最省心也最安全。
+
+## 七、选型结论与踩坑清单
+
+跑完一圈横评，给一个可直接用的决策：
+
+- **对外提供并发服务** → vLLM INT8，按任务决定要不要开 MTP。
+- **本地自用、要质量** → llama.cpp Q8_0，接近无损、启动轻。
+- **显存吃紧或要高并发** → 降到 INT4 / Q6_K，并在真实任务上量掉点。
+- **代码/结构化输出为主** → 开 MTP，`num_speculative_tokens` 可往上探。
+- **自由创作为主** → MTP 收益小，2–3 个或干脆关掉。
+
+最后是高频坑，照着避：
+
+1. **两卡不均衡**：型号/显存不同，vLLM 张量并行会被短板限制；llama.cpp 用 `-ts` 手动配平。
+2. **PCIe 是瓶颈**：张量并行通信量大，慢速 PCIe 或跨 NUMA 会吃掉多卡收益，部署前确认拓扑。
+3. **KV Cache 被低估**：长上下文下它能反超权重，留余量或开 KV 量化。
+4. **投机解码不是免费午餐**：接受率低的任务上它会负优化，务必实测接受率曲线再决定开不开、提议几个。
+
+把这套搭好，你手里就有了一个能按需在「质量」和「吞吐」之间秒切的本地 27B 端点——这才是双卡真正的玩法。
