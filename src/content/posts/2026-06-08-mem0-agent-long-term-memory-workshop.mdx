@@ -1,0 +1,242 @@
+---
+title: "实战工坊：用 Mem0 给 AI Agent 装上「记得住」的长期记忆"
+description: "LLM 天生健忘，关掉对话就忘光。Mem0 提供一个即插即用的记忆层，自动提取、存储、检索用户记忆。本文带你从 pip install 跑通最小示例，再接进真实 Agent 对话循环，并讲清它如何决定记什么、改什么、忘什么。"
+column: "workshop"
+tags: ["Mem0", "Agent记忆", "长期记忆", "Qdrant", "Ollama", "向量检索", "记忆层"]
+pubDate: 2026-06-08
+featured: false
+tldr: "Mem0 是目前最流行的开源 Agent 记忆层。它解决的痛点很直接：LLM 无状态，对话一关记忆全丢，靠把全部历史塞进上下文既贵又会触发 context rot。Mem0 的做法是用一个 LLM 把对话里值得记的事实抽出来，去重、更新、落到向量库，下次只检索相关的几条注入上下文。本文从开源自托管的最小示例讲起，覆盖 add/search/get_all/update/delete 五个核心 API，配置 Qdrant + OpenAI 或全本地 Ollama 后端，再接进真实的 Agent 对话循环，并拆解它的提取-更新-遗忘机制与生产落地的坑。"
+author: "YOMXXX"
+faq:
+  - q: "Mem0 和直接把聊天历史塞进上下文有什么区别？"
+    a: "塞历史是把全部对话原文拼进每次请求，token 随对话线性增长，又贵又慢，到几万 token 后还会触发 context rot（长上下文里信息被淹没、模型注意力涣散）。Mem0 不存原文，它用一个 LLM 把对话里真正值得记的「事实」抽出来（比如「用户偏好深色模式」「用户在做一个 Astro 博客」），去重后落库，下次只检索语义相关的几条注入上下文。本质区别是：一个是无损堆原文，一个是有损存事实。后者上下文恒定小、成本可控，代价是抽取可能漏掉细节。"
+  - q: "开源版（self-hosted）和托管平台版怎么选？"
+    a: "开源版用 `from mem0 import Memory`，完全跑在你自己的基础设施上，向量库、LLM、embedder 都自己配，没有 API key 也能跑（用本地模型时），数据不出域，适合对隐私和成本敏感的团队。托管平台版用 `MemoryClient` 连 Mem0 云服务，省去自己运维向量库和调优提取 prompt 的麻烦，按用量付费，适合想快速上线、不想碰基础设施的团队。两者 API 高度一致，先用开源版本地验证，需要规模化再迁到平台是常见路径。"
+  - q: "记忆是怎么和不同用户隔离的？多租户怎么办？"
+    a: "靠 `user_id` 隔离。每次 add 和 search 都带上 user_id，Mem0 会把记忆按 user 分区，A 用户的记忆永远不会检索到 B 用户头上。除了 user_id，还有 `agent_id`（区分不同 agent 角色的记忆）和 `run_id`（区分单次会话的短期记忆）三个维度，可以组合使用。多租户 SaaS 场景，最佳实践是 user_id 用你系统里的全局唯一用户标识，再用 metadata 存租户 ID 做二次过滤。"
+  - q: "提取记忆要额外调 LLM，成本和延迟会不会失控？"
+    a: "成本主要发生在写入侧。每次 add 时 Mem0 要调一次 LLM 做事实抽取和「该不该更新已有记忆」的判断，这是额外开销。但读取侧（search）走的是向量检索，不调 LLM，很快也很便宜。优化思路：写入不必每轮对话都做，可以攒几轮批量 add；提取用便宜的小模型（甚至本地 Ollama）而生成用大模型；search 的 top_k 控制在 3-5 条，既省注入 token 又避免无关记忆干扰。"
+  - q: "Mem0 适合存什么、不适合存什么？"
+    a: "适合存「跨会话需要记住的个性化事实」：用户偏好、身份信息、长期目标、历史决策、纠正过的错误。不适合当通用知识库——大段文档、API 文档、产品手册这类应该走 RAG，用向量库直接检索原文，而不是让 Mem0 抽成零碎事实。也不适合存高频变化的状态（比如购物车），那是数据库的活。一句话：Mem0 存的是「关于这个用户/这次任务我学到了什么」，不是「世界知识」也不是「业务数据」。"
+---
+
+> **💡 一句话总结**：Mem0 是一个即插即用的 Agent 记忆层，用一个 LLM 把对话里值得记的事实抽出来、去重落库，下次对话只检索相关的几条注入上下文。本文带你从最小示例跑到真实 Agent 对话循环，并讲清它记什么、改什么、忘什么。
+
+## 一、LLM 的「金鱼记忆」问题
+
+做过 Agent 的人都知道，LLM 本质是**无状态**的。这一轮你告诉它「我用 VS Code、喜欢深色模式」，下一轮新开个 session，它就跟没听过一样。所有「记忆」都得你自己想办法塞回上下文。
+
+最朴素的办法是把聊天历史全拼进 prompt。短对话还行，但只要对话一长，问题立刻浮现：
+
+- **成本爆炸**：token 随对话轮数线性增长，每一轮都要把前面所有内容重发一遍。
+- **context rot**：上下文堆到几万 token 后，真正重要的信息被淹没在历史里，模型注意力涣散，回答质量不升反降。
+- **跨会话失忆**：换个 session、隔一天再来，历史没了，一切归零。
+
+真正需要的不是「把所有话都记住」，而是**把值得记的事记住,该忘的忘掉**。这正是 Mem0 要解决的事。
+
+## 二、Mem0 是什么：一个记忆层，不是一个数据库
+
+Mem0（读作 "mem-zero"）是目前最流行的开源 Agent 记忆框架。它的定位是一个**记忆层**，夹在你的应用和 LLM 之间，干三件事：
+
+1. **提取（Extract）**：用一个 LLM 把对话里真正值得记的「事实」抽出来。比如从「我最近在用 Astro 搭个技术博客，部署在 Cloudflare」里抽出「用户在做 Astro 博客」「部署平台是 Cloudflare」两条事实。
+2. **巩固（Consolidate）**：新事实进来时，和已有记忆比对——是全新的就新增，是对旧记忆的更新就改写，矛盾的就覆盖。这一步避免记忆里堆满重复和过时的内容。
+3. **检索（Retrieve）**：下次对话时，根据当前 query 做语义检索，只把最相关的几条记忆注入上下文。
+
+关键区别：它**不存对话原文**，存的是抽取后的结构化事实。所以上下文始终是恒定的小尺寸，而不是无限膨胀的历史。
+
+## 三、5 分钟跑通最小记忆
+
+开源版完全不需要 API key 就能体验核心流程（用默认配置时会调用 OpenAI，所以先设个 key）。安装：
+
+```bash
+pip install mem0ai
+```
+
+最小示例——存一条记忆，再问出来：
+
+```python
+import os
+os.environ["OPENAI_API_KEY"] = "sk-..."
+
+from mem0 import Memory
+
+m = Memory()
+
+# 存入记忆（自动抽取事实）
+m.add("我喜欢深色模式，平时用 VS Code 写代码。", user_id="alice")
+
+# 检索相关记忆
+results = m.search("她用什么编辑器？", filters={"user_id": "alice"})
+for r in results["results"]:
+    print(r["memory"], "  score:", round(r["score"], 3))
+```
+
+你会看到它抽出了类似「Prefers dark mode」「Uses VS Code」这样的结构化记忆，并能用语义检索命中。注意 add 进去的是一整句自然语言，Mem0 在背后帮你做了事实抽取——你不用自己解析。
+
+> **💡 提示**：`Memory()` 用的是默认配置（OpenAI 做 LLM 和 embedder，内存向量库）。内存向量库重启即丢，正经用要配持久化后端，见第五节。
+
+## 四、核心 API：五个动作就够用
+
+Mem0 的开源版 API 非常克制，记住这五个就能覆盖绝大多数场景：
+
+```python
+# 1. add —— 写入记忆（接受字符串或消息列表）
+m.add("我对花生过敏。", user_id="alice", metadata={"category": "health"})
+
+messages = [
+    {"role": "user", "content": "帮我订餐，别放坚果。"},
+    {"role": "assistant", "content": "好的，已避开坚果类。"},
+]
+m.add(messages, user_id="alice")
+
+# 2. search —— 语义检索相关记忆
+hits = m.search("有什么饮食禁忌？", user_id="alice", limit=5)
+
+# 3. get_all —— 拉取某用户的全部记忆（可带 filters）
+all_mem = m.get_all(user_id="alice", filters={"category": "health"})
+
+# 4. update —— 修改某条记忆
+m.update(memory_id="<id>", data="我现在对花生过敏，但坚果可以。")
+
+# 5. delete —— 删除（单条或按 user 清空）
+m.delete(memory_id="<id>")
+m.delete_all(user_id="alice")
+```
+
+几个要点：`add` 既能吃单句也能吃 messages 列表，后者更适合直接喂对话片段；`metadata` 是你做精细过滤的抓手，存 category、来源、时间都靠它；`search` 的 `limit`（top_k）建议 3-5，太多会把无关记忆也注入上下文。
+
+## 五、配置生产级后端
+
+默认的内存向量库不能用于生产。真实部署要把向量库、LLM、embedder 三件套都配好。下面是 **Qdrant + OpenAI** 的组合：
+
+```python
+import os
+from mem0 import Memory
+
+os.environ["OPENAI_API_KEY"] = "sk-..."
+
+config = {
+    "vector_store": {
+        "provider": "qdrant",
+        "config": {
+            "collection_name": "agent_memories",
+            "host": "localhost",
+            "port": 6333,
+        },
+    },
+}
+
+m = Memory.from_config(config)
+m.add("用户负责的项目代号是 Odysseus。", user_id="bob")
+```
+
+如果要**完全本地、数据不出域**，把 LLM 和 embedder 换成 Ollama 即可，一个 key 都不用：
+
+```python
+from mem0 import Memory
+
+memory = Memory.from_config({
+    "vector_store": {
+        "provider": "qdrant",
+        "config": {
+            "collection_name": "local_mem",
+            "host": "localhost",
+            "port": 6333,
+            "embedding_model_dims": 768,
+        },
+    },
+    "llm": {
+        "provider": "ollama",
+        "config": {
+            "model": "llama3.1:latest",
+            "temperature": 0,
+            "max_tokens": 2000,
+            "ollama_base_url": "http://localhost:11434",
+        },
+    },
+    "embedder": {
+        "provider": "ollama",
+        "config": {
+            "model": "nomic-embed-text:latest",
+            "ollama_base_url": "http://localhost:11434",
+        },
+    },
+})
+```
+
+注意 embedder 换了模型，向量维度也要跟着改（`nomic-embed-text` 是 768 维，OpenAI 的 `text-embedding-3-small` 是 1536 维），维度对不上向量库会报错。
+
+## 六、把记忆接进真实 Agent 对话循环
+
+光会 add/search 还不够，关键是把记忆**编织进对话流程**：每轮对话前先检索相关记忆注入系统提示，对话后把新内容写回记忆。一个最小但完整的循环：
+
+```python
+import os
+from openai import OpenAI
+from mem0 import Memory
+
+os.environ["OPENAI_API_KEY"] = "sk-..."
+client = OpenAI()
+mem = Memory()
+
+def chat(user_input: str, user_id: str) -> str:
+    # 1) 检索与本轮相关的记忆
+    hits = mem.search(user_input, user_id=user_id, limit=5)
+    memories = "\n".join(f"- {h['memory']}" for h in hits["results"])
+
+    # 2) 把记忆拼进 system prompt
+    system = (
+        "你是一个有长期记忆的助手。以下是关于该用户的已知信息，"
+        "请在回答时自然地利用它们：\n" + (memories or "（暂无记忆）")
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_input},
+        ],
+    )
+    answer = resp.choices[0].message.content
+
+    # 3) 把本轮对话写回记忆（让 Mem0 自行决定记什么）
+    mem.add(
+        [
+            {"role": "user", "content": user_input},
+            {"role": "assistant", "content": answer},
+        ],
+        user_id=user_id,
+    )
+    return answer
+
+print(chat("我是个 Rust 重度用户，讨厌写 YAML。", "carol"))
+print(chat("帮我推荐个配置文件格式。", "carol"))  # 会记得你讨厌 YAML
+```
+
+第二轮提问时，Mem0 检索到了第一轮抽取的「用户讨厌 YAML」「用户用 Rust」，于是助手会避开 YAML、可能推荐 TOML——**跨轮次的个性化就这样自动发生了**，而你的上下文始终只有几条记忆，没有膨胀。
+
+## 七、它如何决定记什么、改什么、忘什么
+
+Mem0 最值得理解的是它的**记忆巩固机制**。当你 add 新内容时，它不是无脑追加，而是：
+
+1. 先用 LLM 从输入里抽取候选事实；
+2. 对每条候选事实，去向量库检索语义相近的已有记忆；
+3. 让 LLM 判断这是一次 **ADD**（全新事实）、**UPDATE**（对旧事实的补充/修正）、**DELETE**（旧事实已失效）还是 **NOOP**（重复，忽略）。
+
+举例：用户先说「我住北京」，后来说「我搬到上海了」。第二条进来时，Mem0 检索到「住北京」这条旧记忆，判断为 UPDATE/DELETE，于是把它改写或删除，而不是让「住北京」和「住上海」两条矛盾记忆并存。这套机制让记忆库随时间**自我清理**，是它比「往向量库里硬塞」高明的地方。
+
+> **⚠️ 注意**：抽取和巩固都依赖 LLM 的判断，不是 100% 可靠。关键业务事实（如过敏、合规约束）建议带 metadata 标记并定期 get_all 审计，别完全托付给自动巩固。
+
+## 八、生产落地的几个坑
+
+- **user_id 是隔离边界，别图省事共用**。多租户场景务必每个真实用户一个稳定的 user_id，否则记忆会串。
+- **写入不必每轮都做**。每次 add 都要调 LLM，高频对话可以攒几轮再批量写，省成本也降延迟。
+- **search 的 limit 别贪多**。3-5 条通常够，注入太多无关记忆反而干扰生成、增加 token。
+- **提取用小模型、生成用大模型**。事实抽取是个简单任务，用便宜模型甚至本地 Ollama 完全够，把预算留给生成。
+- **定期审计与清理**。自动巩固偶尔会误判，重要场景定期 get_all 检查记忆质量，必要时人工 update/delete。
+
+## 结语
+
+Mem0 把「给 Agent 加记忆」这件原本要自己拼向量库 + 抽取 prompt + 去重逻辑的脏活，收敛成了 add/search 两个动作。它的价值不在多复杂，而在**让记忆变成一个恒定小尺寸、自我清理的层**，从根上绕开了「堆历史」带来的成本和 context rot 问题。
+
+如果你正在做一个需要「记得住用户」的 Agent，先用开源版本地把第六节那个对话循环跑通——你会立刻感受到「它居然记得我上次说的话」带来的体验跃迁。
