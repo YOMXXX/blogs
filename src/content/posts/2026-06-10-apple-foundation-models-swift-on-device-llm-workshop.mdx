@@ -1,0 +1,521 @@
+---
+title: "Apple Foundation Models 实战：用 Swift 调用端侧大模型"
+description: "WWDC 2026 发布的 Foundation Models Framework 让开发者可以用原生 Swift API 直接调用 Apple Intelligence 端侧大模型，本文通过代码示例详解 Tool Calling、Guided Generation 等核心能力"
+column: "workshop"
+tags: ["Apple Intelligence", "Foundation Models", "Swift", "WWDC 2026", "On-Device AI", "iOS 27"]
+pubDate: 2026-06-10
+featured: false
+tldr: "WWDC 2026 发布 Foundation Models Framework 重大更新，开发者可用 Swift API 直接调用端侧大模型。本文详解 Tool Calling、Guided Generation、Vision 等核心 API，并给出完整代码示例"
+author: "YOMXXX"
+faq:
+  - q: "Foundation Models Framework 支持哪些 Apple 设备？"
+    a: "支持搭载 Apple Silicon（M1 及以上）的 Mac、搭载 A17 Pro 及以上芯片的 iPhone 和 iPad，需运行 iOS 27、macOS 27 或 iPadOS 27 系统"
+  - q: "端侧大模型的推理速度和效果如何？"
+    a: "Apple 端侧模型约 3B 参数，针对设备优化后推理延迟在毫秒级别，适合实时交互场景。对于复杂任务可自动切换到 Private Cloud Compute 获取更强能力"
+  - q: "Foundation Models Framework 是否支持第三方模型？"
+    a: "WWDC 2026 新增了第三方和开源模型集成能力，开发者可以在框架中使用兼容的开源模型，但需要遵循 Apple 的模型格式和安全要求"
+  - q: "Guided Generation 和普通文本生成有什么区别？"
+    a: "Guided Generation 可以让模型直接输出符合 Swift Codable 协议的结构化数据，开发者定义数据结构后模型会保证输出格式正确，无需手动解析 JSON"
+  - q: "Tool Calling 能力有什么实际应用场景？"
+    a: "Tool Calling 让端侧模型可以调用 App 内部功能，比如查询日历、搜索通讯录、操作数据库等，实现真正的 AI Agent 体验而不仅是文本生成"
+---
+
+WWDC 2026 在 6 月 9 日的 Keynote 上投下了一枚重磅炸弹：Foundation Models Framework 迎来了自诞生以来最大的一次升级。开发者现在可以用纯 Swift 代码直接调用运行在设备端的大语言模型，不需要网络请求，不需要 API Key，不需要任何第三方依赖——模型就在用户的芯片上。
+
+这意味着什么？你的 App 可以在飞行模式下理解用户意图、生成结构化数据、调用本地工具，甚至理解图片内容。本文将通过完整的代码示例，带你上手这套全新的端侧 AI 开发体验。
+
+## 框架定位：端侧优先，隐私为本
+
+Foundation Models Framework 并不是一个通用的 LLM SDK。它有一个非常明确的设计哲学：**端侧优先推理，隐私数据永不离开设备**。
+
+Apple 在设备端部署了一个约 3B 参数的语言模型，经过针对 Apple Silicon 的深度优化，推理延迟控制在毫秒级别。对于超出端侧模型能力的任务，框架会透明地切换到 Private Cloud Compute（PCC），在苹果自有的安全飞地中完成推理，数据加密传输且不会被存储。
+
+WWDC 2026 新增的核心能力包括：
+
+- **Tool Calling**：模型可以调用开发者定义的工具函数
+- **Guided Generation**：输出直接映射为 Swift 数据结构
+- **Vision**：端侧图像理解能力
+- **Private Cloud Compute 开放访问**：开发者可主动选择端云混合推理
+- **第三方模型集成**：支持加载兼容格式的开源模型
+- **Context Management**：精细化的上下文窗口管理
+- **内置语义搜索**：本地向量检索能力
+
+## 环境准备
+
+开始之前，确保你的开发环境满足以下条件：
+
+- Xcode 27 或更高版本
+- macOS 27 / iOS 27 / iPadOS 27 SDK
+- 搭载 Apple Silicon 的 Mac（M1 及以上）
+- 真机调试需要 A17 Pro 及以上芯片的设备
+
+在项目中导入框架：
+
+```swift
+import FoundationModels
+```
+
+不需要 CocoaPods、不需要 SPM 额外依赖，它是系统框架的一部分。
+
+## 核心 API 详解
+
+### 基础文本生成
+
+最简单的用法只需要三行代码：
+
+```swift
+import FoundationModels
+
+let session = LanguageModelSession()
+let response = try await session.respond(to: "用一句话解释什么是 RAG")
+print(response.content) // "RAG（检索增强生成）是一种..."
+```
+
+`LanguageModelSession` 是所有交互的入口。每个 session 维护独立的对话上下文，模型会记住之前的对话内容。
+
+如果你只需要一次性生成而不需要上下文，可以使用更轻量的方式：
+
+```swift
+let model = SystemLanguageModel.default
+let result = try await model.generate(prompt: "将以下英文翻译为中文：Hello World")
+```
+
+### Guided Generation：结构化输出
+
+这是 Foundation Models Framework 最令人兴奋的能力之一。传统做法中，你需要让模型输出 JSON，然后手动解析、处理格式错误、做类型转换。Guided Generation 彻底消灭了这个环节。
+
+定义一个遵循 `Codable` 协议的数据结构，模型会**保证**输出完全匹配这个结构：
+
+```swift
+import FoundationModels
+
+@Generable
+struct MovieReview: Codable {
+    @Guide(description: "电影名称")
+    var title: String
+
+    @Guide(description: "1-10的评分", range: 1...10)
+    var rating: Int
+
+    @Guide(description: "一句话影评，不超过50字")
+    var summary: String
+
+    @Guide(description: "推荐观看人群")
+    var audience: [String]
+}
+
+let session = LanguageModelSession()
+let review: MovieReview = try await session.respond(
+    to: "评价一下《沙丘2》这部电影",
+    generating: MovieReview.self
+)
+
+print(review.title)    // "沙丘2"
+print(review.rating)   // 9
+print(review.summary)  // "史诗级视听盛宴，完美延续了第一部的宏大叙事"
+print(review.audience) // ["科幻爱好者", "原著读者", "视觉系影迷"]
+```
+
+`@Generable` 宏和 `@Guide` 属性包装器是 WWDC 2026 新增的语法糖。`@Guide` 可以通过 `description` 告诉模型每个字段的含义，通过 `range` 约束数值范围。模型在生成时会严格遵守这些约束，你拿到的一定是类型安全的 Swift 对象。
+
+支持的类型包括 `String`、`Int`、`Double`、`Bool`、`Array`、嵌套的 `Codable` 结构体，以及 `enum`：
+
+```swift
+@Generable
+enum Sentiment: String, Codable {
+    case positive
+    case negative
+    case neutral
+}
+
+@Generable
+struct FeedbackAnalysis: Codable {
+    @Guide(description: "用户反馈的情感倾向")
+    var sentiment: Sentiment
+
+    @Guide(description: "关键词提取，最多5个")
+    var keywords: [String]
+
+    @Guide(description: "是否需要人工跟进")
+    var needsFollowUp: Bool
+}
+```
+
+### Tool Calling：让模型调用你的代码
+
+Tool Calling 让端侧模型从"只能说话"进化为"能做事"。你定义工具，模型决定何时调用、传什么参数。
+
+```swift
+import FoundationModels
+
+@Tool
+struct SearchContacts {
+    @Argument(description: "搜索关键词，可以是姓名或备注")
+    var query: String
+
+    static let description = "在通讯录中搜索联系人"
+
+    func call() async throws -> String {
+        // 实际调用通讯录 API
+        let contacts = try await ContactStore.shared.search(query: query)
+        return contacts.map { "\($0.name): \($0.phone)" }.joined(separator: "\n")
+    }
+}
+
+@Tool
+struct CreateReminder {
+    @Argument(description: "提醒事项的标题")
+    var title: String
+
+    @Argument(description: "提醒时间，ISO 8601 格式")
+    var dueDate: String
+
+    static let description = "创建一个新的提醒事项"
+
+    func call() async throws -> String {
+        let reminder = try await ReminderStore.shared.create(
+            title: title,
+            dueDate: ISO8601DateFormatter().date(from: dueDate)!
+        )
+        return "已创建提醒：\(reminder.title)"
+    }
+}
+```
+
+将工具注册到 session 中：
+
+```swift
+let session = LanguageModelSession(
+    tools: [SearchContacts.self, CreateReminder.self]
+)
+
+let response = try await session.respond(
+    to: "帮我查一下张三的电话号码，然后设一个明天下午3点的提醒打电话给他"
+)
+```
+
+模型会自动拆解用户意图，先调用 `SearchContacts` 查询张三的电话，再调用 `CreateReminder` 创建提醒。整个过程在设备端完成，通讯录数据不会上传到任何服务器。
+
+> **💡 提示：** Tool Calling 的执行是串行的——模型生成工具调用请求，框架执行工具函数，将结果返回给模型，模型再决定下一步。这个循环会自动进行，开发者不需要手动管理。
+
+### Vision：端侧图像理解
+
+WWDC 2026 为端侧模型新增了视觉能力。模型可以直接理解图片内容，无需单独的 Vision 框架：
+
+```swift
+import FoundationModels
+import UIKit
+
+let image = UIImage(named: "receipt")!
+
+let session = LanguageModelSession()
+let response = try await session.respond(
+    to: "请识别这张小票上的商品和价格",
+    attachments: [.image(image)]
+)
+print(response.content)
+```
+
+Vision 能力也可以和 Guided Generation 结合，直接从图片中提取结构化数据：
+
+```swift
+@Generable
+struct ReceiptItem: Codable {
+    @Guide(description: "商品名称")
+    var name: String
+
+    @Guide(description: "单价，单位元")
+    var price: Double
+
+    @Guide(description: "数量")
+    var quantity: Int
+}
+
+@Generable
+struct Receipt: Codable {
+    @Guide(description: "商家名称")
+    var merchant: String
+
+    @Guide(description: "消费明细")
+    var items: [ReceiptItem]
+
+    @Guide(description: "总金额")
+    var total: Double
+}
+
+let receipt: Receipt = try await session.respond(
+    to: "提取这张小票的信息",
+    attachments: [.image(image)],
+    generating: Receipt.self
+)
+```
+
+一张拍糊了的小票照片，直接变成类型安全的 Swift 结构体。
+
+### Session 管理：多轮对话与上下文控制
+
+`LanguageModelSession` 自动维护对话历史，但端侧模型的上下文窗口是有限的。WWDC 2026 提供了精细化的上下文管理 API：
+
+```swift
+let session = LanguageModelSession(
+    configuration: .init(
+        // 系统提示词
+        systemPrompt: "你是一个专业的健身教练助手，用简洁专业的语言回答问题",
+        // 上下文窗口策略
+        contextPolicy: .slidingWindow(maxTokens: 4096),
+        // 温度参数
+        temperature: 0.7
+    )
+)
+
+// 多轮对话
+let r1 = try await session.respond(to: "我想减脂，每周能锻炼3次")
+let r2 = try await session.respond(to: "具体每次练什么？")
+let r3 = try await session.respond(to: "饮食方面呢？")
+
+// 查看当前上下文使用情况
+let usage = session.contextUsage
+print("已用 token：\(usage.used) / \(usage.total)")
+
+// 手动清除历史
+session.clearHistory()
+```
+
+Streaming 流式输出同样支持，适合需要实时显示生成过程的 UI 场景：
+
+```swift
+let stream = session.streamResponse(to: "写一首关于编程的五言绝句")
+
+for try await chunk in stream {
+    // 逐 token 更新 UI
+    textView.text += chunk.content
+}
+```
+
+## Private Cloud Compute：端云混合推理
+
+有些任务对端侧 3B 模型来说确实力不从心。WWDC 2026 开放了 Private Cloud Compute（PCC）的开发者访问接口，让你可以按需切换到更强大的云端模型：
+
+```swift
+let session = LanguageModelSession(
+    configuration: .init(
+        // 自动选择：简单任务端侧，复杂任务上云
+        computePolicy: .adaptive,
+        // 或者强制端侧
+        // computePolicy: .onDeviceOnly,
+        // 或者强制使用 PCC
+        // computePolicy: .privateCloudCompute
+    )
+)
+```
+
+`.adaptive` 策略下，框架会根据任务复杂度自动决定在哪里执行推理。开发者也可以通过 `.onDeviceOnly` 强制端侧推理——比如处理敏感医疗数据时，确保数据绝对不离开设备。
+
+PCC 的安全保证是硬件级的：数据在传输和计算过程中全程加密，苹果服务器无法访问明文数据，计算完成后数据立即销毁，不会用于训练。
+
+## 第三方模型集成
+
+WWDC 2026 新增了对第三方和开源模型的支持。开发者可以将兼容格式的模型打包进 App，通过统一的 API 调用：
+
+```swift
+import FoundationModels
+
+// 加载 App Bundle 中的自定义模型
+let customModel = try LanguageModel(
+    bundleResource: "my-fine-tuned-model",
+    configuration: .init(
+        quantization: .q4,  // 4-bit 量化
+        maxContextLength: 2048
+    )
+)
+
+let session = LanguageModelSession(model: customModel)
+let response = try await session.respond(to: "你好")
+```
+
+需要注意的是，第三方模型需要转换为 Apple 的 Core ML 格式，并且通过 App Review 时需要满足 Apple 的模型安全审核要求。目前社区已经有工具可以将 GGUF 格式的模型转换为兼容格式。
+
+## 实战：构建智能食谱助手
+
+把前面学到的 API 组合起来，构建一个完整的智能食谱助手功能：
+
+```swift
+import FoundationModels
+import SwiftUI
+
+// 数据模型
+@Generable
+struct Recipe: Codable {
+    @Guide(description: "菜名")
+    var name: String
+
+    @Guide(description: "烹饪难度：简单/中等/困难")
+    var difficulty: String
+
+    @Guide(description: "预计烹饪时间，单位分钟", range: 5...180)
+    var cookingTime: Int
+
+    @Guide(description: "食材列表")
+    var ingredients: [Ingredient]
+
+    @Guide(description: "烹饪步骤，按顺序排列")
+    var steps: [String]
+}
+
+@Generable
+struct Ingredient: Codable {
+    @Guide(description: "食材名称")
+    var name: String
+
+    @Guide(description: "用量，如200克、2个")
+    var amount: String
+}
+
+// 工具定义
+@Tool
+struct CheckPantry {
+    @Argument(description: "要查询的食材名称")
+    var ingredient: String
+
+    static let description = "查看家里是否有某种食材"
+
+    func call() async throws -> String {
+        let pantry = PantryManager.shared
+        if let item = pantry.find(ingredient) {
+            return "\(ingredient)：有，剩余\(item.amount)"
+        }
+        return "\(ingredient)：没有"
+    }
+}
+
+@Tool
+struct AddToShoppingList {
+    @Argument(description: "要添加的食材")
+    var items: [String]
+
+    static let description = "将缺少的食材添加到购物清单"
+
+    func call() async throws -> String {
+        let list = ShoppingListManager.shared
+        for item in items {
+            list.add(item)
+        }
+        return "已添加\(items.count)项到购物清单"
+    }
+}
+
+// 主逻辑
+class RecipeAssistant {
+    private let session: LanguageModelSession
+
+    init() {
+        self.session = LanguageModelSession(
+            configuration: .init(
+                systemPrompt: """
+                你是一个专业的中餐烹饪助手。根据用户提供的食材或需求推荐菜谱。
+                你可以查看用户家里的食材库存，也可以帮用户把缺少的食材加入购物清单。
+                """,
+                computePolicy: .adaptive
+            ),
+            tools: [CheckPantry.self, AddToShoppingList.self]
+        )
+    }
+
+    /// 根据图片推荐菜谱
+    func recommendFromPhoto(_ image: UIImage) async throws -> Recipe {
+        let recipe: Recipe = try await session.respond(
+            to: "看看这张冰箱照片里有什么食材，推荐一道家常菜",
+            attachments: [.image(image)],
+            generating: Recipe.self
+        )
+        return recipe
+    }
+
+    /// 文字交互
+    func chat(_ message: String) async throws -> String {
+        let response = try await session.respond(to: message)
+        return response.content
+    }
+
+    /// 流式生成菜谱步骤
+    func streamRecipeSteps(for dish: String) -> AsyncThrowingStream<String, Error> {
+        session.streamResponse(
+            to: "详细描述\(dish)的烹饪步骤，每步都要具体"
+        ).map { $0.content }.eraseToStream()
+    }
+}
+```
+
+在 SwiftUI 中使用：
+
+```swift
+struct RecipeView: View {
+    @State private var assistant = RecipeAssistant()
+    @State private var recipe: Recipe?
+    @State private var isLoading = false
+
+    var body: some View {
+        VStack {
+            if let recipe {
+                Text(recipe.name).font(.title)
+                Text("难度：\(recipe.difficulty) | 时间：\(recipe.cookingTime)分钟")
+
+                ForEach(recipe.ingredients, id: \.name) { item in
+                    HStack {
+                        Text(item.name)
+                        Spacer()
+                        Text(item.amount).foregroundStyle(.secondary)
+                    }
+                }
+
+                ForEach(Array(recipe.steps.enumerated()), id: \.offset) { index, step in
+                    HStack(alignment: .top) {
+                        Text("\(index + 1).")
+                            .fontWeight(.bold)
+                        Text(step)
+                    }
+                }
+            }
+
+            Button("拍照推荐菜谱") {
+                Task {
+                    isLoading = true
+                    // 实际项目中从相机获取图片
+                    let image = UIImage(named: "fridge")!
+                    recipe = try? await assistant.recommendFromPhoto(image)
+                    isLoading = false
+                }
+            }
+            .disabled(isLoading)
+        }
+        .padding()
+    }
+}
+```
+
+这个示例展示了 Foundation Models Framework 的几个能力如何协同工作：Vision 识别冰箱里的食材，Guided Generation 输出结构化菜谱，Tool Calling 查询和管理食材库存，Session 维护多轮对话上下文。整个过程默认在设备端完成，用户的冰箱照片和食材数据不会上传到任何服务器。
+
+## 性能与限制
+
+在实际开发中需要注意以下几点：
+
+**端侧模型的能力边界**：3B 参数的端侧模型适合意图理解、信息提取、简单推理和格式转换。对于长文写作、复杂数学推理、多步逻辑推导，建议使用 `.adaptive` 策略让框架自动切换到 PCC。
+
+**内存占用**：端侧模型加载后大约占用 1-2 GB 内存。系统会在内存压力大时自动卸载模型，下次调用时重新加载。首次加载可能有 1-2 秒的冷启动延迟。
+
+**上下文窗口**：端侧模型的上下文窗口约 4K tokens，对于长对话场景需要合理使用 `contextPolicy` 管理历史消息。
+
+**Guided Generation 的限制**：嵌套层级建议不超过 3 层，单个结构体字段数建议不超过 15 个，过于复杂的结构可能导致生成质量下降。
+
+## 总结
+
+Foundation Models Framework 在 WWDC 2026 的更新是 Apple 生态 AI 开发的一个分水岭。它不是在追赶 OpenAI 或 Google 的云端大模型，而是在走一条完全不同的路——**把 AI 能力变成操作系统的原生能力，像 Core Data、Core Location 一样自然地融入 App 开发流程**。
+
+对于开发者来说，现在是入手的最佳时机：
+
+1. **从 Guided Generation 开始**：这是最容易落地的能力，任何需要"理解用户输入并提取结构化信息"的场景都可以用
+2. **Tool Calling 构建 Agent 体验**：让你的 App 不只是展示信息，而是能"做事"
+3. **Vision 能力降低用户输入成本**：拍照比打字快，图像理解能力让很多交互变得更自然
+4. **隐私优势作为卖点**：在隐私敏感场景（健康、金融、通讯），"数据不离开设备"是真正的差异化竞争力
+
+端侧 AI 的时代，正式到来了。

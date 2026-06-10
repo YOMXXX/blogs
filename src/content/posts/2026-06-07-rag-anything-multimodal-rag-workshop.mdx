@@ -1,0 +1,202 @@
+---
+title: "实战工坊：用 RAG-Anything 给 RAG 装上「看图读表」的眼睛"
+description: "传统 RAG 只会读纯文本，遇到 PDF 里的图表、公式、扫描表格就抓瞎。RAG-Anything 把文档解析、多模态理解和知识图谱检索打包成一个框架，本文带你从安装到跑通一个能检索图片和表格的多模态问答系统。"
+column: "workshop"
+tags: ["RAG-Anything", "多模态RAG", "LightRAG", "MinerU", "知识图谱", "向量检索", "HKUDS"]
+pubDate: 2026-06-07
+featured: false
+tldr: "RAG-Anything 是港大 HKUDS 团队的多模态 RAG 框架，用 MinerU 解析文档、VLM 描述图表、LightRAG 知识图谱检索，让 RAG 系统能「看图读表」。本文从安装到跑通完整流水线"
+author: "YOMXXX"
+faq:
+  - q: "RAG-Anything 和它的前身 LightRAG 是什么关系？"
+    a: "RAG-Anything 由 LightRAG 的原班团队（港大 HKUDS）开发，可以理解为 LightRAG 的多模态超集。LightRAG 解决的是纯文本场景下「向量检索召回不全」的问题，用知识图谱 + 双层检索补足。RAG-Anything 在此之上加了一整套多模态前处理：把 PDF 里的图片、表格、公式抽出来，用视觉模型转成可检索的文本描述，再喂进 LightRAG 的图谱。所以底层检索引擎还是 LightRAG，RAG-Anything 是在它前面加了「解析 + 模态理解」这两层。"
+  - q: "处理多模态文档需要额外的视觉模型吗？成本会不会爆炸？"
+    a: "需要一个 VLM（视觉语言模型）来理解图片、表格和公式，但成本可控。RAG-Anything 只在「建库」阶段对每个图片/表格调用一次 VLM 生成描述，之后的所有查询都走文本检索，不再碰 VLM。所以成本和文档里的图表数量成正比，而不是和查询次数成正比。想省钱可以把 VLM 换成本地的 Qwen-VL 或 Gemma 4 这类开源多模态模型，建库时一次性跑完，后续查询零额外成本。"
+  - q: "MinerU 解析失败或解析质量差怎么办？"
+    a: "MinerU 是 RAG-Anything 默认的文档解析器，对学术 PDF、扫描件、复杂排版表现不错，但不是万能的。遇到解析质量差，先确认是不是扫描件——纯图片 PDF 需要开启 OCR 模式。其次 RAG-Anything 支持自定义解析后端，你可以接 Docling 或自己的解析管线，只要输出符合它要求的「文本块 + 图片 + 表格」结构化格式即可。实在解析不出来的复杂图表，可以手动补一段文字描述插进文档，效果立竿见影。"
+  - q: "多模态查询是怎么工作的？我能直接拿一张图去查吗？"
+    a: "RAG-Anything 支持两种查询。一种是纯文本查询，比如「文档里关于营收的那张表说了什么」——它会在图谱里召回此前为表格生成的描述。另一种是带多模态内容的查询（VLM-enhanced query），你可以在 query 时附上一张新图片或一段表格，框架会先用 VLM 理解你给的内容，再结合知识库检索作答。所以既能「按文字找图表」，也能「拿图表问知识库」，两个方向都通。"
+  - q: "什么场景该用 RAG-Anything，什么场景用普通文本 RAG 就够了？"
+    a: "判断标准很简单：你的文档里有没有「信息只存在于图表/公式里」的内容。如果是纯文本的 FAQ、文章、代码文档，普通文本 RAG（甚至 LightRAG）就够了，上 RAG-Anything 反而增加解析和 VLM 成本。但如果是财报、论文、产品手册、医疗报告这类「关键数据藏在表格和图里」的文档，文本 RAG 会系统性地丢失信息，这时 RAG-Anything 的多模态能力就是刚需。一句话：文字够用就别上，图表关键才值得。"
+---
+
+> **💡 一句话总结**：RAG-Anything 把「文档解析 → 多模态理解 → 知识图谱检索」打包成一个框架，让你的 RAG 系统终于能读懂 PDF 里的图片、表格和公式。底层检索引擎是 LightRAG，前面加了 MinerU 解析和 VLM 模态理解两层。本文带你跑通一个完整的多模态问答 demo。
+
+## 一、为什么你的 RAG 一直「看不见」图表
+
+做过 RAG 的人都踩过这个坑：你把一份财报 PDF 灌进向量库，用户问「第二季度净利润率是多少」，系统答不上来。
+
+原因不是检索算法差，而是**那个数字根本没进库**。它躺在 PDF 第 8 页一张表格的某个单元格里，而你的文档加载器（PyPDF、pdfplumber 之类）要么把表格拍扁成一串没有结构的乱码，要么直接跳过了嵌入的图片和图表。
+
+这是文本 RAG 的结构性缺陷：**真实世界的文档是多模态的，而传统 RAG 管线是单模态的**。论文里的公式、财报里的表格、产品手册里的示意图、医疗报告里的影像——这些地方往往藏着最关键的信息，却恰恰是文本管线最容易丢失的部分。
+
+RAG-Anything（港大 HKUDS 团队，arXiv 2510.12323）就是来补这个洞的。它的定位是 **All-in-One RAG Framework**——一套框架处理所有模态，不用你自己拼 OCR、表格识别、公式解析、向量化、图谱构建这一堆工具。
+
+它的核心管线分三层：
+
+1. **解析层**：用 MinerU 把文档拆成结构化的文本块、图片、表格、公式。
+2. **模态理解层**：对每个图片/表格/公式调用 VLM（视觉语言模型）生成一段可检索的文本描述。
+3. **检索层**：把所有内容（原文 + 模态描述）统一喂进 LightRAG 的知识图谱，做双层检索。
+
+下面我们动手把它跑起来。
+
+## 二、安装与最小配置
+
+RAG-Anything 直接 pip 安装：
+
+```bash
+# 基础安装
+pip install raganything
+
+# 如果要用内置的 MinerU 解析器，装上 all 附加依赖
+pip install 'raganything[all]'
+```
+
+它需要两个模型能力：一个 **LLM**（做图谱构建和最终生成）和一个 **VLM**（理解图表）。可以都用 OpenAI 系，也可以混搭本地模型。先用最简单的 OpenAI 配置跑通：
+
+```python
+import os
+from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+
+os.environ["OPENAI_API_KEY"] = "sk-..."
+
+config = RAGAnythingConfig(
+    working_dir="./rag_storage",   # 知识图谱和向量索引落盘位置
+    parser="mineru",               # 文档解析后端
+    enable_image_processing=True,  # 处理图片
+    enable_table_processing=True,  # 处理表格
+    enable_equation_processing=True,  # 处理公式
+)
+```
+
+> **💡 提示**：`working_dir` 是 RAG-Anything 的「数据库」。同一份知识库的所有索引都落在这里，换项目就换目录。删掉它等于清空知识库。
+
+## 三、灌一份多模态文档进去
+
+假设我们有一份带图表的 PDF 财报 `report.pdf`。建库代码如下：
+
+```python
+import asyncio
+from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+from lightrag.utils import EmbeddingFunc
+
+# LLM：负责知识图谱抽取和最终生成
+def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
+    return openai_complete_if_cache(
+        "gpt-4o-mini", prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        **kwargs,
+    )
+
+# VLM：负责理解图片/表格，注意它要能接收 image_data
+def vision_model_func(prompt, system_prompt=None, history_messages=[],
+                      image_data=None, **kwargs):
+    # image_data 是 base64 编码的图片；框架在解析到图片时会传进来
+    return openai_complete_if_cache(
+        "gpt-4o", prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+        image_data=image_data,
+        **kwargs,
+    )
+
+embedding_func = EmbeddingFunc(
+    embedding_dim=3072,
+    max_token_size=8192,
+    func=lambda texts: openai_embed(texts, model="text-embedding-3-large"),
+)
+
+async def build():
+    rag = RAGAnything(
+        config=RAGAnythingConfig(working_dir="./rag_storage", parser="mineru"),
+        llm_model_func=llm_model_func,
+        vision_model_func=vision_model_func,
+        embedding_func=embedding_func,
+    )
+    # 一行完成：解析 → 模态理解 → 图谱构建
+    await rag.process_document_complete(
+        file_path="report.pdf",
+        output_dir="./parsed_output",
+    )
+
+asyncio.run(build())
+```
+
+`process_document_complete` 这一行背后发生的事值得理解：
+
+- MinerU 把 `report.pdf` 拆成结构化块，图片单独存为文件、表格转成结构化数据、公式转成 LaTeX。
+- 对每张图片，框架调用 `vision_model_func`，让 VLM 描述「这张图表展示了什么」，生成一段可检索文本。
+- 表格和公式同理，转成自然语言描述。
+- 所有内容（原文 + 描述）一起进 LightRAG，抽取实体和关系，建成知识图谱。
+
+**关键认知**：VLM 只在这一步被调用，建完库就不再用了。所以你的 VLM 成本只和文档里图表的数量挂钩，和后续查询次数无关。
+
+## 四、查询：从文字找图表，也能拿图表问库
+
+建好库后，查询非常直接：
+
+```python
+async def query():
+    rag = RAGAnything(
+        config=RAGAnythingConfig(working_dir="./rag_storage"),
+        llm_model_func=llm_model_func,
+        vision_model_func=vision_model_func,
+        embedding_func=embedding_func,
+    )
+
+    # 纯文本查询：召回此前为表格生成的描述
+    ans = await rag.aquery(
+        "第二季度的净利润率是多少？对比第一季度有什么变化？",
+        mode="hybrid",   # LightRAG 的双层检索：局部实体 + 全局主题
+    )
+    print(ans)
+
+    # 多模态查询：附带一张新图片让 VLM 一起理解
+    ans2 = await rag.aquery_with_multimodal(
+        "这张图表的趋势和我们文档里的数据一致吗？",
+        multimodal_content=[{
+            "type": "image",
+            "img_path": "./new_chart.png",
+        }],
+        mode="hybrid",
+    )
+    print(ans2)
+
+asyncio.run(query())
+```
+
+`mode="hybrid"` 是 LightRAG 的招牌：它同时做**局部检索**（围绕具体实体，比如「净利润率」这个节点）和**全局检索**（围绕主题，比如「财务表现」这个社区），再融合。对「既要细节又要全局对比」的问题，hybrid 模式明显优于纯向量检索。
+
+## 五、本地化与省钱：把 VLM 换成开源模型
+
+线上 demo 用 OpenAI 最省事，但生产场景下，建库阶段对每张图都调 GPT-4o 会有成本。两个优化方向：
+
+**方向一：VLM 换本地开源模型**。建库是离线批处理，对延迟不敏感，正适合用本地 VLM。把 `vision_model_func` 指向本地的 Qwen-VL 或 Gemma 4：
+
+```python
+# 伪代码：指向本地 vLLM 起的 OpenAI 兼容端点
+def vision_model_func(prompt, image_data=None, **kwargs):
+    return openai_complete_if_cache(
+        "qwen2.5-vl-7b", prompt,
+        image_data=image_data,
+        base_url="http://localhost:8000/v1",  # 本地 vLLM
+        api_key="local",
+        **kwargs,
+    )
+```
+
+**方向二：按需开启模态处理**。如果你的文档只有表格没有图片，把 `enable_image_processing=False`，省掉无谓的 VLM 调用。三个开关（image/table/equation）按文档实际内容打开即可。
+
+> **⚠️ 注意**：MinerU 首次运行会下载解析模型（几个 GB），离线环境要提前准备好模型缓存。CI 里跑建库别忘了缓存这部分，否则每次都重新下载。
+
+## 六、什么时候该上、什么时候别上
+
+最后给一个务实的决策标准：
+
+- **该上**：财报、学术论文、产品手册、医疗报告、技术规格书——这些文档的关键信息系统性地藏在图表和公式里，文本 RAG 会漏掉。
+- **别上**：纯文本的 FAQ、博客、聊天记录、代码注释——没有多模态内容，上 RAG-Anything 只是徒增解析和 VLM 成本，用 LightRAG 甚至普通向量 RAG 就够。
+
+一句话收尾：**RAG-Anything 不是「更好的 RAG」，而是「能处理图表的 RAG」**。你的瓶颈在召回算法时，它帮不上忙；你的瓶颈在「信息根本没进库」时，它正中要害。先确认你的文档真有多模态内容，再决定要不要给 RAG 装上这双眼睛。

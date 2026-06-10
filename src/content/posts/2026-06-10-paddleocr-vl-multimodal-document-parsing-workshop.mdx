@@ -1,0 +1,598 @@
+---
+title: "PaddleOCR-VL 1.5 实战：0.9B 参数撬动多模态文档解析"
+description: "PaddleOCR-VL 1.5 用仅 0.9B 参数实现了媲美大模型的多语言文档解析能力。本文从环境搭建到 RAG 集成，手把手演示如何用这个开源模型构建文档智能流水线"
+column: "workshop"
+tags: ["PaddleOCR", "VLM", "OCR", "文档解析", "PaddlePaddle", "多模态"]
+pubDate: 2026-06-10
+featured: false
+tldr: "PaddleOCR-VL 1.5 以 0.9B 超紧凑参数实现多语言文档解析，支持复杂排版、表格、公式识别。本文详解安装部署、基础 OCR、复杂文档处理和 RAG 集成的完整实战流程"
+author: "YOMXXX"
+faq:
+  - q: "PaddleOCR-VL 1.5 需要什么硬件配置？"
+    a: "0.9B 参数意味着极低的硬件门槛，普通消费级 GPU（如 RTX 3060 6GB 显存）即可流畅运行，甚至可以在 CPU 上以可接受的速度推理，非常适合边缘部署场景"
+  - q: "PaddleOCR-VL 和传统 PaddleOCR 有什么区别？"
+    a: "传统 PaddleOCR 基于检测加识别的流水线架构，需要分步处理文本检测、方向分类和文字识别；PaddleOCR-VL 采用端到端的视觉语言模型，能同时理解版面结构和文本内容"
+  - q: "支持哪些语言的文档识别？"
+    a: "PaddleOCR-VL 1.5 支持中文、英文、日文、韩文等主要语言，并且在中英文混排文档上表现尤其出色，适合处理国际化的商业文档和学术论文"
+  - q: "如何将 PaddleOCR-VL 集成到现有的 RAG 系统中？"
+    a: "核心流程是用 PaddleOCR-VL 提取文档的结构化文本，按段落或表格分块后通过 Embedding 模型向量化存入向量数据库，查询时检索相关片段作为 LLM 的上下文"
+  - q: "与 GPT-4o 等商业模型的 OCR 能力相比如何？"
+    a: "在标准文档 OCR 基准测试中，PaddleOCR-VL 1.5 在中英文场景下与 GPT-4o 差距在 5% 以内，但推理速度快数倍且完全免费开源，性价比极高"
+---
+
+> **💡 一句话总结**：PaddleOCR-VL 1.5 是百度飞桨开源的 0.9B 参数多模态文档解析模型，在 OmniDocBench v1.5 上以 94.5% 准确率达到 SOTA，支持文本、表格、公式、图表等十种文档元素识别。本文从 pip install 到 RAG 集成，带你跑通完整的文档智能流水线。
+
+## 一、文档解析为什么需要视觉语言模型
+
+传统 OCR 的流水线是「检测 → 分类 → 识别」三步走：先用目标检测模型框出文字区域，再判断方向，最后逐行识别。这套架构在处理简单文档时没问题，但一遇到复杂排版——多栏报纸、学术论文里的公式表格混排、扫描件的扭曲和光照不均——就开始力不从心。
+
+根本原因在于传统流水线**割裂了视觉理解和语义理解**。检测模型不知道公式和正文的语义边界在哪里，识别模型不知道一个单元格属于表头还是表体。
+
+视觉语言模型（VLM）的思路完全不同：用一个统一的模型**同时看图和生成文本**，让模型自己学会「这是标题、这是正文、这是表格第三行第二列」。不需要你手动定义检测规则，模型端到端地输出结构化的 Markdown 文本。
+
+PaddleOCR-VL 1.5 就是这条路线的最新成果——而且只用了 0.9B 参数就做到了 SOTA。
+
+## 二、PaddleOCR-VL 1.5 技术架构
+
+### 0.9B 参数的设计取舍
+
+0.9B 是什么概念？GPT-4o 估计在万亿级别，Gemini 2.5 Pro 同样是大参数量模型。PaddleOCR-VL 1.5 用不到 1B 的参数就在文档解析任务上追平甚至超越了这些巨无霸，靠的是**任务聚焦**——不做通用对话，只做文档解析，把所有参数都花在刀刃上。
+
+基座模型是百度的 ERNIE-4.5-0.3B-Paddle，经过针对文档场景的大量微调。模型使用 BF16 精度，Safetensors 格式存储，总权重不到 2GB，一张消费级显卡就能装下。
+
+### 视觉编码器与语言模型的融合
+
+PaddleOCR-VL 1.5 的架构是典型的 VLM 范式：
+
+1. **视觉编码器**：将输入图像切分成 patch，编码为视觉 token 序列。对于文本定位（spotting）任务，支持高分辨率输入（最大 2048×28×28 像素），确保小字也能被捕捉到。
+2. **投影层**：将视觉 token 映射到语言模型的 embedding 空间。
+3. **语言解码器**：基于 ERNIE-4.5，以自回归方式生成 Markdown 格式的解析结果。
+
+这种设计的好处是模型能在一次前向传播中同时完成版面分析和文字识别，不需要多次调用不同模型。
+
+### 支持的十种文档任务
+
+PaddleOCR-VL 1.5 不只是一个 OCR 模型，它支持十种文档理解任务：
+
+| 任务 | 说明 |
+|------|------|
+| 文档解析 | 整页解析，输出完整 Markdown |
+| 文字识别（OCR） | 支持生僻字、古文 |
+| 表格识别 | 多语言表格、跨页表格合并 |
+| 公式识别 | LaTeX 格式输出 |
+| 图表识别 | 折线图、柱状图等数据提取 |
+| 文本定位（Text Spotting） | 多边形级别的文字区域检测 |
+| 印章识别 | 环形、异形印章文字提取 |
+| 版面分析 | 标题、正文、图片区域分类 |
+| 跨页段落标题识别 | 长文档的结构连续性 |
+| 不规则形状定位 | 扭曲、倾斜文档的鲁棒检测 |
+
+## 三、快速上手：环境搭建与安装
+
+### 方式一：PaddleOCR 原生安装（推荐）
+
+PaddleOCR-VL 1.5 的推荐用法是通过 PaddleOCR 的 Python 包直接调用，这是功能最完整的方式：
+
+```bash
+# 1. 安装 PaddlePaddle（CUDA 12.6 版本）
+python -m pip install paddlepaddle-gpu==3.2.1 \
+  -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+
+# 2. 安装 PaddleOCR（含文档解析依赖）
+python -m pip install -U "paddleocr[doc-parser]>=3.4.0"
+```
+
+如果没有 GPU，可以安装 CPU 版本：
+
+```bash
+# CPU 版本
+python -m pip install paddlepaddle==3.2.1
+
+# 安装 PaddleOCR
+python -m pip install -U "paddleocr[doc-parser]>=3.4.0"
+```
+
+> **💡 提示**：首次运行时模型会自动下载到本地缓存目录，0.9B 模型权重约 2GB，下载一次后续直接从缓存加载。
+
+### 方式二：Transformers 接口
+
+如果你更熟悉 HuggingFace 生态，也可以通过 Transformers 库加载模型：
+
+```bash
+pip install "transformers>=5.0.0" torch pillow
+```
+
+这种方式更灵活但功能较基础（仅支持单元素级别识别），完整的文档解析流水线建议用方式一。
+
+## 四、基础用法：单张图片 OCR
+
+### 使用 PaddleOCR Python API
+
+最简单的用法——三行代码解析一张文档图片：
+
+```python
+from paddleocr import PaddleOCRVL
+
+# 初始化 pipeline，指定使用 v1.5 版本
+pipeline = PaddleOCRVL(pipeline_version="v1.5")
+
+# 解析文档图片
+output = pipeline.predict("invoice.png")
+
+# 输出结果
+for res in output:
+    res.print()                            # 终端打印
+    res.save_to_json(save_path="output")   # 保存为 JSON
+    res.save_to_markdown(save_path="output")  # 保存为 Markdown
+```
+
+运行后你会在 `output/` 目录下得到两个文件：一个 JSON 包含结构化的解析结果，一个 Markdown 保留了文档的排版结构。
+
+### 使用 Transformers 接口
+
+如果需要更细粒度的控制，可以用 Transformers 直接调用模型：
+
+```python
+from PIL import Image
+import torch
+from transformers import AutoProcessor, AutoModelForImageTextToText
+
+model_path = "PaddlePaddle/PaddleOCR-VL-1.5"
+
+# 加载模型和处理器
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = AutoModelForImageTextToText.from_pretrained(
+    model_path, torch_dtype=torch.bfloat16
+).to(device).eval()
+processor = AutoProcessor.from_pretrained(model_path)
+
+# 读取图片
+image = Image.open("document.png").convert("RGB")
+
+# 构造消息（VLM 聊天格式）
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": "OCR:"},
+        ],
+    }
+]
+
+# 推理
+inputs = processor.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    tokenize=True,
+    return_dict=True,
+    return_tensors="pt",
+).to(device)
+
+outputs = model.generate(**inputs, max_new_tokens=4096)
+result = processor.decode(outputs[0][inputs["input_ids"].shape[-1]:-1])
+print(result)
+```
+
+注意 `text` 字段里的提示词决定了任务类型。不同任务对应不同的提示词：
+
+| 提示词 | 任务 |
+|--------|------|
+| `OCR:` | 文字识别 |
+| `Table Recognition:` | 表格识别 |
+| `Formula Recognition:` | 公式识别 |
+| `Chart Recognition:` | 图表识别 |
+| `Spotting:` | 文本定位 |
+| `Seal Recognition:` | 印章识别 |
+
+### 启用 Flash Attention 加速
+
+如果你的环境支持 Flash Attention 2，只需在加载模型时多传一个参数，推理速度可以提升 30% 以上：
+
+```python
+model = AutoModelForImageTextToText.from_pretrained(
+    model_path,
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+).to(device).eval()
+```
+
+## 五、进阶用法：复杂文档解析
+
+### 多栏布局识别
+
+学术论文的双栏排版是传统 OCR 的噩梦——逐行扫描会把左右两栏混在一起。PaddleOCR-VL 1.5 内建了版面分析能力，能正确识别多栏结构并按阅读顺序输出：
+
+```python
+from paddleocr import PaddleOCRVL
+
+pipeline = PaddleOCRVL(pipeline_version="v1.5")
+
+# 解析双栏论文
+output = pipeline.predict("arxiv_paper_page1.png")
+
+for res in output:
+    # 保存为 Markdown，自动保留标题层级和段落分隔
+    res.save_to_markdown(save_path="paper_output")
+```
+
+输出的 Markdown 会自动按正确的阅读顺序组织，标题用 `#` 标记层级，段落自然分隔，公式用 LaTeX 表示。
+
+### 表格提取
+
+表格识别是 PaddleOCR-VL 1.5 的强项之一，支持复杂表格（合并单元格、多行表头）和跨页表格的自动合并：
+
+```python
+from PIL import Image
+import torch
+from transformers import AutoProcessor, AutoModelForImageTextToText
+
+model_path = "PaddlePaddle/PaddleOCR-VL-1.5"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = AutoModelForImageTextToText.from_pretrained(
+    model_path, torch_dtype=torch.bfloat16
+).to(device).eval()
+processor = AutoProcessor.from_pretrained(model_path)
+
+image = Image.open("financial_table.png").convert("RGB")
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": "Table Recognition:"},
+        ],
+    }
+]
+
+inputs = processor.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    tokenize=True,
+    return_dict=True,
+    return_tensors="pt",
+).to(device)
+
+outputs = model.generate(**inputs, max_new_tokens=4096)
+table_md = processor.decode(outputs[0][inputs["input_ids"].shape[-1]:-1])
+print(table_md)
+# 输出标准 Markdown 表格格式，可直接渲染
+```
+
+### 数学公式识别
+
+对于学术文档中的数学公式，使用 `Formula Recognition:` 提示词即可提取 LaTeX 格式：
+
+```python
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": formula_image},
+            {"type": "text", "text": "Formula Recognition:"},
+        ],
+    }
+]
+
+# ... 推理代码同上 ...
+# 输出示例：$$\frac{\partial L}{\partial \theta} = \sum_{i=1}^{N} \nabla_\theta \log \pi_\theta(a_i|s_i) \cdot A_i$$
+```
+
+### 批量处理多页 PDF
+
+实际场景中经常需要处理整份 PDF 文档。下面是一个批量处理的完整流水线：
+
+```python
+import fitz  # PyMuPDF
+from paddleocr import PaddleOCRVL
+from pathlib import Path
+
+def parse_pdf(pdf_path: str, output_dir: str = "parsed_output"):
+    """解析整份 PDF，每页输出一个 Markdown 文件"""
+    doc = fitz.open(pdf_path)
+    pipeline = PaddleOCRVL(pipeline_version="v1.5")
+    Path(output_dir).mkdir(exist_ok=True)
+
+    all_pages_md = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        # 渲染为高分辨率图片（300 DPI）
+        pix = page.get_pixmap(dpi=300)
+        img_path = f"{output_dir}/page_{page_num + 1}.png"
+        pix.save(img_path)
+
+        # 解析
+        output = pipeline.predict(img_path)
+        for res in output:
+            md_content = res.save_to_markdown(save_path=output_dir)
+            all_pages_md.append(md_content)
+
+        print(f"已处理第 {page_num + 1}/{len(doc)} 页")
+
+    # 合并为完整文档
+    full_md = "\n\n---\n\n".join(all_pages_md)
+    with open(f"{output_dir}/full_document.md", "w", encoding="utf-8") as f:
+        f.write(full_md)
+
+    return full_md
+
+# 使用
+result = parse_pdf("research_paper.pdf")
+```
+
+## 六、结合 RAG 构建文档问答系统
+
+PaddleOCR-VL 的真正威力在于作为 RAG 系统的文档预处理引擎。传统的 PDF 文本提取（如 PyPDF2）只能拿到纯文本，丢失了表格、公式等结构信息；而 PaddleOCR-VL 输出的 Markdown 保留了完整结构，极大提升了下游检索和问答的质量。
+
+### 文档预处理流水线
+
+```python
+import fitz
+from paddleocr import PaddleOCRVL
+
+def extract_structured_chunks(pdf_path: str) -> list[dict]:
+    """从 PDF 提取结构化文本块，用于后续向量化"""
+    doc = fitz.open(pdf_path)
+    pipeline = PaddleOCRVL(pipeline_version="v1.5")
+    chunks = []
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=300)
+        img_path = f"/tmp/page_{page_num}.png"
+        pix.save(img_path)
+
+        output = pipeline.predict(img_path)
+        for res in output:
+            # 获取 Markdown 格式的解析结果
+            md_text = str(res)
+
+            # 按段落分块（以双换行为分隔）
+            paragraphs = [p.strip() for p in md_text.split("\n\n") if p.strip()]
+            for i, para in enumerate(paragraphs):
+                chunks.append({
+                    "text": para,
+                    "metadata": {
+                        "source": pdf_path,
+                        "page": page_num + 1,
+                        "chunk_index": i,
+                    }
+                })
+
+    return chunks
+```
+
+### 向量化存储
+
+拿到结构化文本块后，接入任意向量数据库。这里以 ChromaDB 为例：
+
+```python
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+# 初始化 Embedding 模型和向量库
+embedder = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+client = chromadb.PersistentClient(path="./chroma_db")
+collection = client.get_or_create_collection("documents")
+
+def index_chunks(chunks: list[dict]):
+    """将文本块向量化并存入 ChromaDB"""
+    texts = [c["text"] for c in chunks]
+    embeddings = embedder.encode(texts).tolist()
+
+    collection.add(
+        ids=[f"chunk_{i}" for i in range(len(chunks))],
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=[c["metadata"] for c in chunks],
+    )
+    print(f"已索引 {len(chunks)} 个文本块")
+
+# 从 PDF 提取并索引
+chunks = extract_structured_chunks("annual_report.pdf")
+index_chunks(chunks)
+```
+
+### 查询与回答
+
+检索相关片段后注入 LLM 上下文，完成问答闭环：
+
+```python
+from openai import OpenAI
+
+openai_client = OpenAI()
+
+def ask_document(question: str, top_k: int = 5) -> str:
+    """基于文档内容回答问题"""
+    # 检索相关文本块
+    query_embedding = embedder.encode([question]).tolist()
+    results = collection.query(
+        query_embeddings=query_embedding,
+        n_results=top_k,
+    )
+
+    # 构造上下文
+    context = "\n\n---\n\n".join(results["documents"][0])
+
+    # 调用 LLM 回答
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": "你是一个文档问答助手。根据提供的文档内容回答问题，如果文档中没有相关信息请明确说明。",
+            },
+            {
+                "role": "user",
+                "content": f"文档内容：\n{context}\n\n问题：{question}",
+            },
+        ],
+    )
+    return response.choices[0].message.content
+
+# 使用
+answer = ask_document("公司去年的营收增长率是多少？")
+print(answer)
+```
+
+> **💡 提示**：PaddleOCR-VL 输出的 Markdown 保留了表格结构，所以即使问题涉及表格数据（比如某一行的具体数值），检索到的文本块也包含完整的表格上下文，LLM 能准确回答。这是用 PyPDF2 等纯文本提取工具做不到的。
+
+## 七、性能评测
+
+### OmniDocBench v1.5 基准测试
+
+OmniDocBench 是当前最权威的文档解析评测基准，PaddleOCR-VL 1.5 在 v1.5 版本上的表现：
+
+| 模型 | 参数量 | 总分 | 文本 | 公式 | 表格 | 阅读顺序 |
+|------|--------|------|------|------|------|----------|
+| **PaddleOCR-VL 1.5** | **0.9B** | **94.5%** | **SOTA** | **SOTA** | **SOTA** | **SOTA** |
+| GPT-4o | 未公开 | ~90% | 优秀 | 优秀 | 良好 | 良好 |
+| Gemini 2.5 Pro | 未公开 | ~89% | 优秀 | 良好 | 优秀 | 良好 |
+
+用不到 1B 参数在四个子维度上全部达到 SOTA，这个结果相当惊人。
+
+### Real5-OmniDocBench：真实场景鲁棒性
+
+传统基准用的都是高质量的数字文档，但现实中的文档往往有扫描噪声、拍照扭曲、光照不均等问题。PaddleOCR-VL 1.5 提出了 Real5-OmniDocBench 基准，覆盖五种真实场景：
+
+| 场景 | 说明 | PaddleOCR-VL 1.5 |
+|------|------|-------------------|
+| Scanning | 扫描件 | SOTA |
+| Warping | 纸张弯曲 | SOTA |
+| Screen-photography | 屏幕翻拍 | SOTA |
+| Illumination | 光照不均 | SOTA |
+| Skew | 倾斜 | SOTA |
+
+五种场景全部 SOTA，说明这个模型不只是在实验室数据上刷分，在真实世界的恶劣条件下同样可靠。
+
+### ParseBench 评测（LlamaIndex）
+
+在 LlamaIndex 的 ParseBench 基准上，PaddleOCR-VL 1.5 的各维度得分：
+
+| 维度 | 得分 |
+|------|------|
+| 综合均分 | 65.95 |
+| 文本内容 | 82.72 |
+| 文本格式 | 54.27 |
+| 版面结构 | 77.78 |
+| 图表 | 47.62 |
+| 表格 | 67.38 |
+
+文本内容和版面结构是强项，图表识别相对弱一些——这也说明 0.9B 模型在视觉推理上确实受限于参数量，但对于主流的文档解析场景已经完全够用。
+
+### 推理性能
+
+在单张 NVIDIA A100 GPU 上处理 OmniDocBench v1.5 的 512 份 PDF 文档（含 PDF 渲染和 Markdown 生成的端到端流程），PaddleOCR-VL 1.5 的处理速度远快于商业 API，因为省去了网络延迟且模型本身就小。
+
+## 八、vLLM 高性能部署
+
+生产环境中如果需要更高吞吐量，可以用 vLLM 作为推理后端：
+
+### Docker 一键启动
+
+```bash
+docker run --rm --gpus all --network host \
+  ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu \
+  paddleocr genai_server \
+  --model_name PaddleOCR-VL-1.5-0.9B \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --backend vllm
+```
+
+### 客户端调用
+
+启动 vLLM 服务后，PaddleOCR 客户端只需加两个参数就能无缝切换到远程推理：
+
+```python
+from paddleocr import PaddleOCRVL
+
+# 连接 vLLM 服务
+pipeline = PaddleOCRVL(
+    pipeline_version="v1.5",
+    vl_rec_backend="vllm-server",
+    vl_rec_server_url="http://127.0.0.1:8080/v1",
+)
+
+# 用法完全一样
+output = pipeline.predict("document.png")
+for res in output:
+    res.save_to_markdown(save_path="output")
+```
+
+这种架构的好处是将模型推理和业务逻辑分离：vLLM 服务可以部署在 GPU 机器上，业务代码跑在普通 CPU 机器上，通过 HTTP 通信。
+
+### CLI 快速测试
+
+PaddleOCR 还提供了命令行工具，适合快速验证效果：
+
+```bash
+# 命令行直接解析文档
+paddleocr doc_parser -i path/to/document.png --pipeline_version v1.5
+
+# 指定输出目录
+paddleocr doc_parser -i path/to/document.png --pipeline_version v1.5 --save_path output/
+```
+
+## 九、MCP Server 集成
+
+PaddleOCR 项目已经提供了官方的 MCP Server 实现，可以让 AI Agent 直接调用 OCR 能力。最近项目将 MCP Server 从独立实现重构为基于 Python SDK 的版本，集成更加方便。
+
+一个典型的使用场景：在 Claude Code 或其他支持 MCP 的 Agent 中配置 PaddleOCR Server，Agent 遇到图片或 PDF 时自动调用 OCR 进行内容提取，再基于提取结果回答用户问题。
+
+```json
+{
+  "mcpServers": {
+    "paddleocr": {
+      "command": "python",
+      "args": ["-m", "paddleocr.mcp_server"],
+      "env": {
+        "PADDLEOCR_PIPELINE_VERSION": "v1.5"
+      }
+    }
+  }
+}
+```
+
+这意味着文档解析能力可以作为工具嵌入到任何 Agent 工作流中，而不仅仅是一个独立的脚本。
+
+## 十、最佳实践与避坑指南
+
+### 图片预处理
+
+- **分辨率**：推荐 300 DPI 渲染 PDF 页面，低于 150 DPI 会明显影响小字识别。
+- **文本定位任务**：如果原图分辨率较低（宽高均 &lt;1500 像素），建议先上采样到 2 倍再输入模型。
+- **颜色空间**：统一转换为 RGB，避免 CMYK 或灰度图导致的兼容性问题。
+
+### 任务选择
+
+- 只需要提取全文：用 PaddleOCR API 的 `predict()` 方法，它会自动处理版面分析 + OCR。
+- 需要精确的文字坐标：用 Transformers 接口配合 `Spotting:` 提示词。
+- 只需要某种元素（公式/表格）：用对应的提示词做元素级别识别，避免全页解析的开销。
+
+### 生产部署建议
+
+- **吞吐量要求高**：用 vLLM Docker 部署，支持批量推理和请求排队。
+- **边缘设备**：0.9B 模型可在 6GB 显存的消费级 GPU 上运行，适合本地部署。
+- **CPU 推理**：虽然速度较慢，但对于低频调用场景完全可用，省去 GPU 成本。
+- **缓存策略**：相同文档不要重复解析，将结果缓存到数据库或文件系统。
+
+### 常见问题
+
+- **中英文混排效果差**：确认使用的是 v1.5 而非旧版本，v1.5 对混排做了专项优化。
+- **表格合并单元格识别错误**：尝试提高输入图片分辨率，复杂表格对分辨率敏感。
+- **公式识别不完整**：检查 `max_new_tokens` 参数，复杂公式可能需要更长的输出 token。
+
+## 总结
+
+PaddleOCR-VL 1.5 证明了一件事：**文档解析不需要万亿参数的通用大模型**。通过任务聚焦的设计，0.9B 参数就能在 OmniDocBench 上拿到 94.5% 的 SOTA 准确率，支持十种文档元素识别，覆盖真实世界的五种恶劣场景。
+
+它的工程价值在于三点：
+
+1. **门槛低**：一张消费级 GPU 就能跑，甚至支持 CPU 推理。
+2. **集成易**：三行 Python 代码完成文档解析，输出标准 Markdown。
+3. **生态全**：支持 vLLM 高性能部署、LangChain 集成、MCP Server、Transformers 接口，无论你的技术栈是什么都能接入。
+
+如果你正在构建 RAG 系统、文档智能流水线或者任何需要从非结构化文档中提取信息的应用，PaddleOCR-VL 1.5 应该是你的首选方案——免费、开源、Apache 2.0 协议，没有任何使用限制。
