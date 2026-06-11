@@ -1,0 +1,505 @@
+---
+title: "Claude Managed Agents 实战：10 分钟部署你的第一个生产级 AI Agent"
+description: "Anthropic 推出的 Managed Agents API 让开发者无需管理基础设施即可部署自主运行的 AI Agent，本文从零开始用 Python 代码演示 Agent 创建、工具定义、Session 管理全流程"
+column: "workshop"
+tags: ["Claude", "Managed Agents", "Anthropic", "AI Agent", "Python"]
+pubDate: 2026-06-11
+featured: false
+tldr: "Anthropic Managed Agents API 公测版让 AI Agent 部署变得简单：创建 Agent → 配置 Tool → 启动 Session → 流式获取结果。本文用完整 Python 示例演示全流程，包含错误处理和生产部署建议"
+author: "YOMXXX"
+faq:
+  - q: "Claude Managed Agents 和直接调用 Messages API 有什么区别？"
+    a: "Messages API 是单轮请求-响应模式，而 Managed Agents 提供持久化的云端执行环境，Agent 可以自主规划多步骤任务、运行代码、读写文件，开发者通过事件流监控进度"
+  - q: "Managed Agents 支持哪些 Claude 模型？"
+    a: "支持 Claude Opus 4.8、Sonnet 4.6、Haiku 4.5 等模型，不同模型适合不同复杂度的任务，Opus 适合复杂推理，Sonnet 适合日常编码，Haiku 适合高吞吐简单任务"
+  - q: "Managed Agents 的定价方式是怎样的？"
+    a: "按 token 计费与标准 Claude API 一致，额外收取云端环境费用（按 session 时长计费），整体成本取决于任务复杂度和执行时间"
+  - q: "如何在 Managed Agents 中自定义工具？"
+    a: "通过 JSON Schema 定义工具的输入参数和描述，Agent 会根据任务需要自动选择调用合适的工具，工具执行结果会作为 tool_result 事件返回给 Agent 继续推理"
+  - q: "Managed Agents 适合哪些生产场景？"
+    a: "适合需要多步骤自主执行的任务，如自动化代码审查、数据分析报告生成、文档处理流水线、客户支持自动化等，不适合需要毫秒级响应的实时对话场景"
+---
+
+> **一句话总结**：Claude Managed Agents 是 Anthropic 提供的托管式 Agent 基础设施——你定义 Agent 的模型、提示词和工具，Anthropic 负责运行 Agent 循环、管理沙箱、执行工具调用。本文用完整 Python 代码带你从零走完全流程。
+
+## 为什么需要 Managed Agents
+
+过去一年，AI Agent 从概念走向工程落地，但「自己搭 Agent」依然是件苦差事。你得自己写 Agent 循环（while True → LLM 推理 → 工具调用 → 结果注入 → 继续推理），自己管理沙箱环境（代码执行不能炸主机），自己处理上下文膨胀（对话长了要做 compaction），自己实现流式推送。每个环节都有坑，合在一起就是一套小型基础设施。
+
+2026 年 4 月 8 日，Anthropic 发布了 **Claude Managed Agents**（公测版）。它的定位很明确：**你只管定义 Agent 做什么，Anthropic 负责 Agent 怎么跑**。Agent 循环、沙箱隔离、工具执行、上下文管理、流式推送——全部由 Anthropic 的基础设施托管。开发者通过 API 操作四个核心概念就够了。
+
+## 四个核心概念
+
+在写代码之前，先理清 Managed Agents 的四个核心抽象：
+
+| 概念 | 说明 | 类比 |
+|------|------|------|
+| **Agent** | 模型 + 系统提示词 + 工具的配置实体，创建一次、反复引用 | Docker 镜像 |
+| **Environment** | Agent 运行的沙箱环境配置，可以是 Anthropic 云端托管，也可以自托管 | Docker 运行时 |
+| **Session** | 一次 Agent 任务的执行实例，绑定 Agent + Environment | Docker 容器 |
+| **Events** | Session 中的消息流——用户消息、Agent 回复、工具调用、工具结果、状态变更 | 容器日志 |
+
+它们的关系是：**Agent 是配置，Environment 是运行环境，Session 是执行实例，Events 是通信协议**。一个 Agent 可以跑无数个 Session，一个 Environment 可以被多个 Session 复用。
+
+## 环境准备
+
+### 安装 SDK
+
+Managed Agents API 已经内置在 Anthropic 官方 Python SDK 中，确保版本足够新：
+
+```bash
+pip install --upgrade anthropic
+```
+
+### 获取 API Key
+
+前往 [Anthropic Console](https://platform.claude.com) 创建 API Key，设置为环境变量：
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-api03-..."
+```
+
+> **注意**：所有 Managed Agents 端点都需要 `managed-agents-2026-04-01` beta header。Python SDK 会自动设置这个 header，你无需手动处理。
+
+## 完整示例：创建一个代码分析 Agent
+
+下面用一个真实场景串起全流程：创建一个能分析 Python 代码、运行测试、给出改进建议的 Agent。
+
+### 第一步：创建 Agent
+
+Agent 是一个持久化的配置实体。创建一次，拿到 ID 后反复使用，不要每次请求都重新创建。
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+
+# 创建 Agent：定义模型、系统提示词和可用工具
+agent = client.beta.agents.create(
+    name="Code Analyzer",
+    model="claude-sonnet-4-6",
+    system="""你是一个资深的 Python 代码审查专家。你的工作流程是：
+1. 阅读用户提供的代码或文件
+2. 在沙箱中运行代码，验证其行为
+3. 分析代码质量、潜在 bug、性能问题
+4. 给出具体的改进建议和修改后的代码
+
+回复使用中文，代码注释用英文。""",
+    tools=[
+        {"type": "agent_toolset_20260401"},
+    ],
+)
+
+print(f"Agent ID: {agent.id}, version: {agent.version}")
+```
+
+`agent_toolset_20260401` 是内置工具集，包含 bash、文件读写（read/write/edit）、glob、grep、web_fetch、web_search 等工具。Agent 会根据任务需要自动选择使用哪些工具。
+
+### 第二步：创建 Environment
+
+Environment 定义 Agent 运行的沙箱配置。这里使用 Anthropic 托管的云端沙箱：
+
+```python
+# 创建 Environment：使用 Anthropic 云端沙箱
+environment = client.beta.environments.create(
+    name="code-analysis-env",
+    config={
+        "type": "cloud",
+        "networking": {"type": "unrestricted"},
+    },
+)
+
+print(f"Environment ID: {environment.id}")
+```
+
+`networking` 设为 `unrestricted` 表示沙箱可以访问外部网络（比如 pip install 依赖）。生产环境中你可以根据安全需求收紧网络策略。
+
+### 第三步：启动 Session 并流式获取结果
+
+Session 是核心执行单元。创建 Session 后，发送用户消息，然后通过 SSE 流实时接收 Agent 的行为：
+
+```python
+# 创建 Session
+session = client.beta.sessions.create(
+    agent=agent.id,
+    environment_id=environment.id,
+    title="分析排序算法",
+)
+
+print(f"Session ID: {session.id}")
+
+# 打开事件流并发送用户消息
+with client.beta.sessions.events.stream(session.id) as stream:
+    # 发送用户消息——这会触发 Agent 开始工作
+    client.beta.sessions.events.send(
+        session.id,
+        events=[
+            {
+                "type": "user.message",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """请创建一个 Python 文件 sort_benchmark.py，实现以下功能：
+1. 实现冒泡排序、快速排序、归并排序三种算法
+2. 用 random 生成 10000 个随机整数作为测试数据
+3. 用 time 模块对比三种排序的耗时
+4. 运行脚本并分析结果
+
+然后对代码进行审查，指出可以优化的地方。""",
+                    },
+                ],
+            },
+        ],
+    )
+
+    # 逐事件处理流式响应
+    for event in stream:
+        match event.type:
+            case "agent.message":
+                # Agent 的文本回复
+                for block in event.content:
+                    print(block.text, end="")
+            case "agent.tool_use":
+                # Agent 调用工具
+                print(f"\n🔧 [调用工具: {event.name}]")
+            case "agent.tool_result":
+                # 工具执行结果（通常很长，这里只打印摘要）
+                print(f"   ✅ 工具执行完成")
+            case "session.status_idle":
+                # Agent 完成任务，进入空闲状态
+                print("\n\n--- Agent 已完成任务 ---")
+                break
+```
+
+运行这段代码，你会看到类似这样的输出：
+
+```text
+我来帮你创建排序算法对比脚本。
+
+🔧 [调用工具: write]
+   ✅ 工具执行完成
+
+已创建 sort_benchmark.py，现在运行它来看看结果。
+
+🔧 [调用工具: bash]
+   ✅ 工具执行完成
+
+运行结果显示：
+- 冒泡排序：约 12.3 秒（O(n²) 复杂度，10000 个元素时已经很慢）
+- 快速排序：约 0.03 秒
+- 归并排序：约 0.04 秒
+
+代码审查建议：
+1. 快速排序的 pivot 选择可以用三数取中法避免最坏情况...
+
+--- Agent 已完成任务 ---
+```
+
+整个过程中，Agent **自主完成**了写文件、运行脚本、分析结果这一系列操作，你只需要监听事件流。
+
+## 自定义工具（Custom Tool）
+
+内置工具集覆盖了文件操作和代码执行，但真实场景中你往往需要 Agent 调用你自己的 API——查数据库、发通知、调第三方服务。这就需要 **Custom Tool**。
+
+自定义工具的机制和 Messages API 的 Tool Use 一致：你用 JSON Schema 定义工具的接口，Agent 决定何时调用，**但实际执行由你的代码完成**，结果通过事件发回给 Agent。
+
+### 定义带自定义工具的 Agent
+
+```python
+# 创建带自定义工具的 Agent
+agent_with_tools = client.beta.agents.create(
+    name="DevOps Assistant",
+    model="claude-sonnet-4-6",
+    system="你是一个 DevOps 助手，可以查询服务状态和部署信息。",
+    tools=[
+        # 内置工具集
+        {"type": "agent_toolset_20260401"},
+        # 自定义工具：查询服务健康状态
+        {
+            "type": "custom",
+            "name": "check_service_health",
+            "description": "检查指定服务的健康状态，返回服务的运行状态、CPU/内存使用率、最近错误日志",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "service_name": {
+                        "type": "string",
+                        "description": "服务名称，如 api-gateway、user-service",
+                    },
+                    "include_logs": {
+                        "type": "boolean",
+                        "description": "是否包含最近 10 条错误日志",
+                    },
+                },
+                "required": ["service_name"],
+            },
+        },
+        # 自定义工具：触发部署
+        {
+            "type": "custom",
+            "name": "trigger_deploy",
+            "description": "触发指定服务的部署流程，需要指定目标环境和版本号",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "service_name": {"type": "string"},
+                    "environment": {
+                        "type": "string",
+                        "enum": ["staging", "production"],
+                    },
+                    "version": {"type": "string", "description": "语义化版本号"},
+                },
+                "required": ["service_name", "environment", "version"],
+            },
+        },
+    ],
+)
+```
+
+### 处理自定义工具调用
+
+当 Agent 决定调用你的自定义工具时，事件流中会出现 `agent.tool_use` 事件且 `is_custom` 为 True。你需要执行工具逻辑，然后把结果发回给 Agent：
+
+```python
+import json
+
+def handle_custom_tool(name: str, input_data: dict) -> str:
+    """模拟执行自定义工具"""
+    if name == "check_service_health":
+        # 实际场景中这里调用你的监控 API
+        return json.dumps({
+            "service": input_data["service_name"],
+            "status": "healthy",
+            "cpu_usage": "42%",
+            "memory_usage": "68%",
+            "uptime": "14d 6h 32m",
+            "error_count_24h": 3,
+        })
+    elif name == "trigger_deploy":
+        return json.dumps({
+            "deploy_id": "deploy-20260611-001",
+            "status": "started",
+            "estimated_time": "3 minutes",
+        })
+    return json.dumps({"error": f"Unknown tool: {name}"})
+
+
+# 创建 Session 并处理自定义工具调用
+session = client.beta.sessions.create(
+    agent=agent_with_tools.id,
+    environment_id=environment.id,
+)
+
+with client.beta.sessions.events.stream(session.id) as stream:
+    client.beta.sessions.events.send(
+        session.id,
+        events=[
+            {
+                "type": "user.message",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "检查 user-service 的状态，如果正常就部署 v2.1.0 到 staging",
+                    }
+                ],
+            }
+        ],
+    )
+
+    for event in stream:
+        match event.type:
+            case "agent.message":
+                for block in event.content:
+                    print(block.text, end="")
+            case "agent.tool_use":
+                print(f"\n🔧 [调用工具: {event.name}]")
+                # 检查是否是自定义工具
+                if hasattr(event, "is_custom") and event.is_custom:
+                    # 执行自定义工具逻辑
+                    result = handle_custom_tool(event.name, event.input)
+                    # 将结果发回给 Agent
+                    client.beta.sessions.events.send(
+                        session.id,
+                        events=[
+                            {
+                                "type": "tool.result",
+                                "tool_use_id": event.id,
+                                "content": [{"type": "text", "text": result}],
+                            }
+                        ],
+                    )
+            case "session.status_idle":
+                print("\n\n--- 任务完成 ---")
+                break
+```
+
+自定义工具的最佳实践：
+
+- **描述要详尽**：工具描述是 Agent 决定是否调用的关键依据。至少写 3-4 句话，说明工具做什么、什么时候用、什么时候不该用
+- **合并相关操作**：不要把 `create_user`、`update_user`、`delete_user` 拆成三个工具，合并成一个 `manage_user` 加 `action` 参数
+- **返回精简信息**：只返回 Agent 下一步推理需要的字段，不要塞一大堆无关数据
+
+## 工具配置精细化
+
+如果你不想让 Agent 使用全部内置工具，可以精细控制。比如一个只做代码分析的 Agent 不需要网络访问能力：
+
+```python
+# 只启用文件操作和 bash，禁用网络相关工具
+agent_restricted = client.beta.agents.create(
+    name="Offline Code Reviewer",
+    model="claude-sonnet-4-6",
+    system="你是代码审查专家，只分析本地文件，不需要访问网络。",
+    tools=[
+        {
+            "type": "agent_toolset_20260401",
+            "default_config": {"enabled": False},
+            "configs": [
+                {"name": "bash", "enabled": True},
+                {"name": "read", "enabled": True},
+                {"name": "write", "enabled": True},
+                {"name": "edit", "enabled": True},
+                {"name": "glob", "enabled": True},
+                {"name": "grep", "enabled": True},
+            ],
+        },
+    ],
+)
+```
+
+也可以反过来，保留全部工具但禁用个别：
+
+```python
+# 禁用 web_fetch 和 web_search
+agent_no_web = client.beta.agents.create(
+    name="Local Agent",
+    model="claude-sonnet-4-6",
+    tools=[
+        {
+            "type": "agent_toolset_20260401",
+            "configs": [
+                {"name": "web_fetch", "enabled": False},
+                {"name": "web_search", "enabled": False},
+            ],
+        },
+    ],
+)
+```
+
+## 生产部署注意事项
+
+从 demo 到生产，你需要关注以下几个方面。
+
+### 错误处理
+
+网络不稳定、Session 超时、Agent 卡住都可能发生。生产代码必须有重试和超时机制：
+
+```python
+import time
+from anthropic import APITimeoutError, APIConnectionError
+
+def run_agent_with_retry(
+    client, agent_id, environment_id, user_message, max_retries=3
+):
+    """带重试的 Agent 执行"""
+    for attempt in range(max_retries):
+        try:
+            session = client.beta.sessions.create(
+                agent=agent_id,
+                environment_id=environment_id,
+            )
+
+            with client.beta.sessions.events.stream(session.id) as stream:
+                client.beta.sessions.events.send(
+                    session.id,
+                    events=[
+                        {
+                            "type": "user.message",
+                            "content": [{"type": "text", "text": user_message}],
+                        }
+                    ],
+                )
+
+                results = []
+                for event in stream:
+                    if event.type == "agent.message":
+                        for block in event.content:
+                            results.append(block.text)
+                    elif event.type == "session.status_idle":
+                        break
+
+                return "".join(results)
+
+        except (APITimeoutError, APIConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt  # 指数退避
+                print(f"请求失败，{wait}s 后重试: {e}")
+                time.sleep(wait)
+            else:
+                raise
+```
+
+### 成本控制
+
+Managed Agents 的成本来自两部分：**token 费用**（和标准 API 一致）加**云端环境费用**（按 Session 时长计费）。控制成本的几个要点：
+
+- **选对模型**：简单任务用 Haiku，日常编码用 Sonnet，只有复杂推理才上 Opus
+- **及时关闭 Session**：任务完成后不要让 Session 空转
+- **限制工具范围**：禁用不需要的工具，减少 Agent 的探索空间
+- **系统提示词要精确**：模糊的指令会导致 Agent 多走弯路，消耗更多 token
+
+### Agent 复用
+
+Agent 是持久化资源，**创建一次、到处引用**。不要在每次请求中重新创建 Agent：
+
+```python
+# 正确做法：启动时创建一次，保存 ID
+AGENT_ID = "agent_01J..."  # 从配置或数据库读取
+ENVIRONMENT_ID = "env_01J..."
+
+# 每次任务只创建 Session
+session = client.beta.sessions.create(
+    agent=AGENT_ID,
+    environment_id=ENVIRONMENT_ID,
+)
+```
+
+### 版本管理
+
+Agent 支持版本控制。每次更新 Agent 配置（修改系统提示词、增删工具）都会产生新版本。你可以把 Session 固定到特定版本，避免更新影响正在运行的任务：
+
+```python
+# 固定到 Agent 的特定版本
+session = client.beta.sessions.create(
+    agent={"type": "agent", "id": AGENT_ID, "version": 3},
+    environment_id=ENVIRONMENT_ID,
+)
+```
+
+### 安全考量
+
+- **网络隔离**：生产环境建议把 Environment 的 networking 收紧，只允许访问必要的域名
+- **敏感信息**：不要在系统提示词或用户消息中硬编码 API Key、数据库密码等。需要认证时使用 Vault 机制
+- **输入校验**：用户输入在发给 Agent 之前做基本的校验和清洗
+- **自托管沙箱**：如果数据合规要求高，可以使用 self-hosted sandbox，让 Agent 的执行环境完全运行在你自己的基础设施上
+
+## Managed Agents vs Agent SDK vs Messages API
+
+最后做一个快速对比，帮你判断该用哪个：
+
+| 维度 | Messages API | Agent SDK | Managed Agents |
+|------|-------------|-----------|----------------|
+| Agent 循环 | 你自己写 | SDK 提供 | Anthropic 托管 |
+| 工具执行 | 你自己跑 | 你自己跑 | 沙箱中自动执行 |
+| 运行环境 | 你的服务器 | 你的服务器 | 云端沙箱 |
+| 适合场景 | 单轮对话、简单工具 | 需要完全控制的复杂 Agent | 长时间运行的自主任务 |
+| 上手难度 | 最低 | 中等 | 低（基础设施全托管） |
+
+简单说：**需要精细控制选 Agent SDK，想快速部署选 Managed Agents，只要单轮对话选 Messages API**。
+
+## 小结
+
+Claude Managed Agents 把「部署一个生产级 AI Agent」的门槛降到了最低：你不再需要自己写 Agent 循环、管理沙箱、处理上下文膨胀。整个流程浓缩为四步——创建 Agent、创建 Environment、启动 Session、监听 Events。
+
+目前 Managed Agents 还在公测阶段（需要 `managed-agents-2026-04-01` beta header），但核心功能已经完善：内置工具集覆盖了代码执行和文件操作，自定义工具让你接入任意外部服务，SSE 流式事件让你实时观察 Agent 的每一步行为。
+
+如果你正在做自动化代码审查、数据分析流水线、文档处理这类需要「Agent 自主干活一段时间再给结果」的场景，Managed Agents 值得认真评估。它不是要替代你手写的 Agent 框架，而是提供了一个「别人帮你运维 Agent 基础设施」的选项——对于大多数团队来说，这正是最缺的那一块拼图。
