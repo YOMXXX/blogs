@@ -1,0 +1,274 @@
+---
+title: "MCP 2026-07-28 规范重构全解析：从有状态握手到无状态协议的范式转移"
+description: "MCP 最大一次规范修订即将落地：移除握手和会话、引入 Extensions 框架、重新设计 Tasks、新增 MCP Apps。本文逐项解析每个变更的技术细节和迁移影响"
+column: "long-form"
+tags: ["MCP", "Model Context Protocol", "无状态协议", "Agent", "协议设计"]
+pubDate: 2026-06-12
+featured: false
+tldr: "MCP 2026-07-28 Release Candidate 是协议诞生以来最大的修订：移除 initialize 握手和 Session ID，实现完全无状态；引入 Extensions 框架让扩展独立演进；Tasks 从核心功能迁移为扩展并重新设计生命周期；新增 MCP Apps 让服务端渲染交互式 UI"
+author: "YOMXXX"
+faq:
+  - q: "MCP 变成无状态意味着什么？"
+    a: "之前每个客户端必须先执行 initialize 握手获取 Session ID，后续请求必须携带该 ID 路由到同一服务实例。现在每个请求都是自包含的，可以被任意服务实例处理，就像 REST API 一样"
+  - q: "无状态协议还能保持应用状态吗？"
+    a: "可以。协议层无状态不等于应用层无状态。服务端可以通过工具返回显式句柄（如 basket_id、session_id），模型在后续调用中传回这个句柄。状态从协议层的隐式变成了应用层的显式"
+  - q: "现有的 MCP Server 需要迁移吗？"
+    a: "是的。握手移除、Header 新增、Tasks API 重新设计等都是破坏性变更。Tier 1 SDK 预计在 7 月 28 日正式规范发布前完成适配，开发者需要更新 SDK 并修改相关代码"
+  - q: "被废弃的 Roots、Sampling、Logging 还能用吗？"
+    a: "这些是标注式废弃，当前版本和未来一年内的所有版本中仍然可用。但应该开始迁移：Roots 改用工具参数，Sampling 改用 LLM Provider API 直接集成，Logging 改用 stderr 或 OpenTelemetry"
+  - q: "MCP Apps 是什么？"
+    a: "MCP Apps 允许服务端在客户端中渲染交互式 HTML 界面（sandboxed iframe）。工具可以声明 UI 模板，用户通过 UI 操作触发的动作走和工具调用相同的审计路径，实现了服务端驱动的富交互"
+---
+
+> **一句话总结**：MCP 终于长大了——握手没了，会话没了，任何请求可以打到任何服务实例上。这不是修修补补，是协议层面的范式转移。
+
+## 为什么需要这次重构
+
+2025 年 11 月 25 日发布的 MCP 规范定义了一个有状态的协议：客户端先发 `initialize` 请求，服务端返回 `Mcp-Session-Id`，后续所有请求必须携带这个 ID。服务端必须跟踪每个客户端的会话状态。
+
+这个设计在早期原型中运行良好，但在生产环境中暴露了严重的扩展性问题：
+
+1. **粘性会话**：每个客户端必须路由到同一个服务实例，无法简单使用轮询负载均衡
+2. **会话存储**：服务端需要维护一个跨实例共享的会话存储（Redis/数据库），增加了基础设施复杂度
+3. **深度包检测**：负载均衡器需要解析请求体才能提取 Session ID 进行路由，普通的 HTTP 头路由不够用
+4. **故障恢复**：服务实例宕机意味着所有绑定到该实例的客户端会话丢失
+
+2026 年 5 月 21 日，MCP 维护团队（David Soria Parra 和 Den Delimarsky）锁定了 2026-07-28 Release Candidate。正式规范将在 7 月 28 日发布，中间有 10 周验证窗口供 SDK 维护者适配。
+
+## 核心变更一：无状态协议层
+
+这是整个修订中最根本的变化，由六个 SEP（Specification Enhancement Proposal）协同实现。
+
+### 握手和会话移除
+
+`initialize`/`initialized` 握手被完全移除（SEP-2575）。协议版本、客户端信息和能力声明现在通过每个请求的 `_meta` 字段携带。`Mcp-Session-Id` 头和协议级别的会话概念被彻底删除（SEP-2567）。
+
+新增的 `server/discover` 方法允许客户端按需获取服务端能力信息。
+
+### 前后对比
+
+**旧版（2025-11-25）**：
+
+```
+步骤 1: POST /mcp
+        Body: {"method": "initialize", ...}
+        Response: {"session_id": "abc-123", ...}
+
+步骤 2: POST /mcp
+        Header: Mcp-Session-Id: abc-123
+        Body: {"method": "tools/call", ...}
+```
+
+客户端必须先握手拿到 Session ID，然后每个请求携带该 ID。服务端根据 ID 路由到特定实例。
+
+**新版（2026-07-28）**：
+
+```
+POST /mcp
+Header: MCP-Protocol-Version: 2026-07-28
+Header: Mcp-Method: tools/call
+Header: Mcp-Name: get_weather
+Body: {
+  "method": "tools/call",
+  "_meta": {
+    "clientInfo": {"name": "my-client", "version": "1.0"},
+    "capabilities": {...}
+  },
+  "params": {...}
+}
+```
+
+单个自包含请求即可完成调用。任何服务实例都能处理。
+
+### 路由、缓存和追踪
+
+三个配套的 SEP 让无状态协议在基础设施层面可操作：
+
+**可路由（SEP-2243）**：Streamable HTTP 传输现在要求携带 `Mcp-Method` 和 `Mcp-Name` 头。基础设施可以仅根据 HTTP 头路由请求，无需解析请求体。服务端会拒绝头和体不匹配的请求。
+
+**可缓存（SEP-2549）**：列表查询和资源读取的响应携带 `ttlMs`（生存时间）和 `cacheScope`（缓存作用域），建模方式类似 HTTP 的 `Cache-Control`。客户端知道响应多久内有效，是否可以跨用户共享。
+
+**可追踪（SEP-414）**：在 `_meta` 中标准化了 W3C Trace Context 传播，包括 `traceparent`、`tracestate` 和 `baggage` 字段。支持 OpenTelemetry 兼容的分布式追踪后端。
+
+### 无状态协议，有状态应用
+
+协议无状态不意味着应用无状态。服务端需要跨调用保持状态时，采用**显式句柄模式**：
+
+```json
+// 第一次调用：创建购物车
+{"method": "tools/call", "params": {"name": "create_cart"}}
+// 返回：{"result": {"cart_id": "cart-789", ...}}
+
+// 第二次调用：添加商品，显式传递 cart_id
+{"method": "tools/call", "params": {
+  "name": "add_item",
+  "arguments": {"cart_id": "cart-789", "item": "widget"}
+}}
+```
+
+状态从协议层的隐式（Session ID）变成了应用层的显式（`cart_id`）。这让模型能看到状态——它知道自己在操作哪个购物车，而不是依赖一个不透明的会话。
+
+### 服务端发起请求的重构
+
+无状态协议对服务端发起的请求（server-to-client requests）带来了挑战，两个 SEP 解决了这个问题：
+
+**SEP-2260**：服务端发起的请求只能在正在处理客户端请求的过程中发生。之前这只是建议，现在是强制要求。
+
+**SEP-2322（多轮往返请求）**：替代了之前的 SSE 长连接方案。服务端返回一个 `InputRequiredResult`，包含输入请求、JSON Schema 和一个不透明的 `requestState` token。客户端收集用户输入后，带着 `inputResponses` 和 `requestState` 重新发起原始调用。任何服务实例都能处理这个重试，因为所有状态都在请求载荷中。
+
+## 核心变更二：Extensions 框架
+
+SEP-2133 正式化了扩展机制：
+
+- **反向域名标识**：扩展通过反向域名格式标识（如 `io.modelcontextprotocol.tasks`）
+- **独立版本化**：扩展版本独立于核心规范
+- **能力协商**：通过 capabilities 中的 `extensions` map 协商
+- **独立仓库**：`ext-*` 仓库有委托维护者
+- **新的 SEP 流程**：Extensions Track 定义了从实验到正式的独立路径
+
+之前扩展是存在的，但「没有正式流程支撑」。这次改版后，新功能首先作为扩展发布和验证，稳定后才可能进入核心规范。
+
+## 核心变更三：Tasks 重新设计
+
+Tasks 是变化最大的功能。它从核心规范中的实验性功能迁移为独立扩展，并完全重新设计了生命周期。
+
+### 新的生命周期
+
+旧版 Tasks 设计简单但在生产中暴露了问题。新版本的生命周期：
+
+1. **创建**：服务端在处理 `tools/call` 时决定将其转为任务，返回任务句柄
+2. **查询**：客户端通过 `tasks/get` 查询任务状态
+3. **更新**：客户端通过 `tasks/update` 更新任务（如提供额外输入）
+4. **取消**：客户端通过 `tasks/cancel` 取消任务
+
+关键变化：
+- 任务创建是**服务端驱动**的——客户端声明支持 Tasks 扩展，服务端决定何时将一个调用转为任务
+- `tasks/list` 被移除——因为在无会话的协议中无法安全地限定查询范围
+- 生命周期变得更明确，避免了旧版中任务状态不一致的问题
+
+### 迁移影响
+
+所有基于 2025-11-25 实验性 Tasks API 构建的代码都需要迁移。主要改动点：
+
+```
+旧版：client.tasks.list()     → 移除，无替代
+旧版：client.tasks.create()   → 现在由服务端在 tools/call 中隐式创建
+旧版：task.status              → task 通过 tasks/get 查询
+```
+
+## 核心变更四：MCP Apps
+
+SEP-1865 引入了 MCP Apps——服务端渲染的交互式 UI。
+
+### 工作方式
+
+1. 工具在注册时声明 UI 模板
+2. 客户端（宿主应用）预获取和缓存模板，进行安全审查
+3. 工具被调用时，渲染的 HTML 在沙箱 iframe 中展示
+4. UI 中的用户操作通过 JSON-RPC 协议与宿主通信
+5. 每个 UI 触发的动作都走和直接工具调用相同的审计和授权路径
+
+这让 MCP Server 能提供丰富的交互体验——比如一个数据库工具可以渲染交互式的查询结果表格，一个设计工具可以渲染颜色选择器。
+
+## 核心变更五：授权加固
+
+六个 SEP 将授权机制与现实世界的 OAuth 2.0 和 OpenID Connect 部署对齐：
+
+| SEP | 变更 |
+|-----|------|
+| SEP-2468 | 客户端必须验证授权响应中的 `iss` 参数（RFC 9207），防御混淆攻击 |
+| SEP-837 | 客户端在动态注册时声明 `application_type`，防止 localhost redirect URI 被拒绝 |
+| SEP-2352 | 客户端将注册凭据绑定到授权服务器的 `issuer`，服务器迁移时需要重新注册 |
+| SEP-2207 | 文档化如何从 OIDC 风格的授权服务器请求 refresh token |
+| SEP-2350 | 澄清 scope 在 step-up 授权中的累积行为 |
+| SEP-2351 | 澄清 `.well-known` 发现后缀 |
+
+未来版本将要求客户端拒绝缺少 `iss` 的响应，授权服务器应立即开始提供此字段。
+
+## 核心变更六：废弃特性
+
+三个特性被标注废弃，遵循新的特性生命周期策略（SEP-2577）：
+
+| 被废弃 | 替代方案 | 时间线 |
+|--------|---------|--------|
+| **Roots** | 工具参数、资源 URI 或服务配置 | 至少 12 个月后才会移除 |
+| **Sampling** | 直接集成 LLM Provider API | 至少 12 个月后才会移除 |
+| **Logging** | stdio 传输用 `stderr`；结构化可观测用 OpenTelemetry | 至少 12 个月后才会移除 |
+
+这些是**标注式废弃**：方法、类型和能力标志在当前版本和未来 12 个月内发布的所有版本中继续可用。移除需要单独的 SEP 提案。
+
+### Roots 废弃的实际影响
+
+Roots 是之前 MCP 中让服务端了解客户端工作目录的机制。废弃后，服务端应该通过工具参数显式获取路径信息：
+
+```json
+// 旧方式：依赖 Roots
+{"method": "roots/list"}
+// 服务端隐式知道客户端的工作目录
+
+// 新方式：通过工具参数显式传递
+{"method": "tools/call", "params": {
+  "name": "read_file",
+  "arguments": {"path": "/home/user/project/main.py"}
+}}
+```
+
+## JSON Schema 升级
+
+SEP-2106 将工具的 `inputSchema` 和 `outputSchema` 提升到完整的 JSON Schema 2020-12：
+
+- 输入 Schema 保留 `type: "object"` 根约束，但现在允许 `oneOf`、`anyOf`、`allOf`、条件式和 `$ref`/`$defs`
+- 输出 Schema 不受限制
+- `structuredContent` 可以是任何 JSON 值（不只是对象）
+- 实现不得自动解引用外部 `$ref` URI
+- Schema 深度和验证时间应设上限
+
+错误代码变更（SEP-2164）：资源缺失错误从 MCP 自定义的 `-32002` 改为 JSON-RPC 标准的 `-32602`（Invalid Params）。
+
+## 破坏性变更汇总
+
+| 区域 | 破坏性变更 |
+|------|-----------|
+| 握手 | `initialize`/`initialized` 移除 |
+| 会话 | `Mcp-Session-Id` 移除 |
+| HTTP 头 | `Mcp-Method` 和 `Mcp-Name` 现在是必需的 |
+| 服务端请求 | 必须在处理客户端请求时发起 |
+| 多轮往返 | SSE 长连接替换为 `InputRequiredResult` 模式 |
+| Tasks | 生命周期重新设计，`tasks/list` 移除 |
+| 错误代码 | `-32002` 变更为 `-32602` |
+
+## 迁移指南
+
+### 对 MCP Server 开发者
+
+1. **移除握手依赖**：不再需要处理 `initialize` 请求，改为在每个请求的 `_meta` 中读取客户端信息
+2. **添加必需 Header 验证**：验证 `Mcp-Method` 和 `Mcp-Name` 头与请求体匹配
+3. **适配状态管理**：将隐式会话状态改为显式句柄模式
+4. **迁移 Tasks**：如果使用了实验性 Tasks API，按新生命周期重写
+5. **添加缓存头**：为列表和资源读取响应添加 `ttlMs` 和 `cacheScope`
+6. **更新错误代码**：将 `-32002` 改为 `-32602`
+
+### 对 MCP Client 开发者
+
+1. **移除握手逻辑**：不再发送 `initialize` 请求
+2. **添加必需 Header**：每个请求携带 `MCP-Protocol-Version`、`Mcp-Method`、`Mcp-Name`
+3. **在 `_meta` 中携带客户端信息**：协议版本、能力声明
+4. **实现 `InputRequiredResult` 处理**：替代 SSE 长连接
+5. **开始验证 `iss` 参数**：授权响应中的发行者验证
+
+### 时间线
+
+- **现在 → 7 月 28 日**：10 周验证窗口，使用 RC 版本测试
+- **7 月 28 日**：正式规范发布
+- **发布后 12 个月内**：废弃特性（Roots、Sampling、Logging）仍然可用
+- **Tier 1 SDK**：预计在 7 月 28 日前完成适配
+
+## 设计哲学：为什么走向无状态
+
+MCP 的无状态化不是为了技术优雅，而是为了解决 Agent 基础设施的实际工程问题。
+
+2025-2026 年 Agent 应用的快速增长让 MCP Server 的部署规模从「开发者笔记本上跑一个」变成了「数据中心里跑一个集群」。有状态协议在分布式部署中的每一个问题——粘性路由、会话存储、故障恢复——都变成了实际的运维痛点。
+
+无状态化的代价是显式状态管理的复杂度从协议层转移到了应用层。但这是一个合理的权衡：应用状态本来就应该由应用管理，而不是隐藏在协议的会话机制里。`cart_id` 比 `Mcp-Session-Id` 更透明、更可调试、更符合 REST 的哲学。
+
+对于 Agent 开发者来说，这次修订的核心信号是：**MCP 正在从一个实验性协议成长为一个生产级基础设施标准**。握手简化、缓存支持、分布式追踪、正式的扩展框架——每一项都在为大规模部署铺路。

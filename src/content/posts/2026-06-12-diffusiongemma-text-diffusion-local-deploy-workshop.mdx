@@ -1,0 +1,236 @@
+---
+title: "DiffusionGemma 实战：文本扩散模型本地部署，单用户推理速度提升 4 倍"
+description: "Google DeepMind 发布 DiffusionGemma，基于 Gemma 4 MoE 架构的文本扩散模型，用离散扩散替代自回归解码实现 4 倍推理加速。本文从原理到 vLLM 部署全流程实战"
+column: "workshop"
+tags: ["DiffusionGemma", "Google", "文本扩散", "vLLM", "推理优化", "MoE"]
+pubDate: 2026-06-12
+featured: false
+tldr: "DiffusionGemma 是 Google 基于 Gemma 4 26B MoE 架构的实验性开源模型，用离散文本扩散替代逐 token 自回归生成，256 token 画布并行解码，单用户推理延迟降低 4 倍。本文解析其工作原理并演示 vLLM 本地部署全流程"
+author: "YOMXXX"
+faq:
+  - q: "DiffusionGemma 和普通 Gemma 4 有什么区别？"
+    a: "普通 Gemma 4 是自回归模型，每步只能生成一个 token。DiffusionGemma 用文本扩散机制，从 256 个随机 token 出发并行去噪，每步同时预测所有位置，单用户场景下推理速度快 4 倍"
+  - q: "DiffusionGemma 适合什么场景？"
+    a: "适合单用户交互式场景：本地 IDE 代码补全、个人助手、离线翻译等对延迟敏感的应用。不适合高并发多用户服务，因为扩散模型在批处理场景下吞吐量低于自回归模型"
+  - q: "DiffusionGemma 的推理需要什么硬件？"
+    a: "基于 26B A4B MoE 架构，激活参数约 4B，推荐使用 NVIDIA A100 40GB 或 RTX 4090 24GB 显卡。得益于 MoE 稀疏激活，实际显存占用远小于 26B 全参数模型"
+  - q: "文本扩散模型的输出质量和自回归模型相比如何？"
+    a: "在标准基准测试中 DiffusionGemma 质量略低于同参数自回归模型，但差距在缩小。其优势在于可以自我纠错——扩散过程中置信度低的 token 会被重新噪声化并再次预测"
+  - q: "vLLM 是否原生支持 DiffusionGemma？"
+    a: "vLLM 已在最新版本中添加了对 DiffusionGemma 的实验性支持，可以直接通过 OpenAI 兼容 API 提供服务。需要安装最新的 nightly 版本并启用扩散模式标志"
+---
+
+> **一句话总结**：DiffusionGemma 把图像生成领域的扩散思路搬到了文本生成——从一堆随机 token 出发，逐步去噪到最终文本。代价是多用户吞吐量下降，收益是单用户延迟大幅降低。本文从原理讲到部署。
+
+## 自回归解码的瓶颈
+
+当前主流 LLM 都是自回归模型：给定前文，预测下一个 token，把它拼回去再预测下一个。这意味着生成 256 个 token 就需要 256 次前向传播。
+
+问题出在**利用率**。单用户服务时，GPU 的大部分时间花在从显存加载模型权重上（memory-bound），计算单元大量空闲。批处理多用户请求可以提高计算利用率，但对单个用户来说延迟并没有降低。
+
+DiffusionGemma 的核心洞察很简单：**与其为 256 个用户各生成 1 个 token，不如为 1 个用户同时生成 256 个 token**。
+
+## DiffusionGemma 的工作原理
+
+### 编码器-去噪器架构
+
+DiffusionGemma 基于 Gemma 4 26B A4B（Mixture-of-Experts 架构），通过一个「Encoder-Denoiser 补丁」将原始的自回归解码器改造为两个运行模式：
+
+| 模式 | 注意力类型 | 职责 |
+|------|-----------|------|
+| **编码器模式** | 因果注意力（causal） | 处理输入 query，生成 KV cache 提供上下文 |
+| **去噪器模式** | 双向注意力（bidirectional） | 在 256 token 画布上并行预测所有位置 |
+
+编码器的 KV cache 在整个去噪过程中共享且不更新，去噪器可以在每一步看到所有画布位置的上下文。
+
+### 离散文本扩散过程
+
+与图像扩散类似，DiffusionGemma 的生成过程分为加噪和去噪两个方向：
+
+**前向过程（训练时）**：将真实文本逐步替换为随机 token，直到变成完全随机的噪声序列。
+
+**反向过程（推理时）**：
+1. 初始化一个 256 token 的画布，填满从词表中均匀采样的随机 token
+2. 去噪器对所有位置并行预测，输出每个位置的概率分布
+3. 按置信度排序，接受高置信度的预测，将低置信度位置重新填入随机 token
+4. 重复步骤 2-3，直到所有位置收敛或达到最大步数
+
+关键细节——DiffusionGemma 使用**均匀状态扩散**（Uniform State Diffusion）而非常见的掩码扩散：
+
+```
+掩码扩散：token → [MASK] → 预测 → 确定（不可更改）
+均匀扩散：token → 随机token → 预测 → 如果不确信 → 再次随机化 → 重新预测
+```
+
+掩码扩散的问题是一旦预测就不能修改。均匀扩散允许模型**自我纠错**：一个在前 10 步都拿到高置信度的 token，到第 11 步可能突然被推翻。这种机制让输出质量更高，但训练难度也更大。
+
+### 自条件化机制
+
+去噪步骤之间，模型会把上一步的预测信息向前传递：将 softmax 概率与嵌入矩阵相乘，得到每个位置的加权嵌入，通过一个小型前馈网络处理后加到下一步的 token 嵌入上。这相当于给模型一个「上一步我试图做什么」的记忆。
+
+### 多画布拼接
+
+单个画布只有 256 token，长文本通过**画布拼接**生成：填满一个画布后，这些 token 扩展编码器的 KV cache，然后初始化新的 256 token 画布继续去噪。编码器的 KV cache 使用因果注意力，所以只需处理新画布的 token，计算开销较小。
+
+## 调度器：控制去噪过程的三个旋钮
+
+DiffusionGemma 的推理质量由调度器控制，包含三个组件：
+
+**步数控制**：最大去噪迭代次数。步数越多质量越高，但速度越慢。
+
+**Logits 温度调度**：早期步骤使用高温度（鼓励探索），后期步骤使用低温度（锁定答案）。类似退火算法。
+
+**自适应停止**：两个条件满足任一即可停止——
+- 稳定性：连续 N 步预测结果完全相同
+- 置信度：所有位置的熵值低于 0.005
+
+### 熵约束采样器
+
+控制每一步接受哪些 token：
+
+1. 将所有位置按熵值从低到高排序
+2. 依次接受 token，累积熵不超过阈值
+3. 被拒绝的位置重新填入随机 token
+
+这保证了只有「模型非常确信」的 token 才会被保留。
+
+## 速度与质量的权衡
+
+| 维度 | 自回归模型 | DiffusionGemma |
+|------|-----------|----------------|
+| 单用户延迟 | 基准 | **约 4 倍加速** |
+| 多用户吞吐量 | 高 | 低 |
+| 计算特征 | 内存密集（memory-bound） | 计算密集（compute-bound） |
+| 自我纠错 | 不支持 | 支持 |
+| 输出长度 | 任意 | 256 token/画布，长文需拼接 |
+
+用一句话概括：**DiffusionGemma 把 GPU 的空闲算力换成了更低的延迟**。这在单用户本地部署场景中非常有价值，在高并发服务场景中则不如自回归模型。
+
+## 本地部署实战
+
+### 方式一：Transformers 直接加载
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+model_id = "google/diffusiongemma-26B-A4B-it"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+messages = [
+    {"role": "user", "content": "用 Python 写一个快速排序算法"}
+]
+
+input_ids = tokenizer.apply_chat_template(
+    messages, return_tensors="pt"
+).to(model.device)
+
+outputs = model.generate(
+    input_ids,
+    max_new_tokens=512,
+    # DiffusionGemma 特有参数
+    diffusion_steps=64,        # 去噪步数，越大质量越高
+    canvas_size=256,           # 画布大小
+    temperature_schedule="cosine",  # 温度调度策略
+)
+
+print(tokenizer.decode(outputs[0][input_ids.shape[-1]:]))
+```
+
+### 方式二：vLLM 部署 OpenAI 兼容 API
+
+vLLM 已经实验性支持 DiffusionGemma。先安装最新版：
+
+```bash
+pip install vllm --pre
+```
+
+启动服务：
+
+```bash
+vllm serve google/diffusiongemma-26B-A4B-it \
+    --dtype bfloat16 \
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.9 \
+    --enable-diffusion \
+    --diffusion-steps 32
+```
+
+客户端调用：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed",
+)
+
+response = client.chat.completions.create(
+    model="google/diffusiongemma-26B-A4B-it",
+    messages=[
+        {"role": "user", "content": "解释什么是注意力机制"}
+    ],
+    max_tokens=512,
+    extra_body={
+        "diffusion_steps": 32,
+        "canvas_size": 256,
+    }
+)
+
+print(response.choices[0].message.content)
+```
+
+### 方式三：Kaggle Notebook 快速体验
+
+Google 在 Kaggle 上提供了官方 Notebook，可以用免费 GPU 直接运行：
+
+```bash
+# 在 Kaggle 环境中
+pip install -q kaggle-hub transformers torch
+```
+
+```python
+import kaggle_hub
+
+model_path = kaggle_hub.model_download(
+    "google/diffusion-gemma/transformers/diffusiongemma-26b-a4b-it"
+)
+# 后续加载方式与 Transformers 相同
+```
+
+## 调参建议
+
+去噪步数对输出质量影响最大，以下是不同场景的推荐配置：
+
+| 场景 | `diffusion_steps` | `canvas_size` | 说明 |
+|------|-------------------|---------------|------|
+| 代码补全 | 16-24 | 256 | 低步数即可，代码结构性强 |
+| 对话回复 | 32-48 | 256 | 中等步数平衡速度和质量 |
+| 长文写作 | 64-128 | 256 | 高步数确保连贯性 |
+| 延迟敏感 | 8-16 | 128 | 缩小画布进一步降低延迟 |
+
+去噪步数和质量之间并非线性关系。自适应停止机制意味着很多情况下模型会在达到最大步数前就收敛。设置 `diffusion_steps=64` 不代表一定会跑 64 步。
+
+## 当前限制
+
+DiffusionGemma 是实验性模型，使用时需要注意：
+
+1. **多用户吞吐量低**——扩散过程是计算密集型的，多用户并发时每个用户都需要独立的去噪过程，无法像自回归模型那样通过 KV cache 共享高效批处理
+2. **质量略低于同级自回归模型**——在标准基准上和 Gemma 4 自回归版本仍有差距
+3. **仅支持文本生成**——虽然基于多模态的 Gemma 4 架构，但当前版本只支持文本输入输出
+4. **画布大小固定**——每次只能生成 256 token，长文本需要多次画布拼接
+
+## 文本扩散的未来
+
+DiffusionGemma 代表了一个重要的技术探索方向。自回归解码统治 LLM 推理已经多年，其「逐 token 串行生成」的本质限制了单用户延迟的下限。文本扩散提供了另一种可能：通过并行化生成过程，把延迟从 O(n) 降低到 O(n/canvas_size × steps)。
+
+这和图像生成领域的演进路径惊人相似——Stable Diffusion 最初质量也不如 GAN，但扩散模型的可扩展性最终让它成为主流。文本扩散还在早期阶段，但 Google 选择以开源方式发布，释放了一个明确信号：**这条路值得探索**。
+
+对于个人开发者和小团队，DiffusionGemma 已经可以在本地 GPU 上提供比自回归模型更低延迟的推理体验。尤其在 IDE 代码补全、个人 AI 助手等单用户场景中，4 倍的速度提升是实打实的体验升级。
