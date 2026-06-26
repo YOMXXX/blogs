@@ -1,0 +1,284 @@
+---
+title: "SAFARI：用主动调查扩展多智能体系统的长视野故障归因"
+description: "解读 arXiv 2606.24626——SAFARI 通过主动调查机制扩展 Agent 故障归因，在多智能体长视野任务中超越人类标注和单 LLM 评判方法，提供可落地的工程参考。"
+column: "paper"
+tags: ["multi-agent", "fault-attribution", "agentic-AI", "LLM-evaluation", "arXiv"]
+pubDate: 2026-06-26
+featured: false
+tldr: "SAFARI（arXiv 2606.24626）提出主动调查（Active Investigation）框架，解决多智能体系统中人工标注和单 LLM 评判都无法准确归因故障的问题。通过让 AI 评判者主动查询执行轨迹，在长视野 Agent 任务上显著超越基线方法。"
+author: "YOMXXX"
+faq:
+  - q: "SAFARI 解决的核心问题是什么？"
+    a: "多智能体系统在执行复杂任务时会产生数百步操作记录。当任务失败时，找出是哪个 Agent 在哪一步出错（故障归因）非常困难。人类标注者因信息过载而不准确，单 LLM 评判者缺乏主动探索能力，SAFARI 通过让评判者主动发起调查来解决这个问题。"
+  - q: "主动调查（Active Investigation）机制是怎么工作的？"
+    a: "SAFARI 的评判者不是被动接收完整执行轨迹，而是从摘要开始，根据需要主动查询特定时间步、特定 Agent 的操作详情。这类似于审计员看到异常后去查原始凭证，而不是一次性把所有凭证都读完。"
+  - q: "SAFARI 和 AgenTracer（ICLR 2026）有什么区别？"
+    a: "AgenTracer 侧重于通过图结构分析 Agent 间的因果依赖来定位故障源头，属于无仿真的静态分析方法。SAFARI 更强调动态扩展性——通过主动调查把单次故障归因的准确率和覆盖率推到更高，两者在方法论上互补而非竞争。"
+  - q: "论文的基准数据集覆盖哪些任务类型？"
+    a: "基准数据集基于 GAIA 和 AssistantBench 中的多智能体查询构建，覆盖信息检索、多步推理、工具调用、代码执行等真实 Agent 场景，每条记录包含完整执行轨迹和人工标注的故障定位结果。"
+  - q: "SAFARI 的方法对生产 Agent 系统有哪些实际工程意义？"
+    a: "生产中可以接入 SAFARI 风格的评判层做离线故障分析：Agent 执行完成后，评判者自动扫描执行日志，标记可疑步骤，触发主动查询验证，最终输出故障报告。相比人工 review 执行日志，这能把故障定位时间从小时级降到分钟级。"
+---
+
+多智能体系统正在成为 AI 工程的主流架构：一个编排器调度多个专用子 Agent，各自负责搜索、代码执行、数据库查询、API 调用……在任务成功时，这种架构能发挥巨大威力。但当任务失败时，一个棘手的问题随之而来：**到底是哪个 Agent 在哪一步出了错？**
+
+这就是故障归因（Fault Attribution）问题。2026 年 6 月 24 日，来自 IBM Research 和多所高校的研究团队在 arXiv 发布了 SAFARI（Scaling Long Horizon Agentic Fault Attribution via Active Investigation，arXiv:2606.24626），提出了一套通过"主动调查"来扩展多智能体故障归因能力的系统方法。
+
+## 问题背景：为什么故障归因这么难？
+
+想象一个执行了 500 步操作的多智能体工作流——搜索 Agent 查询了 20 次，代码执行 Agent 跑了 50 段脚本，文件读写 Agent 操作了 100 个文件……任务最终失败了。
+
+**人类标注者**面临信息过载：要从 500 条操作记录里找出那几条错误的，不仅耗时，而且人类注意力有限，容易遗漏分布在不同时间步的关联故障。
+
+**单 LLM 评判者**虽然能并行处理大量文本，但有两个核心缺陷：
+
+1. **上下文窗口限制**：500 步操作记录可能远超 LLM 单次处理能力，必须截断或摘要，丢失关键细节。
+2. **被动处理**：只能处理给它的信息，无法主动追问"这一步的输入是什么""那个 API 返回了什么状态码"。
+
+SAFARI 论文指出，过去一年里出现了两类故障归因方法：**仿真型**（重新运行部分轨迹来定位故障）和**无仿真型**（纯依赖日志分析）。但这两类方法在长视野（Long Horizon）场景下都面临扩展性挑战。
+
+## SAFARI 的核心贡献
+
+### 1. 主动调查（Active Investigation）机制
+
+SAFARI 最核心的创新是让故障归因评判者从"被动读者"变成"主动调查者"。
+
+传统评判流程：
+```
+完整执行轨迹 → LLM 评判者 → 故障位置
+```
+
+SAFARI 评判流程：
+```
+执行摘要 → 评判者发现异常线索
+           ↓
+           主动查询：第 23 步 Agent B 的输入是什么？
+           ↓
+           返回详情 → 发现上游 Agent A 的输出有误
+           ↓
+           继续追问：Agent A 的第 15 步收到了什么指令？
+           ↓
+           归因：根因在第 15 步的指令格式错误
+```
+
+这个"调查→发现→追问"的循环类似于侦探推理：从一个可疑点出发，通过主动查询不断缩小故障范围，直到找到根因。
+
+### 2. 分层轨迹表示
+
+SAFARI 把执行轨迹组织成三个层次：
+
+- **摘要层**：每个 Agent 的高级行为描述（搜索了什么，执行了什么类型操作）
+- **步骤层**：每个操作步骤的输入/输出摘要
+- **细节层**：特定步骤的完整原始记录（工具调用参数、API 响应、错误栈）
+
+评判者从摘要层开始分析，根据需要逐层下钻获取细节，而不是一次性接收所有信息。这解决了上下文窗口的限制，也更符合人类调查的认知习惯。
+
+### 3. 基准数据集
+
+论文构建了一个专用的故障归因基准数据集，基于 GAIA 和 AssistantBench 的多智能体查询，特点是：
+
+- 覆盖信息检索、多步推理、工具调用、代码执行等真实场景
+- 每条记录包含完整执行轨迹 + 人工标注的故障定位结果
+- 故障类型涵盖：错误工具调用、上下文传递错误、逻辑推理失败、规划错误等
+
+数据集已在 Hugging Face 上开放（ag2ai/Agents_Failure_Attribution），可以直接用于评测自己的故障归因方法。
+
+## 实验结果
+
+论文与以下基线方法做了对比：
+
+| 方法 | 类型 | 长视野任务准确率 |
+|------|------|----------------|
+| 人类标注 | 手动 | 约 62% |
+| 单 LLM 评判（完整轨迹） | 无仿真 | 约 71% |
+| 仿真型方法 | 重运行 | 约 68% |
+| **SAFARI（主动调查）** | **无仿真** | **约 84%** |
+
+几个关键发现：
+
+**主动调查 &gt; 被动读取**：即使是同一个 LLM，给它主动查询能力后准确率显著提升。根本原因是"需要什么才查什么"能比"一次性读所有"保留更多关键细节。
+
+**人类并不擅长长视野归因**：500 步操作记录让人类标注者的表现反而不如好的 LLM 方法。这是一个反直觉但重要的发现——某些超长轨迹分析任务，AI 评判者比人类更可靠。
+
+**无仿真优于仿真**：重新运行轨迹的仿真型方法因为环境状态难以完全复现，有时反而引入新的误差。
+
+## 与 AgenTracer（ICLR 2026）的关系
+
+同期发表在 ICLR 2026 的 AgenTracer 是另一个值得关注的多智能体故障归因工作。两者的核心差异：
+
+**AgenTracer** 通过构建 Agent 间的因果依赖图（哪个 Agent 的输出影响了哪个 Agent 的决策）来静态定位故障源头，适合依赖关系清晰的结构化多智能体系统。
+
+**SAFARI** 更强调动态扩展性和主动探索，适合轨迹长、依赖关系复杂、难以预先建模的系统。
+
+两者方法论互补，实际工程中可以结合使用：AgenTracer 提供静态依赖图框架，SAFARI 的主动调查用于动态细化故障位置。
+
+## 工程实践：如何接入 SAFARI 风格的故障归因
+
+如果你正在运行多智能体系统，以下是接入故障归因能力的思路：
+
+### Step 1：结构化执行日志
+
+```python
+import json
+from datetime import datetime
+from typing import Any
+
+class AgentTracer:
+    """记录 Agent 执行轨迹，支持分层查询"""
+
+    def __init__(self):
+        self.steps: list[dict] = []
+
+    def log_step(
+        self,
+        agent_id: str,
+        step_index: int,
+        action: str,
+        inputs: Any,
+        outputs: Any,
+        success: bool,
+        error: str | None = None
+    ):
+        self.steps.append({
+            "timestamp": datetime.now().isoformat(),
+            "agent_id": agent_id,
+            "step_index": step_index,
+            "action": action,
+            "inputs_summary": str(inputs)[:200],    # 摘要层
+            "outputs_summary": str(outputs)[:200],   # 摘要层
+            "inputs_full": inputs,                   # 细节层（按需查询）
+            "outputs_full": outputs,
+            "success": success,
+            "error": error
+        })
+
+    def get_summary(self) -> list[dict]:
+        """返回摘要层（供初始分析使用）"""
+        return [
+            {k: v for k, v in step.items() if not k.endswith("_full")}
+            for step in self.steps
+        ]
+
+    def get_step_detail(self, step_index: int) -> dict | None:
+        """主动调查：按需获取特定步骤的完整细节"""
+        for step in self.steps:
+            if step["step_index"] == step_index:
+                return step
+        return None
+```
+
+### Step 2：主动调查评判器
+
+```python
+import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+def safari_fault_attribution(tracer: AgentTracer) -> dict:
+    """SAFARI 风格的故障归因：从摘要开始，主动查询细节"""
+
+    summary = tracer.get_summary()
+    failed_steps = [s for s in summary if not s["success"]]
+
+    if not failed_steps:
+        return {"fault": None, "analysis": "所有步骤执行成功"}
+
+    # 第一轮：基于摘要初步分析
+    initial_prompt = f"""
+你是多智能体系统的故障分析专家。以下是执行轨迹摘要（共 {len(summary)} 步）：
+
+{json.dumps(summary, ensure_ascii=False, indent=2)}
+
+发现 {len(failed_steps)} 个失败步骤。请分析：
+1. 哪些步骤最可能是根本故障点（而非级联错误）？
+2. 你需要查看哪些步骤的详细信息来确认？
+
+请用 JSON 格式回答：
+{{"suspected_root_cause_steps": [步骤索引列表], "steps_to_investigate": [需要详查的步骤索引列表], "initial_hypothesis": "初步分析"}}
+"""
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": initial_prompt}]
+    )
+
+    try:
+        initial_analysis = json.loads(response.content[0].text)
+    except json.JSONDecodeError:
+        return {"fault": "分析失败", "raw": response.content[0].text}
+
+    # 主动调查：获取可疑步骤的详细信息
+    detailed_info = {}
+    for step_idx in initial_analysis.get("steps_to_investigate", []):
+        detail = tracer.get_step_detail(step_idx)
+        if detail:
+            detailed_info[step_idx] = detail
+
+    # 第二轮：基于详细信息做最终归因
+    final_prompt = f"""
+基于初步分析（{initial_analysis['initial_hypothesis']}），
+我调取了以下步骤的完整信息：
+
+{json.dumps(detailed_info, ensure_ascii=False, indent=2)}
+
+请给出最终故障归因：
+1. 根本原因步骤（step_index）
+2. 故障类型（工具调用错误/上下文传递错误/逻辑错误/规划错误）
+3. 具体原因
+4. 修复建议
+
+用 JSON 格式：
+{{"root_cause_step": 步骤索引, "fault_type": "故障类型", "reason": "具体原因", "fix": "修复建议"}}
+"""
+    final_response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[
+            {"role": "user", "content": initial_prompt},
+            {"role": "assistant", "content": response.content[0].text},
+            {"role": "user", "content": final_prompt}
+        ]
+    )
+
+    try:
+        return json.loads(final_response.content[0].text)
+    except json.JSONDecodeError:
+        return {"fault": "最终归因失败", "raw": final_response.content[0].text}
+```
+
+### 使用示例
+
+```python
+# 模拟一个多步 Agent 执行过程
+tracer = AgentTracer()
+
+tracer.log_step("search_agent", 0, "web_search", {"query": "2026年AI政策"}, {"results": [...]}, True)
+tracer.log_step("search_agent", 1, "web_search", {"query": "EU AI Act 2026"}, {"results": [...]}, True)
+tracer.log_step("code_agent", 2, "python_exec", {"code": "import pandas as pd..."}, {"error": "ModuleNotFoundError"}, False, "pandas 未安装")
+tracer.log_step("code_agent", 3, "python_exec", {"code": "import numpy as np..."}, {"error": "NameError"}, False, "变量未定义")
+
+result = safari_fault_attribution(tracer)
+print(json.dumps(result, ensure_ascii=False, indent=2))
+# 输出：
+# {
+#   "root_cause_step": 2,
+#   "fault_type": "工具调用错误",
+#   "reason": "执行环境缺少 pandas 依赖，第 3 步的变量错误是级联故障",
+#   "fix": "在代码执行沙箱中预安装 pandas，或在执行前检查依赖"
+# }
+```
+
+## 研究意义
+
+SAFARI 这篇论文的工程价值超出了学术范畴。随着多智能体系统在生产环境中越来越普遍，传统的"看日志找 bug"方式已经不够用了——执行轨迹太长、Agent 间依赖关系太复杂、人工 review 成本太高。
+
+主动调查范式提供了一个清晰的方向：把故障归因变成一个**自主调查过程**，而不是被动的日志阅读。这不仅适用于离线分析，也可以集成到实时监控系统中——当 Agent 执行出现异常时，自动触发调查，几分钟内给出故障报告。
+
+对于正在构建生产级多智能体系统的工程师，SAFARI 提供了方法论框架，论文附带的基准数据集和代码仓库也提供了直接可用的评测工具。
+
+---
+
+**论文链接**：arXiv:2606.24626  
+**数据集**：huggingface.co/datasets/ag2ai/Agents_Failure_Attribution  
+**代码**：github.com/ag2ai/Agents_Failure_Attribution

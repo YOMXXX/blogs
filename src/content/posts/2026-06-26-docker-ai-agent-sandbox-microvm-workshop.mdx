@@ -1,0 +1,328 @@
+---
+title: "Docker MicroVM 沙箱：给 AI Agent 代码执行加上安全护栏"
+description: "从容器到 MicroVM，详解如何用 Docker + Firecracker/gVisor 为 LLM Agent 代码执行构建隔离沙箱，附完整 Python 示例和生产级最佳实践。"
+column: "workshop"
+tags: ["Docker", "AI-Agent", "sandbox", "MicroVM", "security", "LLM"]
+pubDate: 2026-06-26
+featured: false
+tldr: "普通 Docker 容器共享宿主内核，对 LLM Agent 生成的不可信代码安全边界不够。MicroVM（Firecracker/gVisor）提供 VM 级隔离 + 容器级启动速度，是 2026 年 Agent 代码执行沙箱的最优解。本文从原理到代码完整演示。"
+author: "YOMXXX"
+faq:
+  - q: "普通 Docker 容器为什么不足以隔离 AI Agent 执行的代码？"
+    a: "Docker 默认使用 runc 运行时，容器与宿主共享内核。LLM 生成的代码可以通过内核漏洞、设备挂载或 seccomp 绕过逃逸到宿主机，2025-2026 年已有多起公开案例。MicroVM（Firecracker/gVisor）提供独立内核，从根本上消除了共享内核攻击面。"
+  - q: "Firecracker 和 gVisor 有什么区别，该怎么选？"
+    a: "Firecracker 是真正的 MicroVM，每个沙箱有独立的 KVM 虚拟机和 Linux 内核，安全级别最高但需要 KVM 支持。gVisor 在用户空间实现 Linux 系统调用拦截，不需要 KVM，可以直接作为 Docker 运行时使用。生产环境有 KVM 就选 Firecracker，否则用 gVisor 叠加到现有 Docker 基础设施。"
+  - q: "MicroVM 启动开销有多大，对 Agent 延迟影响是否可接受？"
+    a: "Firecracker MicroVM 冷启动约 150-300ms，使用预热池可降到 50ms 以下。gVisor 额外延迟约 50-100ms。对于 Agent 任务（通常以秒计），这个开销完全可接受，并可通过并发预热多个实例进一步摊薄。"
+  - q: "如何限制沙箱内 Agent 的网络访问权限？"
+    a: "最简单的方式是 --network none 完全断网。如果 Agent 需要访问外部 API，可以自定义 bridge network 配合宿主 iptables 白名单，只允许特定域名和端口出流量，同时设置速率限制防止数据外泄。"
+  - q: "代码执行沙箱方案在 Mac 上能测试吗？"
+    a: "Mac 没有 KVM，无法直接运行 Firecracker。gVisor 在 Mac 的 Docker Desktop 上也不支持原生运行。推荐用 Linux VM（OrbStack、Multipass）或 GitHub Actions（ubuntu-latest）验证沙箱配置，生产环境部署到 Linux 裸机或云实例。"
+---
+
+让 LLM Agent 自主执行代码，是 2026 年 AI 工程中最常见的需求之一。但随着 Agent 越来越复杂，一个被忽视的问题正在变得紧迫：**谁来保证 Agent 生成的代码不会伤害你的服务器？**
+
+2025 年底，安全研究者公开了多起 AI 代码执行沙箱逃逸案例。攻击者通过提示注入让 Agent 生成能逃逸 Docker 容器的代码，进而控制宿主机。2026 年 6 月 Reddit r/LocalLLaMA 的 "Best Local Agents" 讨论帖里，最高票答案的核心结论明确：**容器不够，要上 MicroVM**。
+
+本文从原理到实践，完整讲解如何给 AI Agent 的代码执行环境构建 MicroVM 级别的安全隔离。
+
+## 为什么普通 Docker 容器不够？
+
+Docker 的核心安全模型是**命名空间隔离 + cgroup 资源限制**，配合 seccomp 系统调用过滤器和 AppArmor/SELinux 策略。对可信代码已经足够，但对 LLM 生成的代码有根本性缺陷。
+
+**共享内核攻击面**：所有容器共享宿主 Linux 内核。内核有漏洞，任何容器内的进程都可能通过权限提升攻破隔离。LLM 生成代码的输入空间几乎无限，攻击者有足够多的"尝试空间"。
+
+**Seccomp 绕过**：seccomp 过滤器必须预先定义允许的系统调用白名单。Linux 有 400+ 个系统调用，且随内核版本更新。历史上已有多个 seccomp bypass CVE，维护一个既完整又不过度限制的白名单极其困难。
+
+**挂载命名空间的复杂性**：如果 Agent 需要访问文件系统，挂载点配置一旦有误就可能暴露宿主路径。`/proc`、`/sys`、`/dev` 是常见的信息泄露和提权入口。
+
+相比之下，MicroVM 的隔离从**内核级别**就已经分离，攻击者需要同时突破虚拟化层和宿主内核两道防线，难度指数级上升。
+
+## 两种主流 MicroVM 方案对比
+
+### Firecracker
+
+由 AWS 开发，专为 Serverless 场景设计，是 Lambda 和 Fargate 的底层技术。
+
+核心特性：每个 MicroVM 运行独立的 Linux 内核（`vmlinux`），通过 KVM 硬件虚拟化加速，启动时间约 125-300ms（带 snapshot restore 可降到 &lt;5ms），内存 overhead 极低（每实例约 5MB），只暴露最小化设备模型（virtio-net, virtio-blk）。
+
+适合场景：需要最强隔离的生产环境，有 KVM 支持的裸金属或云实例。
+
+### gVisor
+
+Google 开源，在用户空间实现 Linux 系统调用的拦截和处理，不需要 KVM。
+
+核心特性：Sentry 进程拦截容器的所有系统调用，可直接作为 Docker/containerd 的运行时（`--runtime=runsc`），无需 KVM，与 Docker 生态完全兼容，额外延迟约 50-100ms。
+
+适合场景：不支持 KVM 的环境，需要在现有 Docker 基础设施上快速叠加安全层。
+
+```bash
+# 安装 gVisor 运行时（Ubuntu/Debian）
+sudo apt-get install -y apt-transport-https ca-certificates curl
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list
+sudo apt-get update && sudo apt-get install -y runsc
+
+# 将 gVisor 注册为 Docker 运行时
+sudo tee /etc/docker/daemon.json > /dev/null <<'EOF'
+{
+  "runtimes": {
+    "runsc": {
+      "path": "/usr/bin/runsc"
+    }
+  }
+}
+EOF
+sudo systemctl restart docker
+
+# 验证安装
+docker run --runtime=runsc -it python:3.12-slim python -c "print('hello from gvisor')"
+```
+
+## 完整示例：用 Docker + gVisor 构建 Agent 代码执行沙箱
+
+### 沙箱镜像（Dockerfile.sandbox）
+
+```dockerfile
+FROM python:3.12-slim
+
+# 只安装执行所需的最小依赖
+RUN pip install --no-cache-dir numpy pandas matplotlib scipy
+
+# 创建无权限用户
+RUN useradd -m -u 1000 sandboxuser
+
+WORKDIR /sandbox
+RUN chmod 755 /sandbox
+
+USER sandboxuser
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+```
+
+```bash
+docker build -f Dockerfile.sandbox -t agent-sandbox:latest .
+```
+
+### 沙箱执行器（sandbox_runner.py）
+
+```python
+import subprocess
+import tempfile
+import os
+import json
+from typing import Optional
+
+class SandboxRunner:
+    """
+    在 gVisor 隔离容器中执行 LLM 生成的代码。
+    每次执行创建全新容器，执行后立即销毁。
+    """
+
+    SANDBOX_IMAGE = "agent-sandbox:latest"
+    RUNTIME = "runsc"          # gVisor 运行时
+    TIMEOUT_SECONDS = 30       # 最大执行时间
+    MEMORY_LIMIT = "256m"      # 内存上限
+    CPU_QUOTA = "0.5"          # CPU 核心数上限
+
+    def execute(self, code: str, inputs: Optional[dict] = None) -> dict:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            code_file = os.path.join(tmpdir, "code.py")
+            with open(code_file, "w") as f:
+                f.write(code)
+
+            if inputs:
+                input_file = os.path.join(tmpdir, "inputs.json")
+                with open(input_file, "w") as f:
+                    json.dump(inputs, f)
+
+            cmd = [
+                "docker", "run",
+                "--rm",                                     # 执行后立即删除容器
+                "--runtime", self.RUNTIME,                  # 使用 gVisor
+                "--network", "none",                        # 禁止网络访问
+                "--read-only",                              # 只读文件系统
+                "--tmpfs", "/tmp:size=64m,noexec",          # 临时可写空间，禁止执行
+                "--memory", self.MEMORY_LIMIT,              # 内存限制
+                "--cpus", self.CPU_QUOTA,                   # CPU 限制
+                "--security-opt", "no-new-privileges",      # 禁止权限提升
+                "--cap-drop", "ALL",                        # 丢弃所有 Linux capability
+                "-v", f"{tmpdir}:/sandbox:ro",              # 挂载代码目录（只读）
+                self.SANDBOX_IMAGE,
+                "python", "/sandbox/code.py"
+            ]
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.TIMEOUT_SECONDS
+                )
+                return {
+                    "success": result.returncode == 0,
+                    "stdout": result.stdout[:10000],        # 截断超长输出
+                    "stderr": result.stderr[:2000],
+                    "return_code": result.returncode
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "success": False,
+                    "error": f"执行超时（{self.TIMEOUT_SECONDS}s）",
+                    "stdout": "",
+                    "stderr": ""
+                }
+```
+
+### Agent 调度层（agent_executor.py）
+
+```python
+import anthropic
+import re
+from sandbox_runner import SandboxRunner
+
+client = anthropic.Anthropic()
+runner = SandboxRunner()
+
+def extract_python_code(text: str) -> list[str]:
+    pattern = r'```python\n(.*?)```'
+    return re.findall(pattern, text, re.DOTALL)
+
+def run_code_agent(user_query: str) -> str:
+    messages = [{"role": "user", "content": user_query}]
+
+    while True:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system="你是数据分析助手。需要计算时，用 Python 代码块展示过程，代码必须自包含、可独立运行。",
+            messages=messages
+        )
+
+        assistant_message = response.content[0].text
+        messages.append({"role": "assistant", "content": assistant_message})
+
+        code_blocks = extract_python_code(assistant_message)
+        if code_blocks:
+            print("\n[沙箱执行中...]")
+            for code in code_blocks:
+                exec_result = runner.execute(code)
+                if exec_result["success"]:
+                    print(exec_result["stdout"])
+                else:
+                    print(f"执行失败: {exec_result.get('stderr') or exec_result.get('error')}")
+
+        if response.stop_reason == "end_turn":
+            break
+
+    return assistant_message
+
+# 测试
+result = run_code_agent("用 numpy 模拟 10000 次抛硬币，计算正面朝上的概率及 95% 置信区间")
+print(result)
+```
+
+运行上面的代码，每次 LLM 提出一段 Python，就会被送进 gVisor 隔离的容器执行，宿主机完全感知不到其内部细节。
+
+## 预热池：把冷启动延迟降到可忽略
+
+每次请求都启动新容器有 100-300ms 开销。高并发场景下，可以维护一个预热容器池：
+
+```python
+import queue
+import threading
+import subprocess
+import uuid
+
+class SandboxPool:
+    """维护预热容器池，降低冷启动延迟"""
+
+    def __init__(self, pool_size: int = 5):
+        self.pool_size = pool_size
+        self.available: queue.Queue[str] = queue.Queue()
+        self._fill_pool()
+
+    def _create_container(self) -> str:
+        cid = f"sandbox-{uuid.uuid4().hex[:8]}"
+        subprocess.run([
+            "docker", "create", "--name", cid,
+            "--runtime", "runsc",
+            "--network", "none",
+            "--read-only",
+            "--memory", "256m",
+            "--cpus", "0.5",
+            "--security-opt", "no-new-privileges",
+            "--cap-drop", "ALL",
+            "agent-sandbox:latest",
+            "sleep", "infinity"
+        ], check=True, capture_output=True)
+        subprocess.run(["docker", "start", cid], check=True, capture_output=True)
+        return cid
+
+    def _fill_pool(self):
+        for _ in range(self.pool_size):
+            try:
+                self.available.put(self._create_container())
+            except Exception as e:
+                print(f"预热容器失败: {e}")
+
+    def get(self, timeout: float = 5.0) -> str:
+        cid = self.available.get(timeout=timeout)
+        threading.Thread(target=self._refill, daemon=True).start()
+        return cid
+
+    def _refill(self):
+        try:
+            self.available.put(self._create_container())
+        except Exception:
+            pass
+
+    def release_and_destroy(self, cid: str):
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+```
+
+使用预热池后，"取容器"这一步的延迟从 &lt;300ms 降到 &lt;1ms（容器已就绪，立即可用）。
+
+## Firecracker 生产级部署速览
+
+如果你的环境支持 KVM（裸金属、支持嵌套虚拟化的 AWS 实例），Firecracker 提供更强的隔离。
+
+```bash
+# 检查 KVM 可用性
+ls -la /dev/kvm
+
+# 下载 Firecracker 二进制（替换 ARCH 为 x86_64 或 aarch64）
+ARCH=$(uname -m)
+wget -q "https://github.com/firecracker-microvm/firecracker/releases/download/v1.11.0/firecracker-v1.11.0-${ARCH}.tgz"
+tar -xzf "firecracker-v1.11.0-${ARCH}.tgz"
+sudo mv "release-v1.11.0-${ARCH}/firecracker-v1.11.0-${ARCH}" /usr/local/bin/firecracker
+```
+
+Firecracker 通过 Unix socket 暴露 REST API 来控制 MicroVM 生命周期，Python 封装大约 100 行左右。完整例子可以参考官方 `getting-started.md`，核心流程是：创建 socket → 配置 machine（vCPU/mem）→ 设置 rootfs 和内核 → InstanceStart。
+
+## 安全配置清单
+
+在生产环境部署前，逐项核对以下配置：
+
+| 配置项 | gVisor 写法 | 说明 |
+|--------|-------------|------|
+| 禁网 | `--network none` | Agent 不需要网络时完全断开 |
+| 只读 FS | `--read-only` | 防止持久化恶意文件 |
+| 内存限制 | `--memory 256m` | 防止 OOM 炸宿主 |
+| CPU 限制 | `--cpus 0.5` | 防止算力耗尽 |
+| 超时 | `subprocess.timeout=30` | 防止无限循环 |
+| 无新权限 | `--security-opt no-new-privileges` | 防止 setuid 提权 |
+| 丢弃 capabilities | `--cap-drop ALL` | 移除危险系统权限 |
+| 非 root | `USER sandboxuser` | 减小逃逸后影响范围 |
+| 临时空间 noexec | `--tmpfs /tmp:noexec` | 防止写入后直接执行 |
+
+## 选型建议
+
+**用 gVisor**：需要在现有 Docker 基础设施上快速叠加安全层；无 KVM；对隔离要求适中，更看重部署便利性。
+
+**用 Firecracker**：裸金属或支持嵌套虚拟化的云实例；有合规要求（金融、医疗）；需要 snapshot/restore 功能加速冷启动。
+
+**两者都不用**：Agent 只处理确定性无副作用的计算；代码完全由你控制，不包含用户输入或 LLM 生成的部分。
+
+MicroVM 沙箱是 Agent 代码执行安全的正确投资方向。Agent 能力越强，被注入恶意指令的风险也越高。在 Agent 还相对简单的今天把安全护栏建好，是 2026 年 AI 工程中最值得做的一件事。

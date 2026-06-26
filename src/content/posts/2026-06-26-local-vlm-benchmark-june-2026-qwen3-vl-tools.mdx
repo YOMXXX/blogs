@@ -1,0 +1,237 @@
+---
+title: "本地 VLM 横评 2026-06：Qwen3-VL 8B 还是 Qwen3.6 27B，谁是最优解？"
+description: "基于 Reddit r/LocalLLaMA 社区 6 月实测数据，对比 Qwen3-VL 8B、Qwen3.6 27B、Qwen3.6 35B-A3B 等主流本地视觉语言模型在 OCR、图像描述和视觉推理上的实际表现。"
+column: "tools"
+tags: ["VLM", "Qwen3-VL", "local-LLM", "benchmark", "vision-language-model", "Ollama"]
+pubDate: 2026-06-26
+featured: false
+tldr: "Qwen3.6 27B Q4 nothink 以 79.6 分摘得 2026 年 6 月本地 VLM 横评冠军。Qwen3-VL 8B 以 6GB VRAM 占用和 43 tok/s 速度拿下性价比最优奖，是消费级 GPU 的首选。Qwen3.6 35B-A3B MoE 变体以 76.4 分紧随其后。"
+author: "YOMXXX"
+faq:
+  - q: "Qwen3-VL 8B 和 Qwen3.6 27B 的主要区别是什么？"
+    a: "Qwen3-VL 8B 是视觉语言模型（VLM），原生支持图像输入，参数量小（8B）、速度快（43 tok/s）、VRAM 占用低（6GB）。Qwen3.6 27B 是纯文本模型升级版，通过插件式视觉编码器支持图像，参数量更大（27B）、能力更强但需要更多 VRAM（约 18-20GB）。性能优先选 27B，硬件受限选 8B。"
+  - q: "Qwen3.6 35B-A3B 是什么架构，有什么优势？"
+    a: "35B-A3B 表示 35B 总参数、每次激活约 3B 的混合专家（MoE）架构。实际推理的算力消耗接近 3B 模型，但知识容量接近 35B 模型。优势是在中等 VRAM（约 8-12GB）上能获得超越参数量的表现，适合硬件不够跑 27B 但追求更高质量的场景。"
+  - q: "这次评测的方法论是什么，结果可信度如何？"
+    a: "评测基于 Reddit u/throwaway_eval 在 r/LocalLLaMA 发布的系统化基准，使用 90 个任务的主观+客观混合评分，测试内容覆盖 OCR、图像细节识别、视觉推理等。方法论公开透明，采用盲测排名，可信度较高，但属于社区实测而非学术论文，有一定主观性。"
+  - q: "Ollama 用户应该下载哪个模型？"
+    a: "VRAM 在 8GB 以下用 qwen3-vl:8b（Q4 量化）。VRAM 16-24GB 用 qwen3.6:27b（Q4 量化）。VRAM 10-16GB 且需要视觉能力可以尝试 qwen3.6:35b-a3b（Q4 MoE，激活参数少，实际显存需求低于 27B）。"
+  - q: "InternVL3.5 和 Molmo2 在这次横评中表现如何？"
+    a: "InternVL3.5 在专业图文理解任务（如学术截图、技术图表）上有优势，但综合得分不如 Qwen3.6 27B。Molmo2（Allen AI 2026 新作）在自然图像描述上表现出色，但 OCR 和多语言场景下稍弱。两者都是值得关注的替代选项，但目前 Qwen 家族在综合横评中仍保持领先。"
+---
+
+本地视觉语言模型（VLM）的竞争，在 2026 年 6 月进入了一个新的阶段。在消费级 GPU 上运行真正有用的 VLM，已经不再是理想，而是现实。
+
+这篇文章整合了 Reddit r/LocalLLaMA 社区在 2026 年 6 月发布的两份系统化实测报告，对目前最值得关注的几个本地 VLM 做全面横评，帮你在性能与硬件成本之间找到最优解。
+
+## 测试方法论
+
+社区评测者 u/throwaway_eval 用 90 个任务构建了系统化评测集，混合主观评分和客观指标：
+
+**任务类型分布**：
+- OCR 和文字识别（约 25 题）：包含多语言、手写、低对比度等挑战场景
+- 图像细节描述（约 25 题）：测试对视觉内容的精确描述能力
+- 视觉推理（约 20 题）：需要理解图像内容进行逻辑推断
+- 图表和数据可视化解读（约 20 题）：测试图表阅读能力
+
+评分方式：每题 0-1 分（客观题）或 0-0.5-1 主观评分，满分 90 分，归一化为百分制。
+
+**测试环境**：
+- 操作系统：Ubuntu 22.04 LTS
+- 推理框架：llama.cpp（最新版本），Ollama 封装
+- 量化格式：Q4_K_M（默认），部分模型测试 Q6_K 对比
+- 测试机器：两台，一台 RTX 4090 24GB，一台 RTX 3090 24GB
+
+第二份报告（u/bench_runner_ml，2026 年 6 月 21 日更新）是第一份的补充，增加了 think/nothink 模式对比和新增的 Qwen3.6 35B-A3B 测试。
+
+## 综合排名结果
+
+### 第一名：Qwen3.6 27B Q4 nothink（得分 79.6）
+
+不是预期中的"原生 VLM"，而是 Qwen3 系列的通用旗舰赢得了冠军。
+
+Qwen3.6 27B 通过外接视觉编码器支持图像输入，但对图像的理解能力已经很成熟。得分 79.6，0 次超时（90/90 任务全部完成），是综合最强的本地 VLM 选择。
+
+**think 模式 vs nothink 模式**：同一个模型，nothink 模式得 79.6，think（慢思考）模式反而只有 78.2，还有 9 次超时（81/90）。原因是 OCR 和细节描述任务不需要"想太多"，过度推理反而引入噪声和超时。结论：**视觉任务默认用 nothink 模式**。
+
+硬件需求：Q4 量化需要约 18-20GB VRAM，RTX 4090 满足要求。
+
+### 第二名：Qwen3.6 27B Q4 think（得分 78.2）
+
+和第一名是同一模型，仅参数配置不同。如上文所述，在视觉任务上 nothink 更优。但 think 模式在纯视觉推理的复杂子任务上（约 5-6 题）有局部优势，如果你的场景以复杂推理为主而非 OCR，可以考虑 think 模式。
+
+### 第三名：Qwen3.6 35B-A3B Q4 nothink（得分 76.4）
+
+MoE 架构的惊喜。35B 总参数，但每次激活只用约 3B，实际推理显存消耗约 8-12GB（显著低于 27B 的 18-20GB）。
+
+得分 76.4，和 27B 差距只有 3.2 分，但 VRAM 需求减半。对于显存在 12GB 左右的用户（RTX 3080 12GB、RTX 4070 Ti SUPER），这是高价值选择。
+
+一个值得注意的细节：35B-A3B 在需要同时理解图像全局信息和局部细节的任务（"找出图中的细节差异"类题型）上表现比 27B 更好，可能是更大的总参数量带来的语义理解优势。
+
+### 第四名：Qwen3-VL 8B Q4 nothink（得分约 72，性价比冠军）
+
+原生 VLM，专为图像-文本理解设计，8B 参数量。
+
+得分 72 排第四，但 Qwen3-VL 8B 赢得了本次横评最重要的奖项：**性价比最优**。
+
+- **显存占用**：仅需约 6GB VRAM，RTX 3060 12GB、RTX 4060 16GB 都轻松运行
+- **推理速度**：43 tok/s（Q4，4090），是同等画质场景下最快的选项
+- **可靠性**：90/90 任务全部完成，0 次超时，0 次胡言乱语
+- **多语言 OCR**：测试了中文（少林寺旗帜）、英文、混排场景，Qwen3-VL 8B 是唯一正确识别全部字符的 8B 以下模型
+
+如果你的 VRAM &lt;=16GB，或者对速度有要求，Qwen3-VL 8B 是无可争议的推荐。
+
+### 其他值得关注的模型
+
+**InternVL3.5**（上海 AI Lab）：在学术截图和技术图表理解上表现突出，尤其是数学公式识别。综合得分约 70-73，在 Qwen 家族密集覆盖的通用场景中略显弱势，但如果你的主要用途是论文截图解析，InternVL3.5 值得测试。
+
+**Molmo2**（Allen AI，2026 新作）：社区关注度较高的新模型。自然图像描述能力出色，生成的描述比竞品更自然流畅。但在 OCR（尤其是中文）和图表理解上明显弱于 Qwen 系列，综合得分约 65-68。
+
+**GLM-5V-Turbo**（Z.ai）：作为 GLM-5.2 配套的视觉版本，能力未被包含在这次开源横评中（非开放权重），只通过 API 可用。在 API 评测场景下，GLM-5V-Turbo 和 Qwen3.6 27B 接近，但无法本地部署是关键限制。
+
+## 各任务维度细拆
+
+### OCR 和文字识别
+
+这是区分 VLM 能力最明显的维度。评测使用了挑战性素材：
+
+- 旗帜上的中文汉字（少林寺）和英文徽章描述
+- 手写中英文混排便签
+- 低对比度背景的印刷文字
+- 复杂排版的扫描件
+
+**结论**：Qwen3.6 27B 和 Qwen3-VL 8B 在中文 OCR 上明显优于其他模型，Molmo2 在中文场景下的准确率约只有 Qwen 的 60%。
+
+### 图像细节描述
+
+测试图像包含特意设置的"陷阱"：背景中的隐藏物体、图像边缘的细节、容易被忽略的数字或标志。
+
+Qwen3.6 27B 在这个维度领先最多，它能注意到其他模型忽略的背景细节。评测者怀疑这得益于 Qwen3.6 的大参数量带来的更强语义关联能力。
+
+### 视觉推理
+
+"图中的红色物体在桌子的左边还是右边？""这两张图里哪张更可能是午后拍摄的？"
+
+所有被测模型在这个维度上差距缩小，Qwen3.6 27B 仍略领先，但 Qwen3-VL 8B 的表现和 27B 差距只有约 4%，性价比优势更加突出。
+
+### 图表和数据可视化解读
+
+折线图、柱状图、散点图的数值读取和趋势描述。
+
+InternVL3.5 在这个维度上意外表现最好，超过 Qwen 系列约 5 分。如果你的主要用途是 BI 报表截图解析，InternVL3.5 值得优先测试。
+
+## 实际部署指南
+
+### Ollama 一行命令
+
+```bash
+# 性价比之选：Qwen3-VL 8B（需要 ~6GB VRAM）
+ollama pull qwen3-vl:8b
+
+# 性能旗舰：Qwen3.6 27B（需要 ~20GB VRAM）
+ollama pull qwen3.6:27b
+
+# VRAM 中等的性价比方案：Qwen3.6 35B-A3B（需要 ~10GB VRAM）
+ollama pull qwen3.6:35b-a3b
+```
+
+### Python API 使用示例
+
+```python
+import ollama
+import base64
+from pathlib import Path
+
+def analyze_image(image_path: str, question: str, model: str = "qwen3-vl:8b") -> str:
+    """使用本地 VLM 分析图像"""
+    # 读取图像并编码为 base64
+    image_data = Path(image_path).read_bytes()
+    image_b64 = base64.b64encode(image_data).decode()
+
+    # 判断图像格式
+    suffix = Path(image_path).suffix.lower()
+    media_type = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(suffix, "image/jpeg")
+
+    response = ollama.chat(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": question,
+            "images": [image_b64]
+        }]
+    )
+    return response["message"]["content"]
+
+
+# OCR 示例
+text = analyze_image(
+    "screenshot.png",
+    "请识别图中所有文字，保持原始排版格式。",
+    model="qwen3-vl:8b"
+)
+print(text)
+
+# 图像描述
+description = analyze_image(
+    "photo.jpg",
+    "详细描述这张图片的内容，包括前景、背景和任何值得注意的细节。",
+    model="qwen3.6:27b"    # 追求质量用 27B
+)
+print(description)
+
+# 图表分析
+chart_analysis = analyze_image(
+    "chart.png",
+    "这个图表显示了什么数据？主要趋势是什么？有什么异常值？",
+    model="qwen3.6:27b"
+)
+print(chart_analysis)
+```
+
+### 与 nothink 模式配合
+
+```python
+def vlm_nothink(image_path: str, question: str) -> str:
+    """显式使用 nothink 模式，适合 OCR 和描述任务"""
+    # 在问题前加 /no_think 指令（Qwen3.6 系列支持）
+    prompt = f"/no_think\n{question}"
+    return analyze_image(image_path, prompt, model="qwen3.6:27b")
+```
+
+## 选型决策树
+
+```
+显存 <= 8GB
+  → Qwen3-VL 8B Q4（唯一推荐，性价比极高）
+
+显存 10-16GB
+  → Qwen3.6 35B-A3B Q4（MoE，激活参数少，性价比最优中端方案）
+
+显存 >= 20GB，性能优先
+  → Qwen3.6 27B Q4 nothink
+
+显存 >= 20GB，主要用途是图表/学术截图
+  → InternVL3.5（图表维度最强）
+
+不需要中文 OCR，追求自然描述
+  → Molmo2（描述质量出色）
+```
+
+## 与半年前的对比
+
+2025 年 12 月的本地 VLM 横评中，得分 72 的表现能排在前三。2026 年 6 月，72 分只能排第四，而第一名 79.6 分明显超出当时最强。半年内，本地 VLM 的上限提升了约 10 个百分点，这个进步速度令人惊讶。
+
+Qwen 家族在这个赛道上显示出强大的迭代能力。Qwen3-VL 对比半年前的 Qwen2.5-VL，在中文 OCR 上提升了约 15%，在视觉推理上提升了约 12%。如果这个趋势延续，到 2026 年底，本地 VLM 达到目前闭源 API 水平或许不是奢望。
+
+## 结语
+
+如果只能给出一个建议：**VRAM 充足就选 Qwen3.6 27B Q4 nothink，VRAM 受限就选 Qwen3-VL 8B**。这两个选择能覆盖 90% 以上的本地 VLM 使用场景。
+
+Qwen3.6 35B-A3B 是 MoE 架构的有趣折中——如果你的 VRAM 在 10-16GB 之间，这个选项能让你以较低硬件成本获得接近 27B 的体验，值得测试。
+
+本地 VLM 的黄金时代刚刚开始，半年后的横评结果可能又会完全不同。
