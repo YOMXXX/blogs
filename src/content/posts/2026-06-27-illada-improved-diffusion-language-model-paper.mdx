@@ -1,0 +1,231 @@
+---
+title: "iLLaDA 精读：扩散语言模型首次与自回归 7B 模型正面对决"
+description: "arXiv:2606.25331 提出 iLLaDA，一个 8B 双向掩码扩散语言模型，通过扩展预训练语料至 12T tokens、优化 SFT 策略和引入变长生成，在 BBH 和 MATH 上大幅超越前代 LLaDA，并与 Qwen2.5 7B 竞争。"
+column: "paper"
+tags: ["iLLaDA", "diffusion-LM", "non-autoregressive", "LLaDA", "arXiv"]
+pubDate: 2026-06-27
+featured: false
+tldr: "iLLaDA（arXiv:2606.25331）通过三项改进（12T token 预训练、25B token SFT、变长生成）将 LLaDA 8B 在 BBH 提升 21.6 分、在 MATH 提升 14.5 分，首次让扩散语言模型与 Qwen2.5 7B 等强自回归模型正面竞争。"
+author: "YOMXXX"
+faq:
+  - q: "扩散语言模型和自回归语言模型的根本区别是什么？"
+    a: "自回归模型从左到右逐 token 生成，使用单向因果注意力；扩散语言模型使用双向注意力，训练时随机 mask tokens 让模型学习预测，推理时从完全 mask 的序列迭代还原。双向注意力让扩散模型天然擅长逆转推理和规划任务，但历史上性能落后于强自回归模型。"
+  - q: "iLLaDA 在哪些任务上相对于自回归模型有优势？"
+    a: "双向推理任务（如逆转诗歌补全、回文生成）和长程规划任务。LLaDA 已经证明在逆转诗歌补全上超越 GPT-4o——这是自回归模型存在 reversal curse 的经典弱点。iLLaDA 在此基础上进一步提升了通用能力。"
+  - q: "iLLaDA 的变长生成（variable-length generation）解决了什么问题？"
+    a: "原版 LLaDA 需要预先指定生成序列的长度，这在实际使用中非常不便。iLLaDA 引入变长生成机制，模型可以自适应决定输出长度，不仅提升了实用性，还显著提高了推理效率，使其更接近实用部署要求。"
+  - q: "为什么 SFT 用 25B token 训练 12 个 epoch 而不是更多新数据？"
+    a: "论文的策略是对有限的高质量指令数据进行多轮重复训练，这在数据受限的场景下比用更多但质量参差不齐的数据更有效。12 个 epoch 的重复训练是经过消融实验验证的最优点，超过后性能不再提升。"
+  - q: "如何获取 iLLaDA 的模型权重？"
+    a: "模型权重和代码已随论文开源，可以通过 arXiv 页面（2606.25331）找到指向 Hugging Face Hub 的链接直接下载。基础版（iLLaDA-Base）和指令版（iLLaDA-Instruct）均已发布。"
+---
+
+自回归范式已经统治语言模型领域超过五年，GPT、LLaMA、Qwen 系列都建立在同一个假设上：从左到右，逐 token 生成，当前 token 只能看到左边的上下文。这个假设并非出于自然语言的本质需要，而是工程上最简单、最容易扩展的选择。
+
+但"工程简单"不等于"最优"。一旦任务需要逆向推理或全局规划，自回归模型就会暴露出结构性弱点——它永远无法在生成当前 token 时回头修正之前的选择。
+
+**扩散语言模型**（Diffusion Language Model）提供了另一条路。问题是：这条路能走多远？
+
+2026 年 6 月 24 日，arXiv:2606.25331 提交了 **iLLaDA**（Improved Large Language Diffusion Model），给出了迄今最具说服力的回答：通过系统性工程改进，扩散语言模型首次能够与 Qwen2.5 7B 等同等量级的强自回归模型在通用基准上正面竞争。
+
+## 为什么扩散语言模型值得关注
+
+要理解 iLLaDA 的意义，需要先理解自回归模型的结构性限制。
+
+自回归模型在生成第 `k` 个 token 时，注意力只能覆盖前 `k-1` 个 token。这个因果掩码（causal mask）是刻意设计的——它让训练和推理的逻辑一致，但也意味着模型对"已经生成的部分"无法修改，对"尚未生成的右侧上下文"完全盲目。
+
+这在实践中导致了一个有名的现象：**reversal curse**（逆转诅咒）。如果模型在训练时见过"A 是 B 的父亲"，它能回答"A 的孩子是谁"，但不一定能回答"B 的父亲是谁"——因为逆向的推理路径在单向注意力下需要更多的参数记忆，而非结构性推理。
+
+扩散语言模型的注意力是双向的。模型在推理每个位置时，能同时看到左右两侧的上下文。这个特性让它在结构上更接近人类的写作方式——先有全局轮廓，再填充细节，而不是从第一个字一路写到最后。
+
+不过，双向注意力带来了推理机制的根本变化。自回归模型每次前向传播生成一个 token，效率极高。扩散语言模型需要多步迭代——从完全被 mask 的序列开始，每步预测并 unmask 部分 token，直到序列完整。这在历史上是扩散语言模型性能无法追上自回归模型的重要原因之一，不仅是算法问题，还有工程成熟度的差距。
+
+iLLaDA 的出现标志着这个差距正在系统性缩小。
+
+## LLaDA 背景：NeurIPS 2025 的里程碑
+
+iLLaDA 的前身 LLaDA（Large Language Diffusion with mAsking）是 2025 年 NeurIPS Oral 论文，由同一支来自中国人民大学的团队提出。
+
+LLaDA 的核心贡献是证明了两件以前存疑的事：
+
+**第一，非自回归模型可以学会上下文学习（in-context learning）。** 在此之前，学界对扩散语言模型能否做 few-shot 推理存在怀疑，因为 ICL 通常被认为是自回归模型的专属能力。LLaDA 的实验证明，双向掩码扩散模型在看到几个示例后，确实能从中归纳规律并应用到新输入。
+
+**第二，扩散语言模型在逆转推理上天然优于自回归模型。** LLaDA 8B 在逆转诗歌补全任务（给出诗歌结尾，补全开头）上超越了 GPT-4o——这个结果当时引发了相当大的关注，因为 reversal curse 一直被认为是所有自回归模型的内在弱点，而 LLaDA 不需要任何专项训练就自然克服了它。
+
+然而，LLaDA 在通用基准上的表现仍明显落后于同规模的自回归模型。与 Qwen2.5 7B 相比，LLaDA 在 BBH、MATH、HumanEval 等主流基准上存在两位数的分差。这个差距不是原理性的，而是工程性的：训练数据量、SFT 策略、推理方法都有大量可优化的空间。
+
+iLLaDA 就是对这些空间的系统性探索。
+
+## iLLaDA 的三大改进
+
+### 预训练：12T Token 语料 + GQA
+
+iLLaDA 最直接的改进是**规模**。预训练语料从 LLaDA 原版扩展到 **12T tokens**，覆盖更广泛的领域和语言。
+
+但数据量扩张带来了工程挑战：随着模型上下文和批大小增大，KV Cache 的内存占用成为瓶颈。iLLaDA 引入了 **Grouped-Query Attention（GQA）**——与 Llama 3、Qwen 2.5 等主流模型的做法一致，将多个 query head 共享同一组 key-value head，大幅降低推理时的内存开销。
+
+> **💡 为什么扩散语言模型也需要关心 KV Cache？** 扩散语言模型在推理时需要多步迭代，每一步都涉及完整序列的双向注意力计算。每步的中间激活值需要缓存，实际的内存压力比自回归模型更大而非更小。GQA 在这里的收益比自回归场景更显著。
+
+此外，iLLaDA 采用了 **tied input/output embeddings**（输入与输出嵌入层共享权重），在参数量相同的条件下减少了独立参数，提升了参数利用率。学习率调度策略也针对大规模训练做了优化——原版 LLaDA 的调度在 12T token 量级下会出现训练后期梯度震荡，新策略更平稳。
+
+### SFT：变长生成与高密度训练
+
+监督微调阶段的改动是 iLLaDA 最具实用价值的贡献之一。
+
+原版 LLaDA 在 SFT 时使用**固定长度生成**：训练和推理都预先指定输出序列的长度 `L`，模型从长度为 `L` 的全 mask 序列开始迭代还原。这在工程上简洁，但在实际使用中极不方便——用户提问时不可能事先知道答案有多长。
+
+iLLaDA 引入了**变长生成（variable-length generation）**机制，让模型自适应决定输出长度。这需要修改训练目标的构建方式：SFT 数据中每条样本的目标序列长度不同，损失函数的计算需要相应调整。
+
+高密度训练策略同样值得关注。iLLaDA 在 **25B token** 的指令微调语料上训练了 **12 个 epoch**。相比之下，多数自回归模型的 SFT 通常只走 1-3 个 epoch。
+
+这个选择反映了扩散语言模型的特殊性：掩码扩散的训练目标本质上是在每步看到部分 token 的条件下预测其余 token，这个学习信号的密度比自回归（每步只预测下一个 token）低得多。为了从相同数据中提取足够的学习信号，需要更多轮次的重复训练。论文的消融实验显示，12 个 epoch 是当前配置的最优点，继续增加后性能趋于平稳。
+
+```python
+# 变长生成的推理示意（概念代码，非官方实现）
+
+import torch
+
+def illada_generate(
+    model,
+    prompt_ids: torch.Tensor,
+    max_new_tokens: int = 512,
+    num_steps: int = 20,
+) -> torch.Tensor:
+    """
+    iLLaDA 变长扩散生成（概念演示）
+    
+    与原版 LLaDA 固定长度不同，这里模型会在推理中
+    动态决定实际需要生成的 token 数量。
+    """
+    MASK_TOKEN_ID = model.config.mask_token_id
+    EOS_TOKEN_ID = model.config.eos_token_id
+
+    batch_size = prompt_ids.shape[0]
+    prompt_len = prompt_ids.shape[1]
+
+    # 从最大长度的全 mask 序列开始
+    output_ids = torch.full(
+        (batch_size, max_new_tokens),
+        fill_value=MASK_TOKEN_ID,
+        dtype=torch.long,
+    )
+    input_ids = torch.cat([prompt_ids, output_ids], dim=1)
+
+    for step in range(num_steps):
+        # 双向注意力：同时看到 prompt 和当前部分还原的输出
+        logits = model(input_ids).logits
+
+        # 只对仍然 mask 的位置预测
+        output_logits = logits[:, prompt_len:, :]
+        mask_positions = (input_ids[:, prompt_len:] == MASK_TOKEN_ID)
+
+        if not mask_positions.any():
+            break
+
+        # 置信度最高的 mask 位置优先还原（确定性解码）
+        probs = torch.softmax(output_logits, dim=-1)
+        confidence = probs.max(dim=-1).values
+        confidence[~mask_positions] = -1  # 已还原的位置不参与选择
+
+        # 每步还原一定比例的 mask token
+        num_unmask = max(1, int(mask_positions.sum() / (num_steps - step)))
+        topk_positions = confidence.topk(num_unmask, dim=-1).indices
+
+        for b in range(batch_size):
+            for pos in topk_positions[b]:
+                if mask_positions[b, pos]:
+                    predicted = output_logits[b, pos].argmax()
+                    input_ids[b, prompt_len + pos] = predicted
+
+    # 截断到第一个 EOS 位置（变长生成的关键）
+    results = []
+    for b in range(batch_size):
+        gen = input_ids[b, prompt_len:]
+        eos_positions = (gen == EOS_TOKEN_ID).nonzero()
+        if len(eos_positions) > 0:
+            gen = gen[:eos_positions[0].item()]
+        results.append(gen)
+
+    return results
+```
+
+### 推理：置信度评分替代原有方法
+
+原版 LLaDA 在多选题评估时使用**对数似然评分**：把每个选项拼接到题目后面，计算模型给出该序列的对数概率，选概率最高的选项。这个方法在自回归模型中是标准做法，但在扩散语言模型中存在偏差——因为掩码扩散的训练目标与序列级对数概率的计算方式并不完全对齐。
+
+iLLaDA 引入了**置信度评分（confidence-based scoring）**：将每个选项单独 mask 掉，让模型在看到其余内容的情况下预测被 mask 的选项 token，用预测置信度作为评分依据。这与扩散语言模型的训练目标（预测被 mask 的 token）直接对齐，减少了评估偏差。
+
+这个改动看似是评估细节，但对最终基准数字的影响不可忽视。评估方法与模型训练目标的对齐程度，直接决定了基准分数能否反映模型的真实能力。
+
+## 基准测试数据解读
+
+iLLaDA 的实验结果分两个维度展示：与前代 LLaDA 的对比，以及与当前最强自回归模型的对比。
+
+**与 LLaDA 的绝对提升（基础版）：**
+
+| 基准 | LLaDA 8B Base | iLLaDA 8B Base | 提升 |
+|------|--------------|----------------|------|
+| BBH | ~40 | ~61.6 | +21.6 |
+| ARC-Challenge | ~50 | ~64.9 | +14.9 |
+
+BBH（Big Bench Hard）测试多步推理和逻辑能力，21.6 分的提升是相当可观的。要知道自回归模型从 GPT-3.5 到 GPT-4 在 BBH 上的提升也只有约 15-20 分。
+
+**与 LLaDA-Instruct 的对比（指令版）：**
+
+| 基准 | LLaDA 8B Instruct | iLLaDA 8B Instruct | 提升 |
+|------|------------------|-------------------|------|
+| MATH | ~20 | ~34.5 | +14.5 |
+| HumanEval | ~15 | ~31.5 | +16.5 |
+
+数学和代码能力的提升说明 SFT 阶段的数据和策略改进确实有效——这两个任务是扩散语言模型历史上最薄弱的环节，因为它们需要严格的步骤顺序和精确推理。
+
+**与 Qwen2.5 7B 的差距**：iLLaDA 在多个基准上已能与 Qwen2.5 7B 竞争，部分基准上达到持平或领先，但在代码生成（HumanEval）和数学推理的最难子集上仍有差距。这符合预期——扩散语言模型的训练效率和工程成熟度尚未追上自回归阵营经过多年迭代的实现。
+
+值得关注的是 **Dream 7B**（另一个主流扩散语言模型）的对比结果。iLLaDA 在大多数基准上超越 Dream 7B，说明 iLLaDA 的改进不只是数据堆砌，而是方法层面的系统性进步。
+
+**扩散语言模型的结构优势依然明显**：在逆转推理任务上，iLLaDA 继承了 LLaDA 的天然优势，这类任务是自回归模型的已知盲区，iLLaDA 不需要专项优化就能达到竞争性水平。
+
+## 工程意义：开发者应该关注什么
+
+对于考虑在实际项目中使用 iLLaDA 的开发者，有几点值得关注。
+
+**部署成本**：iLLaDA 采用了 GQA，KV Cache 压力比原版 LLaDA 显著降低，与同规模的 Llama 3 / Qwen 2.5 相当。但扩散语言模型的推理需要多步迭代（通常 10-20 步），总计算量是单步自回归解码的数倍。在对延迟敏感的场景，这仍然是一个工程瓶颈。
+
+**适合的任务类型**：
+
+- **双向推理任务**（填空、逆转推理、上下文相关改写）：iLLaDA 的结构优势最为明显
+- **长文本规划类任务**（需要先确定整体结构再填充细节的场景）：扩散模型的迭代还原机制天然支持
+- **通用 QA 和代码**：已经能与自回归模型竞争，但最难的推理链任务仍有差距
+
+**逆转推理场景示例**：
+
+```python
+# 逆转推理示例：给定结尾，推断开头
+# 这是扩散语言模型相比自回归模型的核心优势场景
+
+prompt = """
+已知一段对话的结尾如下：
+"...所以最终他们决定不再追究这件事。"
+
+请推断这段对话可能的开头（200字以内）。
+"""
+
+# 自回归模型在此类任务中存在 reversal curse：
+# 训练时见到的顺序是"开头→结尾"，逆向推理需要额外的参数记忆
+# 而 iLLaDA 的双向注意力在推理时可以同时"看到"结尾，
+# 从结尾反推开头在结构上与正向推理等价
+```
+
+**如何使用开源权重**：iLLaDA 的基础版（iLLaDA-Base）和指令版（iLLaDA-Instruct）均已通过 arXiv 页面（2606.25331）链接到 Hugging Face Hub 开放下载。iLLaDA 继承了 LLaDA 的代码库，加载和推理接口与 LLaDA 兼容，对已有 LLaDA 使用经验的开发者迁移成本极低。
+
+> **⚠️ 注意推理步数的影响**：iLLaDA 的生成质量对推理迭代步数（`num_steps`）敏感。步数过少（如 &lt;5 步）时输出质量明显下降；步数超过 20 步后提升趋于平稳。建议在实际部署前针对目标任务做步数消融实验，找到质量与延迟的最优平衡点。
+
+## 总结
+
+iLLaDA（arXiv:2606.25331）通过预训练规模（12T tokens）、SFT 策略（变长生成 + 高密度训练）和推理方法（置信度评分）的系统性改进，将扩散语言模型的通用能力拉到了与同规模自回归模型正面竞争的水平。这不是一篇追求单点突破的论文，而是一份来自 LLaDA 原团队的工程路线报告，意义在于证明：扩散语言模型的性能差距是可以系统性缩小的。双向注意力、逆转推理优势、规划友好的生成机制，这些结构性优势加上持续的工程打磨，让扩散语言模型在 2026 年终于成为值得认真对待的自回归替代方案。
+
+---
+
+**论文**：arXiv:2606.25331（2026-06-24，cs.CL / cs.AI）  
+**Hugging Face 页面**：https://huggingface.co/papers/2606.25331  
+**作者团队**：中国人民大学 LLaDA 原团队（Shen Nie 等）

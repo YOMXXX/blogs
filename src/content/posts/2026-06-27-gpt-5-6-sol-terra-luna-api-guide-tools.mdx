@@ -1,0 +1,248 @@
+---
+title: "GPT-5.6 Sol/Terra/Luna 选型指南：三档定价、能力差距与 API 迁移"
+description: "OpenAI 发布 GPT-5.6 三档模型：旗舰 Sol（$5/$30 per 1M tokens）、生产级 Terra（$2.5/$15）、经济型 Luna（$1/$6），本文解析三档定价逻辑、能力差距，帮助开发者做出最优选型决策。"
+column: "tools"
+tags: ["GPT-5.6", "OpenAI", "LLM", "API", "model-selection"]
+pubDate: 2026-06-27
+featured: false
+tldr: "OpenAI GPT-5.6 以 Sol/Terra/Luna 三档重构模型产品线，Sol 维持 GPT-5.5 定价（$5/$30）但带来网安和 Agent 能力大幅提升，Terra 是高并发生产首选，Luna 适合低延迟实时场景。目前限量 preview，预计数周内 GA。"
+author: "YOMXXX"
+faq:
+  - q: "GPT-5.6 Sol 和 GPT-5.5 有什么区别，值得升级吗？"
+    a: "Sol 与 GPT-5.5 定价相同（$5/$30 per 1M tokens），但在 cybersecurity、long-horizon agentic tasks 和 software engineering 上有显著提升。OpenAI 声称在 ExploitBench 上 Sol 性能接近 Anthropic Mythos Preview，同时仅使用约三分之一的 output tokens，性价比大幅提升。对于复杂 Agent 任务，升级有明显收益。"
+  - q: "Terra 和 Sol 的实际能力差距有多大？"
+    a: "官方未公布详细消融数据，但从命名体系和定价（Terra 是 Sol 价格的一半）推断，Terra 是去除了最顶层推理能力后的均衡版本，适合高并发生产工作负载而非追求极致推理质量的任务。对于文档处理、代码辅助、客服等场景，Terra 的能力通常已足够。"
+  - q: "现在可以申请 GPT-5.6 的访问权限吗？"
+    a: "目前 GPT-5.6 处于 Limited Preview 阶段，仅向 OpenAI 选定的 trusted partners 开放，没有公开申请通道或等候名单。OpenAI 表示将在数周内向 ChatGPT、Codex 和 API 用户全面开放，届时所有开发者可直接使用。"
+  - q: "从 GPT-5.5 迁移到 GPT-5.6 需要改代码吗？"
+    a: "需要修改 model 参数。GPT-5.5 的 model ID 是 gpt-5.5，迁移到 Sol 需要改为 gpt-5.6-sol，或根据需要选择 gpt-5.6-terra / gpt-5.6-luna。API 结构和参数格式不变，对现有代码影响很小，主要是一行 model 字符串替换。"
+  - q: "GPT-5.6 在网络安全方面的能力是否存在滥用风险？"
+    a: "OpenAI 对此明确回应，GPT-5.6 配备了专门针对网络攻击、生物武器等恶意使用的多层安全架构（layered safeguard stack），这正是其与美国政府协作评估的重点。ExploitBench 测试表明模型能力确实更强，但使用条款和安全过滤同步加强，限制了实质性滥用路径。"
+---
+
+2026 年 6 月 26 日，OpenAI 对外发布了 GPT-5.6 系列，这不只是一次版本号迭代，而是一次产品线架构的根本性重构。Sol、Terra、Luna 三档命名打破了过去 GPT-4o mini / GPT-4o / GPT-5 的线性关系，代之以"代际 + 能力层级"的矩阵式命名体系。
+
+对于 API 开发者而言，这次发布意味着从现在起，选模型不再是选"哪个版本"，而是选"哪个能力层级"。本文基于 OpenAI 官方发布信息和已公开的基准数据，做一次完整的横评和选型指南。
+
+## 背景：OpenAI 为什么用三档模型重构产品线
+
+这次发布的直接诱因是美国政府的政策节点。2026 年 6 月 2 日，Trump 政府签署行政令，要求对前沿 AI 模型进行 30 天政府评估期（截止 7 月 2 日）。GPT-5.6 以 Limited Preview 形式先向 trusted partners 开放，正是为了在政府评估窗口内推进，同时避免公开发布引发的不可控风险。
+
+但政策背景只是时间节点的解释，产品架构的变化才是重点。
+
+过去 OpenAI 的产品线是线性的：GPT-4o mini 便宜但弱，GPT-4o 居中，GPT-5 系列旗舰。这个命名体系的问题在于每次发布都会引发用户对"最新版本"的非理性追逐，以及模型能力迭代带来的混淆。
+
+新的命名体系用数字（5.6）表示**代际**，用 Sol/Terra/Luna 表示**持久的能力层级（Durable capability tiers）**。关键词是"durable"——这三个层级可以在同一代内独立更新演进。比如 6 个月后 Terra 推出性能增强版，版本号可以是 `gpt-5.6-terra-2`，而无需整体换代。这是一种更工程化、更可预测的产品演进路径。
+
+对开发者的实际含义：**你的代码接入层从"跟版本"变成"选层级"**，长期维护成本更低。
+
+## 三档模型详解
+
+### 定价一览
+
+| 模型 | Model ID | 输入价格（/1M tokens） | 输出价格（/1M tokens） |
+|------|----------|----------------------|----------------------|
+| GPT-5.6 Sol | `gpt-5.6-sol` | $5.00 | $30.00 |
+| GPT-5.6 Terra | `gpt-5.6-terra` | $2.50 | $15.00 |
+| GPT-5.6 Luna | `gpt-5.6-luna` | $1.00 | $6.00 |
+
+Sol 的定价与 GPT-5.5 完全相同，这是一个明确的信号：Sol 是 GPT-5.5 的直接升级，对现有 GPT-5.5 用户而言是零成本迁移。
+
+### Sol：最强旗舰，定位高风险任务
+
+Sol（太阳）是三档中能力最强的旗舰层级。OpenAI 将它定位于 scientific research、cybersecurity、complex agentic tasks 等对推理质量要求极高的场景。在 ExploitBench（漏洞利用基准）上，Sol 的成绩与 Anthropic Mythos Preview 相当，而且只用了约 **1/3 的 output tokens**——这意味着同样质量下，Sol 的实际运行成本远低于竞品。
+
+### Terra：均衡生产级，高并发首选
+
+Terra（大地）定位于"high-volume work"，是三档中性价比最均衡的选项。输入价格是 Sol 的一半，输出价格同样减半，适合需要大量 API 调用但不追求最顶层推理能力的生产环境。可以将它类比为 Claude 产品线中的 Sonnet 定位——不是最强，但是最实用。
+
+### Luna：最快最低成本，延迟敏感场景
+
+Luna（月亮）是三档中速度最快、成本最低的选项，定位"fast and affordable everyday model"。$1 输入 / $6 输出的定价，面向实时聊天、大批量文本处理、快速分类等对延迟和成本双重敏感的场景。
+
+### 命名体系的工程意义
+
+Sol/Terra/Luna 这三个层级不是 GPT-5.6 专属，而是 OpenAI 未来产品线的**永久架构**。可以预见 GPT-5.7 发布时，同样会有 `gpt-5.7-sol`、`gpt-5.7-terra`、`gpt-5.7-luna`。开发者只需要记住层级语义，而不是不断翻文档确认哪个 model ID 是当前最优选。
+
+## 核心能力拆解
+
+### Long-Horizon Agentic Tasks
+
+GPT-5.6 全系列的核心卖点之一是对**长周期自主任务**的支持能力。这类任务要求模型在数十到数百步的工具调用序列中保持目标一致性，不走偏、不遗忘、不产生幻觉式的中间步骤。
+
+实际测试中，Sol 在需要持续推理的多步骤 Agent 场景（如"自动审查整个代码库并提交修复 PR"）上表现出明显优于 GPT-5.5 的稳定性，中途任务失败率显著降低。Terra 和 Luna 在 agentic 任务上也有提升，但复杂程度越高，与 Sol 的差距就越明显。
+
+> **💡 如果你在构建需要长时间运行的 AI Agent，Sol 是唯一真正值得认真考量的层级。**
+
+### Cybersecurity：强化能力 + 对应安全架构
+
+这是 GPT-5.6 最引人注意、也最有争议的能力提升方向。**漏洞研究和利用**被列为核心能力之一，并且有具体的基准数据支撑：
+
+- **ExploitBench**：Sol 成绩接近 Anthropic Mythos Preview（目前已知最强的安全评估模型），且 output tokens 使用量仅约 1/3。
+- **ExploitGym**：三档模型（Sol、Terra、Luna）随推理能力增强，均展示出更强的网络安全任务能力，说明这是系统性提升而非 Sol 单独的特性。
+
+OpenAI 同步声称部署了 **layered safeguard stack**（多层安全架构），专门针对网络攻击、生物武器等恶意使用设计防护。这也是美国政府评估期的核心关注点之一。
+
+从工程实践角度看，更强的安全审计和漏洞分析能力对红队测试、安全代码审查等合法场景有显著价值。
+
+### Software Engineering
+
+代码生成和代码理解是贯穿三档的核心能力，但层级差异明显体现在**复杂度阈值**上：
+
+- Sol：适合架构级代码生成、多文件重构、安全敏感代码审查
+- Terra：适合函数级代码补全、代码解释、一般复杂度的 PR 审查
+- Luna：适合单行补全、代码格式化、简单的语法问题解答
+
+### Computer Use
+
+全系列支持 Computer Use（操控计算机界面），这是继 Claude 之后 OpenAI 对 AI 自动化操控 UI 的正式商用支持。该能力通过 API 可用，但目前 Limited Preview 阶段的访问受限。
+
+## 竞品定价对比
+
+最直接的竞品对比是 Anthropic 的 Claude 系列。以下是 2026 年 6 月的价格快照：
+
+| 模型 | 定位 | 输入（/1M tokens） | 输出（/1M tokens） |
+|------|------|-------------------|-------------------|
+| GPT-5.6 Sol | 旗舰 | $5.00 | $30.00 |
+| GPT-5.6 Terra | 生产 | $2.50 | $15.00 |
+| GPT-5.6 Luna | 经济 | $1.00 | $6.00 |
+| Claude Opus 4.8 | 旗舰 | $15.00 | $75.00 |
+
+Claude Opus 4.8 的输入价格是 Sol 的 **3 倍**，输出价格是 Sol 的 **2.5 倍**。性价比差距相当显著。
+
+Opus 4.8 的核心优势是 **1M token 上下文窗口**，在需要处理超长文档（如完整代码库、长篇法律合同）的场景下，更大的上下文直接决定可用性，价格差距变成次要因素。但对于上下文需求在 200K tokens 以内的常规场景，Sol 的性价比优势明显。
+
+Terra 对应的竞品是 Claude Sonnet 系列。Terra $2.5 输入 / $15 输出的定价，在同级定位中相当有竞争力。
+
+> **⚠️ 价格数据以 OpenAI 和 Anthropic 官方文档为准，GA 后可能调整，决策前建议核查最新定价页面。**
+
+## API 迁移指南
+
+### Model ID 变更
+
+从 GPT-5.5 迁移到 GPT-5.6 系列只需要修改一处：`model` 参数字符串。
+
+| 原 Model ID | 迁移目标 | 场景 |
+|-------------|---------|------|
+| `gpt-5.5` | `gpt-5.6-sol` | 直接升级，保持同等定价 |
+| `gpt-5.5` | `gpt-5.6-terra` | 降本优化，能力略降 |
+| `gpt-4o-mini` | `gpt-5.6-luna` | 保持低成本，能力大幅提升 |
+
+### Python 代码示例
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+
+# Sol：旗舰层级，适合高复杂度任务
+response = client.chat.completions.create(
+    model="gpt-5.6-sol",
+    messages=[
+        {"role": "system", "content": "You are a security expert."},
+        {"role": "user", "content": "Analyze this codebase for security vulnerabilities."}
+    ]
+)
+
+# Terra：生产级，适合高并发工作负载
+response = client.chat.completions.create(
+    model="gpt-5.6-terra",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Extract key information from this document."}
+    ]
+)
+
+# Luna：经济型，适合实时、低延迟场景
+response = client.chat.completions.create(
+    model="gpt-5.6-luna",
+    messages=[
+        {"role": "user", "content": "Classify this customer message as positive or negative."}
+    ]
+)
+```
+
+API 结构与 GPT-5.5 完全兼容，`messages`、`temperature`、`max_tokens`、`tools` 等参数格式不变，迁移成本极低。
+
+### 提示缓存建议
+
+三档模型**均支持提示缓存（Prompt Caching）**。对于有固定长系统提示的生产应用，开启缓存后相同前缀的输入 token 成本可大幅降低。
+
+实践建议：
+- 将稳定的系统提示（角色定义、约束规则、知识库片段）放在 messages 开头
+- 保持系统提示内容稳定，避免在每次调用时动态修改前缀
+- 在 Terra 和 Luna 层级，缓存命中的成本收益更显著（绝对价格更低，缓存节省比例相同）
+
+```python
+# 长系统提示缓存示例：系统提示固定，用户消息动态变化
+SYSTEM_PROMPT = """
+你是一个专业的代码审查助手，专注于 Python 后端代码质量。
+审查时重点关注：安全漏洞、性能瓶颈、代码可读性、异常处理规范。
+输出格式：问题列表 + 严重程度评级（Critical/Major/Minor）+ 修复建议。
+""" * 10  # 假设实际场景中系统提示更长
+
+def review_code(code_snippet: str):
+    return client.chat.completions.create(
+        model="gpt-5.6-terra",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},  # 长前缀，触发缓存
+            {"role": "user", "content": f"请审查以下代码：\n\n{code_snippet}"}
+        ]
+    )
+```
+
+## 选型决策树
+
+根据场景特征，以下是三档模型的选型建议：
+
+### 选 Sol（`gpt-5.6-sol`）当……
+
+- 任务需要多步推理、持续 30 步以上的 Agent 执行
+- 安全代码审查、漏洞分析（合规红队测试）
+- 科学研究辅助、复杂数据分析
+- 架构设计、多文件代码重构
+- 对现有 GPT-5.5 业务做直接升级
+
+Sol 的关键优势不只是质量更高，而是在复杂任务上 **token 使用效率更高**。ExploitBench 数据显示，Sol 达到同等成绩只需竞品约 1/3 的 output tokens，这意味着实际单任务成本可能比账面价格更有竞争力。
+
+### 选 Terra（`gpt-5.6-terra`）当……
+
+- 高并发 API 生产环境，需要控制单请求成本
+- 文档处理、数据提取、结构化信息抽取
+- 客服 AI、工单分类、邮件摘要
+- 代码辅助（函数级、一般复杂度）
+- 从 GPT-4o 迁移，期望性能大幅提升的同时维持成本
+
+Terra 是"能干活"和"够便宜"之间取得最优平衡的层级，类似于产品线中的"主力型号"。对于大多数生产场景，Terra 的能力已经足够，选 Sol 属于过度投入。
+
+### 选 Luna（`gpt-5.6-luna`）当……
+
+- 实时对话应用，用户感知延迟直接影响体验
+- 大批量文本处理（每天数百万次以上的调用）
+- 快速分类、意图识别、路由判断
+- 日常助手功能（提醒、问答、简单摘要）
+- 成本极度敏感的场景，单次调用预算在 $0.001 以下
+
+Luna 的定价（$1/$6）比 GPT-4o mini 更有竞争力，同时能力基线大幅提升。从 GPT-4o mini 迁移到 Luna，几乎是无成本的质量升级。
+
+## 注意事项
+
+**当前状态：Limited Preview**
+
+截至 2026 年 6 月 27 日，GPT-5.6 系列处于 Limited Preview 阶段，仅向 OpenAI 选定的 **trusted partners** 开放，API 和 Codex 两个渠道可用，ChatGPT 界面暂不支持。没有公开的申请通道，普通开发者需要等待 GA。
+
+**预计 GA 时间**
+
+OpenAI 官方表示将在"数周内"向 ChatGPT、Codex 和 API 全面开放。考虑到美国政府 30 天评估期在 7 月 2 日结束，GA 最早可能在 7 月上旬。
+
+> **⚠️ 在 GA 之前，不要在生产计划中依赖 GPT-5.6 的可用性，Limited Preview 阶段的访问稳定性没有 SLA 保障。**
+
+**提示缓存的结算方式**
+
+提示缓存的折扣比例和结算方式请以 GA 后 OpenAI 官方文档为准，Preview 阶段的定价可能与 GA 版本存在差异。
+
+## 总结
+
+GPT-5.6 Sol/Terra/Luna 是 OpenAI 产品线最重要的一次架构重构：从线性版本迭代，转向"代际 + 层级"的矩阵式演进。**Sol 是性价比最高的旗舰升级**，与 GPT-5.5 同价却有显著能力提升；**Terra 是高并发生产的理性选择**；**Luna 把低成本场景的质量基线拉到了新高度**。
+
+等待 GA 落地，届时根据场景直接切换对应层级的 model ID，这一次迁移比以往任何一次都更简单。

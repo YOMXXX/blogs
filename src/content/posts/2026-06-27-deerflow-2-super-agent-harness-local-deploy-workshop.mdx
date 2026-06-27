@@ -1,0 +1,311 @@
+---
+title: "DeerFlow 2.0 实战：ByteDance 开源 Super Agent Harness 本地部署与自定义"
+description: "DeerFlow 2.0 是 ByteDance 开源的 Super Agent Harness，支持多 Agent 编排、沙箱代码执行和可扩展 Skills 系统，本文从零演示本地部署流程，并介绍如何自定义 Skill 扩展能力。"
+column: "workshop"
+tags: ["DeerFlow", "ByteDance", "AI-Agent", "open-source", "multi-agent"]
+pubDate: 2026-06-27
+featured: false
+tldr: "DeerFlow 2.0 是 ByteDance 开源的通用 Agent Harness（47K+ Star），把深度研究框架升级为完整的 AI 任务执行运行时，本文演示完整部署流程和自定义 Skill，让 AI 真正接管长周期任务。"
+author: "YOMXXX"
+faq:
+  - q: "DeerFlow 2.0 和 1.0 最大的区别是什么？"
+    a: "1.0 仅是深度研究框架，专注于信息收集和报告生成。2.0 完全重构为 Super Agent Harness，新增了沙箱代码执行、持久化内存、消息应用集成和可扩展 Skills 系统，处理范围从研究扩展到数据分析、内容自动化等全链路任务。"
+  - q: "DeerFlow 支持哪些 LLM 后端？"
+    a: "官方支持 OpenAI、Anthropic Claude、Google Gemini，并通过 Ollama 兼容本地模型（如 Qwen3、Mistral 等）。在 config.yaml 中修改 llm.model 字段即可切换，无需改动任何代码。"
+  - q: "DeerFlow 的 Skills 系统是什么原理？"
+    a: "每个 Skill 是结构化的 Markdown 文件，定义任务工作流、最佳实践和工具引用。Skills 按需加载而非全量预加载，让 Context 保持精简。你可以添加自定义 Skill 文件或覆盖内置 Skill 来扩展 DeerFlow 的能力。"
+  - q: "本地运行 DeerFlow 需要什么硬件配置？"
+    a: "使用云端 API 时对本机硬件要求极低，普通 8GB 内存的笔记本即可。若使用 Ollama 本地模型，运行 8B 量化模型建议至少 16GB 内存和 8GB 显存；运行 32B 以上模型建议 M2 Pro 以上或 RTX 4090 级别显卡。"
+  - q: "DeerFlow 和 Manus AI 相比有什么优势？"
+    a: "Manus 是商业闭源产品，DeerFlow 是 MIT 开源项目，代码完全可审计，数据不离开本机。Skills 系统使 DeerFlow 更易于扩展和定制，且可搭配任意模型（包括本地模型），长期总成本更低。"
+---
+
+## 引言：从研究工具到 Agent 运行时的进化
+
+2026 年 2 月，bytedance/deer-flow 一夜之间冲上 GitHub Trending 第一，单日新增 Star 破万，最终稳定在 47000+ 颗。彼时它还是一个偏向深度研究（Deep Research）的 Python 工具——给一个问题，自动搜索、整理、生成报告，像极了 OpenAI 的 Deep Research 功能的开源替代。
+
+但 2.0 版本的方向彻底变了。官方将其重新定位为 **Super Agent Harness**：一个通用的 AI Agent 执行运行时，而不只是报告生成器。新版引入了沙箱代码执行、持久化内存、消息应用集成和可扩展的 Skills 系统，让 DeerFlow 从"研究助理"进化成了"能干活的 Agent 基础设施"。
+
+本文以 workshop 风格展示完整的本地部署流程，以及如何通过自定义 Skill 让 DeerFlow 完成你业务场景中的专属任务。
+
+---
+
+## 架构解析：DeerFlow 2.0 的五层能力模型
+
+DeerFlow 2.0 的架构基于 **LangGraph + LangChain**，多个 Agent 节点在有向无环图中协作，由 Planner 统一调度。整体可以分为五层：
+
+### 第一层：多 Agent 编排
+
+核心 Agent 包括：
+
+- **Planner Agent**：任务分解器，接收用户指令后拆解为子任务，分配给下游 Agent
+- **Searcher Agent**：负责 Web Search 和 Web Crawling，获取外部信息
+- **Coder Agent**：在沙箱 Python 环境中运行代码，处理数据分析、图表生成等需要计算的步骤
+- **Report Generator**：整合所有 Agent 输出，生成结构化报告（支持 PDF/PPT）
+
+### 第二层：工具层
+
+每个 Agent 都可以按需调用工具。内置工具包括：Web Search（支持 Tavily/Bing/Google）、Web Crawling、Python Code Executor、文件读写。MCP Server 集成允许挂载第三方工具服务。
+
+### 第三层：Skills 系统
+
+Skills 是本次 2.0 最核心的新设计，详见下文专节介绍。
+
+### 第四层：持久化内存与 Context 压缩
+
+DeerFlow 2.0 内置了跨会话的持久化内存（基于向量检索），支持长任务执行时的状态保存。Context 压缩机制会对历史消息做摘要，避免长对话把 Token 窗口撑爆。
+
+### 第五层：前端与集成层
+
+官方提供了基于 Next.js 的 Web UI，支持实时流式输出、任务进度展示和结果下载。消息应用集成层支持 Slack、飞书等接入，可以作为企业内部 Bot。
+
+> **💡 选型提示：** 如果你只需要"问答 + 搜索"，DeerFlow 可能过重。它的价值在于需要跨工具、跨步骤、有代码执行需求的复杂任务自动化。
+
+---
+
+## 快速部署
+
+### 环境准备
+
+确认本机已安装：
+
+- **Python 3.11+**（推荐 3.12，避免部分依赖兼容问题）
+- **Node.js 20+** 和 **pnpm**（前端依赖管理）
+- **uv**（可选，比 pip 快很多）
+- **Git**
+
+```bash
+# 验证版本
+python --version   # Python 3.12.x
+node --version     # v20.x 或更高
+pnpm --version     # 9.x
+```
+
+如果本机还没有 uv，一行安装：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### 克隆仓库
+
+```bash
+git clone https://github.com/bytedance/deer-flow
+cd deer-flow
+```
+
+### 初始化配置
+
+DeerFlow 提供了 Makefile 快捷命令，一步生成配置文件模板：
+
+```bash
+make config
+```
+
+这条命令会在项目根目录生成 `.env` 和 `config.yaml` 两个文件。`.env` 存放 API Key，`config.yaml` 是主配置文件。
+
+> **⚠️ 注意：** `.env` 已在 `.gitignore` 中，不会被提交。但如果你 fork 了仓库，请务必再次确认 `.env` 未被跟踪。
+
+### 配置模型
+
+打开 `config.yaml`，核心字段如下。
+
+**方案一：使用 OpenAI / Claude / Gemini 云端 API**
+
+```yaml
+llm:
+  model: "gpt-4o"          # 或 "claude-opus-4-5"、"gemini-2.5-pro"
+  api_key: "${OPENAI_API_KEY}"  # 从 .env 读取
+  max_tokens: 8192
+
+search:
+  provider: "tavily"        # 推荐 Tavily，质量最稳定
+  api_key: "${TAVILY_API_KEY}"
+```
+
+对应的 `.env`：
+
+```bash
+OPENAI_API_KEY=sk-...
+TAVILY_API_KEY=tvly-...
+```
+
+**方案二：使用 Ollama 本地模型（零 API 费用）**
+
+先确保 Ollama 已安装并拉取模型：
+
+```bash
+# 安装 Ollama（macOS）
+brew install ollama
+
+# 拉取 Qwen3 8B 量化版（约 5GB）
+ollama pull qwen3:8b
+```
+
+然后修改 `config.yaml`：
+
+```yaml
+llm:
+  model: "ollama/qwen3:8b"
+  base_url: "http://localhost:11434"
+  max_tokens: 8192
+
+search:
+  provider: "tavily"
+  api_key: "${TAVILY_API_KEY}"
+```
+
+> **💡 提示：** 搜索工具仍然需要 Tavily API Key（免费 tier 每月 1000 次）。如果你只想完全离线，可以把 search.provider 改为 duckduckgo，但结果质量会下降。
+
+### 安装依赖并启动
+
+```bash
+# Python 后端依赖（推荐用 uv，快 10 倍）
+uv sync
+
+# 或者用 pip
+pip install -e ".[dev]"
+
+# 前端依赖
+cd web && pnpm install && cd ..
+```
+
+两个终端分别启动后端和前端：
+
+```bash
+# 终端 1：启动后端
+python main.py
+
+# 终端 2：启动前端
+cd web && pnpm dev
+```
+
+浏览器访问 `http://localhost:3000`，看到 DeerFlow 的 Chat UI 即为部署成功。后端默认监听 `8000` 端口，前端通过 Next.js 代理转发 API 请求。
+
+---
+
+## 第一个任务：竞品分析报告
+
+部署完成后，我们来跑一个实际任务：**生成一份 AI 代码助手的竞品分析报告**。
+
+在 Web UI 的输入框输入：
+
+```
+请对主流 AI 代码助手工具（Cursor、GitHub Copilot、WindSurf、Augment Code）进行竞品分析，
+重点对比：定价模式、上下文窗口大小、离线能力、企业版功能。
+最终生成一份结构化报告，包含对比表格和选型建议。
+```
+
+DeerFlow 会自动展开以下流程（可在 UI 的任务视图中实时观察）：
+
+1. **Planner** 将任务拆解为 4 个子任务（每个产品各一个搜索子任务 + 1 个汇总子任务）
+2. **Searcher** 并发搜索各产品的官网文档、定价页面和用户评测
+3. **Coder** 用 Python 整理原始数据，生成 Markdown 对比表
+4. **Report Generator** 将所有输出合并为完整报告，提供 PDF 下载链接
+
+整个过程在 GPT-4o 下通常耗时 3-5 分钟，Qwen3:8b 本地模型约 10-15 分钟。报告质量与模型能力正相关，复杂分析任务建议使用 70B 以上的模型。
+
+> **💡 技巧：** 在任务描述里加上"以 Markdown 表格形式对比"或"生成 PDF"等格式指令，Report Generator 会优先遵循这些约束。
+
+---
+
+## 自定义 Skill 扩展
+
+DeerFlow 的 Skills 系统是其最具差异化的特性。每个 Skill 是一个 Markdown 文件，存放在 `skills/` 目录下，告诉 Agent "如何完成这类任务"——包括工作流步骤、最佳实践、应该调用哪些工具。
+
+内置的 `skills/research.md` 大致结构如下：
+
+```markdown
+# Research Skill
+
+## Description
+Conduct thorough research on a given topic using web search and crawling.
+
+## Workflow
+1. Decompose the research question into 3-5 sub-questions
+2. Search each sub-question independently
+3. Crawl top 3 results per search query
+4. Synthesize findings into a structured summary
+
+## Best Practices
+- Prefer primary sources (official docs, papers) over secondary sources
+- Cross-validate facts from at least 2 sources
+- Note publication dates for time-sensitive information
+
+## Tools
+- web_search: initial discovery
+- web_crawl: full content extraction
+```
+
+现在我们来写一个**财务报告分析**的自定义 Skill。在 `skills/` 目录下新建 `financial_analysis.md`：
+
+```markdown
+# Financial Analysis Skill
+
+## Description
+Analyze financial reports (10-K, 10-Q, earnings calls) and extract
+key metrics, trends, and risks.
+
+## Workflow
+1. Identify the company and reporting period from the user request
+2. Locate the source document (URL or uploaded file)
+3. Extract key financial metrics:
+   - Revenue, gross margin, operating income, net income
+   - YoY growth rates
+   - Free cash flow
+   - Debt-to-equity ratio
+4. Run Python code to calculate derived metrics and generate charts
+5. Identify top 3 risks mentioned in the report
+6. Produce a structured summary with a one-paragraph investment thesis
+
+## Best Practices
+- Always note the fiscal year end date
+- Convert all figures to the same currency (USD default)
+- Flag any restatements or accounting changes
+- Include page/section references for key claims
+
+## Tools
+- web_crawl: fetch the SEC filing or IR page
+- python_executor: calculate ratios and plot charts
+```
+
+保存后，重启 DeerFlow 后端（或等待热重载），即可在任务中直接引用这个 Skill：
+
+```
+请使用 Financial Analysis Skill 分析 NVIDIA 2026 Q1 财报，
+重点关注数据中心业务增速和毛利率变化趋势。
+```
+
+Planner 会自动识别并加载 `financial_analysis.md`，按其定义的工作流执行任务，而不需要在 System Prompt 中塞入冗长的分析步骤说明。这就是按需加载的精髓——Context 只在需要时才膨胀。
+
+> **💡 进阶用法：** 你也可以在 Skill 文件里引用 MCP Server，例如 `- mcp://your-server/tool-name`，让 Skill 调用你自己部署的内部 API 工具。这种方式适合企业内网数据的私有 Agent 场景。
+
+---
+
+## 生产部署注意事项
+
+如果你打算在团队内部或生产环境使用 DeerFlow，以下几点需要提前规划：
+
+**1. 沙箱安全**
+
+Coder Agent 默认在本机 Python 环境执行代码，没有额外隔离。生产环境建议使用 Docker 沙箱：在 `config.yaml` 中设置 `sandbox.type: docker`，DeerFlow 会把代码执行限制在一次性容器内，避免恶意指令影响宿主机。
+
+**2. API 限速与成本控制**
+
+多 Agent 并发搜索会快速消耗 Search API 配额。建议在 `config.yaml` 的 `search.max_results` 字段限制每次搜索的返回条数（默认 5，生产可设为 3），同时在 `llm.max_tokens` 设置合理上限，防止单任务超支。
+
+**3. 持久化存储**
+
+默认的内存后端是 SQLite，适合单机测试。多实例或高并发场景需要切换到 PostgreSQL，在 `config.yaml` 的 `memory.backend` 字段指定连接字符串即可。
+
+**4. 反向代理**
+
+前端 Next.js 开发服务器不适合生产。建议 `pnpm build && pnpm start` 跑生产构建，前面挂 Nginx 做 HTTPS 终止和访问控制。
+
+---
+
+## 总结
+
+DeerFlow 2.0 的核心价值在于：**把分散的 Agent 能力统一成一个可观测、可扩展、可本地化的运行时**。它不是 ChatGPT 的替代品，而是一套基础设施，适合需要跨工具、多步骤、有代码执行需求的复杂任务自动化。Skills 系统让它在不同业务场景之间切换变得廉价——写一个 Markdown 文件，而不是修改底层 Prompt 或重新训练模型。
+
+如果你的团队有大量重复性分析工作（竞品调研、财报整理、数据清洗），DeerFlow 2.0 值得认真评估。起点是 `git clone`，代价只是几小时的部署时间。
