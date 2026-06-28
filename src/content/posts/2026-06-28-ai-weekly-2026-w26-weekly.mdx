@@ -1,0 +1,121 @@
+---
+title: "AI 周报 2026-W26：Composer 2 自研编程模型 / Gemini 3.5 Pro 延期 / Qwen-AgentWorld / Agent 记忆系统评估"
+description: "2026 年第 26 周 AI 要点速览：Cursor 发布 Composer 2 编程专用模型、Google 延期 Gemini 3.5 Pro、阿里 Qwen-AgentWorld 语言世界模型开源、Agent 记忆系统系统性评估报告，以及 LLM 可观测性工具的成熟。"
+column: "weekly"
+tags: ["AI-weekly", "weekly-roundup", "Composer2", "Gemini", "Qwen-AgentWorld", "agent-memory", "LLM-observability"]
+pubDate: 2026-06-28
+featured: false
+tldr: "本周 AI 领域：Cursor Composer 2 基于 Kimi K2.5 MoE 在 SWE-bench 多语言达到 73.7%；Google Gemini 3.5 Pro 延至 7 月发布；Qwen 团队开源语言世界模型 Qwen-AgentWorld；arXiv 系统评估 12 个 agent 记忆架构发现无一统治所有场景；LLM 可观测性平台竞争进入成熟期。"
+author: "YOMXXX"
+faq:
+  - q: "本周最值得开发者关注的一件事是什么？"
+    a: "Cursor Composer 2 的发布。它改变了 AI 编程工具的竞争格局：从「谁能接入最好的通用大模型」转向「谁能训练最好的领域专用编程模型」。Composer 2 的 SWE-bench 多语言 73.7% 达到旗舰通用模型水平，且捆绑在 Cursor 订阅中免费使用，对重度 agentic 用户是显著的性价比提升。"
+  - q: "Gemini 3.5 Pro 延期对使用 Google AI 的开发者有什么影响？"
+    a: "短期影响有限——Gemini 3.5 Flash 已于 5 月发布，大多数成本敏感场景已可使用。延期意味着依赖 3.5 Pro 长上下文 agent 能力的团队需要继续使用 Claude Opus 4.8 或 GPT-5.5 作为主力。对已购买 Google Cloud 企业协议的团队，建议关注 7 月发布后的 agent 基准对比。"
+  - q: "Qwen-AgentWorld 的开源权重能在本地运行吗？"
+    a: "35B-A3B（MoE 激活约 3B 参数）版本可以在 2 张 A100 80G 上运行，量化后甚至可在 RTX 4090 集群上测试。397B 版本需要企业级 GPU 集群。HuggingFace 已有完整权重和推理代码，GitHub 仓库 QwenLM/Qwen-AgentWorld 包含示例脚本。"
+  - q: "Agent 记忆系统评估报告的主要结论是什么？"
+    a: "arXiv 2606.24775 系统评估了 12 个 agent 记忆系统，核心结论是：没有单一记忆架构能在所有任务类型上胜出。向量检索对跨会话事实性好，图结构对关系推理好，数据库式记忆对程序性任务好。选择记忆系统应匹配工作负载瓶颈，而非跟风选择最新方案。"
+  - q: "本周有哪些值得跟进的 arXiv 论文？"
+    a: "除了 Qwen-AgentWorld（2606.24597）和 Agent Memory（2606.24775），还推荐：「Progress Advantage for LLM Agents」（2606.26080，分析 agent 成功的预测信号）、「Semantic Consistency Policy Optimization」（2606.25852，改进 LLM agent 强化学习训练），以及「Manipulation Is Task-Dependent」（2606.25899，多维度评估前沿 LLM 的操控行为）。"
+---
+
+本周（2026 年 6 月 22-28 日）AI 领域的信号密度较高：有一个改变 AI 编程工具格局的产品发布，一个揭示大模型竞争新逻辑的延期事件，两篇值得深读的 arXiv 论文，以及一个工具生态成熟的标志性节点。
+
+---
+
+## 1. Cursor Composer 2：编程模型进入专用化时代
+
+**核心事件**：Cursor 发布技术报告（arXiv 2603.24477），详细披露 Composer 2 的训练过程——基于 Kimi K2.5 Mixture-of-Experts 架构专项微调，在 SWE-bench Multilingual 达到 73.7%、Terminal-Bench 达到 61.7%。
+
+**为什么重要**：这是 AI 编程工具从"调用前沿 API"转向"自研领域专用模型"的标志性事件。Cursor 面临的压力是真实的：Claude Opus 4.6 的 per-token 成本让重度 agentic 用户的月均 API 支出很快超过订阅费。Composer 2 以捆绑订阅的形式解决了这个问题，同时在 agentic 代码任务上的性能与旗舰通用模型持平。
+
+**给开发者的启示**：如果你是 Cursor Pro 用户且重度使用 Composer 功能，切换到 Composer 2 是一个无成本的显著升级。在 Cursor 设置 → Models 中即可切换。非 Cursor 用户则要注意这一趋势：IDE 厂商开始构建自己的模型护城河，未来"最好的编程 AI"可能不再是通用大模型排行榜上的第一名。
+
+**延伸阅读**：[Cursor Composer 2 技术报告](https://arxiv.org/abs/2603.24477)，本周本站 workshop 专文：「Cursor Composer 2 实战：用 Kimi K2.5 MoE 驱动的 Agentic 编程模型」
+
+---
+
+## 2. Gemini 3.5 Pro 延期至 7 月：agent 能力成为新的发布门槛
+
+**核心事件**：Google 将 Gemini 3.5 Pro 从 6 月推迟到 7 月，原因是内测中 agent 任务表现未达预期，需要更多时间调整。
+
+**数字背后**：Gemini 3.5 Flash（5 月已发布）在 WebArena 上约 58%，而 Claude Opus 4.8 约 68%、GPT-5.5 约 65%。对 Google 旗舰模型 Pro 版本而言，这个差距不可接受。延期是为了把短板补上再面对市场。
+
+**更大的含义**：这标志着大模型竞争的判断标准已经迁移——2023 年看 MMLU，2024 年看 MMLU+代码，2026 年看多步骤 agent 任务成功率。通用基准不再是发布的充分条件，必须在 agent 场景下"能用"才算合格。
+
+**7 月值得关注的问题**：
+- Gemini 3.5 Pro 的 SWE-bench 和 WebArena 成绩能否追平 Claude Opus 4.8？
+- 2M token 长上下文在 agent 场景下的实际表现（vs. Claude 的 200k）
+- 推理 API 定价是否有竞争力
+
+---
+
+## 3. Qwen-AgentWorld：用 LLM 「想象」环境来训练 Agent
+
+**论文**：Qwen-AgentWorld: Language World Models for General Agents（arXiv 2606.24597，阿里 Qwen 团队）
+
+**核心思路**：与其在真实环境中收集训练数据（慢、贵、不可重置），不如训练一个 LLM 来**预测环境如何响应 agent 动作**，再用这个"语言世界模型"（LWM）来训练 agent。
+
+**最有趣的发现**：经过 LWM warm-up 的模型，即使不做任何 agent 任务专项微调，在 agentic 基准上的零样本性能就有显著提升（WebArena +6.8%）。这说明"理解环境如何响应动作"本身就是有效的 agent 能力预热。
+
+**实际意义**：
+- 35B-A3B MoE 版本已在 HuggingFace 开源，可本地部署
+- AgentWorldBench 涵盖 7 种数字环境，是评估通用 agent 能力的新基准
+- 为后续的 agent 训练研究提供了高质量的语言世界模型基础
+
+---
+
+## 4. 12 个 Agent 记忆系统系统性评估：没有赢家
+
+**论文**：Are We Ready For An Agent-Native Memory System?（arXiv 2606.24775）
+
+**背景**：随着 agent 从"单次对话"演进为"长期运行的任务执行者"，记忆系统变得关键——如何跨会话保存信息、如何检索历史上下文、如何更新/遗忘旧知识？
+
+**核心发现**：
+- 评估了 12 个主流 agent 记忆架构（向量数据库、图结构、数据库式、混合式等）
+- **没有单一架构能在所有任务类型上胜出**
+- 不同记忆架构对不同工作负载有不同优势：
+  - 向量检索：跨会话事实性（MemoryAgentBench）
+  - 图结构：多跳关系推理（DB-Bench 中的关联查询）
+  - 数据库式：程序性任务（LifelongAgentBench 的操作序列）
+- 建议：先分析工作负载瓶颈（是跨会话事实检索？是关系推理？是程序执行？），再选记忆架构
+
+**工程意义**：如果你正在为 agent 系统设计记忆层，这篇论文是目前最系统的对比资源。避免跟风选择"最新"的记忆方案，应该根据实际任务类型做决策。
+
+---
+
+## 5. LLM 可观测性进入成熟期
+
+本周没有单一的"大新闻"，但几个信号合在一起说明 LLM 可观测性生态已经成熟：
+
+- **Future AGI** 开源 SDK 新增对 13 种 guardrail 后端的支持，包括 Qwen3Guard 和 Granite Guardian 系列
+- **Arize Phoenix** CLI 发布，终端直接查询 trace 数据，与 Cursor 和 Claude Code 的工作流集成更自然
+- **Langfuse 被 Clickhouse 收购**（1 月事件，本周有更多用户反馈）：对数据主权有要求的团队需要关注架构变化，其他团队影响暂时有限
+- **Confident AI** 发布了多轮对话 eval 的新 `TaskCompletionMetric`，专门评估 agent 是否"完成了用户真正的意图"而非只看单次响应质量
+
+**信号解读**：当可观测性工具都在迭代"更细粒度的 agent 追踪"和"更自动化的评估"，说明开发者已经越过"让 LLM 能用"的阶段，进入"让 LLM 在生产环境中可靠运行并持续改进"的阶段。这是整个行业成熟的标志。
+
+---
+
+## 本周值得读的论文
+
+| 论文 | 核心价值 | arXiv ID |
+|------|---------|---------|
+| Qwen-AgentWorld | 语言世界模型统一 agent 训练环境 | 2606.24597 |
+| Agent-Native Memory System | 12 个记忆架构系统评估 | 2606.24775 |
+| Progress Advantage for LLM Agents | 分析 agent 逐步成功的预测信号 | 2606.26080 |
+| Semantic Consistency Policy Optimization | 改进 LLM agent 的 RL 训练稳定性 | 2606.25852 |
+| Manipulation Is Task-Dependent | 多维度评估前沿 LLM 的操控行为 | 2606.25899 |
+
+---
+
+## 下周展望
+
+- **Gemini 3.5 Pro**：7 月目标发布，关注 agent 基准数字和定价策略
+- **ACL 2026**（7 月 2-7 日，圣迭戈）：NLP 最大学术会议，预计有大量 LLM 对齐和 agent 推理的最新研究亮相
+- **Kimi K2.5 API 公测**：Moonshot AI 的 MoE 旗舰模型是否会直接开放 API，将影响 Composer 2 的竞争格局
+
+---
+
+*本期周报覆盖时间：2026 年 6 月 22 日至 28 日。*
