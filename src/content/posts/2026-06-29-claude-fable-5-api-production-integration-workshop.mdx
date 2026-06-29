@@ -1,0 +1,369 @@
+---
+title: "Claude Fable 5 API 生产集成实战：refusal 处理、回退机制与迁移指南"
+description: "详解 claude-fable-5 API 的 stop_reason refusal 新字段、Opus 4.8 安全分类器回退逻辑、计费规则与生产迁移最佳实践，附完整 TypeScript 与 Python 示例代码。"
+column: "workshop"
+tags: ["Claude", "Fable-5", "Anthropic", "API", "LLM", "agent"]
+pubDate: 2026-06-29
+featured: false
+tldr: "claude-fable-5 于 6 月 9 日上线，带来全新 stop_reason: refusal 机制——安全分类器触发时回退 Opus 4.8，HTTP 返回 200 而非错误。生产集成必须处理这一新状态，本文给出完整代码和迁移清单。"
+author: "YOMXXX"
+faq:
+  - q: "claude-fable-5 和 claude-mythos-5 有什么区别？"
+    a: "两者底层模型完全相同，区别在于访问权限和安全机制。Fable 5 是公开版本，内置安全分类器，会对网络安全、生物化学、模型蒸馏等敏感请求进行过滤，触发时回退 Opus 4.8。Mythos 5 不含这些分类器，但仅限受邀的 Project Glasswing 合作方访问。"
+  - q: "stop_reason: refusal 和普通错误有什么不同？"
+    a: "refusal 是一个成功响应（HTTP 200），不是错误（4xx/5xx）。这意味着你的错误处理逻辑不会捕获它，必须在正常响应流中显式检查 stop_reason 字段。如果不处理，应用会把空内容当成正常回复展示给用户。"
+  - q: "触发安全分类器回退后计费如何？"
+    a: "输入 token 按 Fable 5 价格计费，输出 token 按实际处理的模型（Fable 5 或 Opus 4.8）计费。如果被回退到 Opus 4.8，输出部分按 Opus 4.8 价格计，通常比 Fable 5 贵。Anthropic 在响应中通过 model 字段告知实际使用的模型。"
+  - q: "有哪些方法可以减少不必要的 refusal？"
+    a: "主要有三种：一是调整系统提示，明确说明使用场景（如「用于企业安全审计」）；二是检查请求措辞，避免触发关键词（如直接说「修复漏洞」而非「利用漏洞」）；三是升级为 Project Glasswing 访问 Mythos 5（需 Anthropic 审批）。对于合法的安全研究场景，Anthropic 也提供了申请豁免的流程。"
+  - q: "从 claude-opus-4-8 迁移到 claude-fable-5 需要改哪些地方？"
+    a: "必须改的有两处：一是把 model 字段从 claude-opus-4-8 改为 claude-fable-5；二是在响应处理中加入 stop_reason === 'refusal' 的判断分支。可选优化包括：检查实际返回的 model 字段以追踪回退率、在监控中记录 refusal 事件、为终端用户准备友好的回退提示文案。"
+---
+
+Anthropic 于 2026 年 6 月 9 日正式发布 Claude Fable 5（`claude-fable-5`），这是目前公开可用的最强 Claude 模型，在 SWE-Bench Pro 上得分 80.3%，超越此前的 Opus 4.8（69.2%）和 GPT-5.6 Sol（74.1%）。
+
+但 Fable 5 带来的不只是性能提升。它引入了一套全新的**安全分类器机制**，会在检测到敏感请求时静默切换到 Opus 4.8 处理，并通过一个之前从未出现过的 `stop_reason` 值通知开发者。如果你在生产系统中直接把 `claude-opus-4-8` 替换成 `claude-fable-5`，极有可能在某些场景下出现静默的空响应——因为现有的错误处理代码根本不认识 `refusal`。
+
+本文系统梳理这套新机制的工作原理，并给出完整的生产集成代码。
+
+## 性能基准速览
+
+迁移之前先看看值不值得。以下是 Fable 5 在核心基准上的表现：
+
+| 基准 | Fable 5 | Opus 4.8 | GPT-5.5 |
+|------|---------|---------|---------|
+| SWE-Bench Pro | **80.3%** | 69.2% | 58.6% |
+| Terminal-Bench 2.1 | **72.1%** | 61.4% | 67.8% |
+| FrontierCode | **85.7%** | 74.3% | 79.2% |
+| Cursor Benchmark | **72.9%** | 61.8% | 68.4% |
+
+对于长上下文 agent 工作流，Fable 5 的提升是全面性的。迁移的代价是需要处理新的安全机制。
+
+## 安全分类器的工作原理
+
+Fable 5 内置三类安全分类器，覆盖以下领域：
+
+- **网络安全**（cybersecurity）：漏洞利用、渗透测试、恶意代码生成
+- **生物化学**（bio/chem）：危险物质合成、病原体改造
+- **模型蒸馏**（model distillation）：尝试从 Fable 5 提取知识用于训练其他模型
+
+当请求触发分类器时，系统会：
+
+1. 把请求转给 `claude-opus-4-8` 处理
+2. 在响应的 `stop_reason` 字段填入 `"refusal"`
+3. 在响应的 `model` 字段标注实际使用的模型（`claude-opus-4-8`）
+4. 返回 HTTP 200 ——**不是错误**
+
+根据 Anthropic 的数据，在正常 SaaS 应用场景下，触发率**低于 5%**。但安全工具、研究助手、代码审计平台等场景可能显著更高。
+
+## 代码：TypeScript 集成
+
+### 基础响应处理
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+interface CompletionResult {
+  content: string;
+  wasRefused: boolean;
+  actualModel: string;
+}
+
+async function callFable5(
+  messages: Anthropic.MessageParam[],
+  systemPrompt?: string
+): Promise<CompletionResult> {
+  const response = await client.messages.create({
+    model: "claude-fable-5",
+    max_tokens: 8096,
+    system: systemPrompt,
+    messages,
+  });
+
+  const wasRefused = response.stop_reason === "refusal";
+  const actualModel = response.model;
+  const content = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => (block as Anthropic.TextBlock).text)
+    .join("");
+
+  if (wasRefused) {
+    // 记录监控指标
+    console.warn(`[Fable5] Refusal triggered. Actual model: ${actualModel}`);
+  }
+
+  return { content, wasRefused, actualModel };
+}
+```
+
+### 带回退提示的用户界面处理
+
+```typescript
+async function handleUserMessage(userInput: string): Promise<string> {
+  const result = await callFable5([
+    { role: "user", content: userInput },
+  ]);
+
+  if (result.wasRefused) {
+    // 不要把空内容直接展示给用户
+    // Anthropic 已经回退到 Opus 4.8，内容可能仍有价值
+    // 但要告知用户这个请求经过了不同路径
+    return result.content || "该请求经过了安全审查，请重新描述您的需求。";
+  }
+
+  return result.content;
+}
+```
+
+### 生产级带重试和监控的实现
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+
+interface FableMetrics {
+  totalRequests: number;
+  refusalCount: number;
+  refusalRate: number;
+}
+
+class Fable5Client {
+  private client: Anthropic;
+  private metrics: FableMetrics = {
+    totalRequests: 0,
+    refusalCount: 0,
+    refusalRate: 0,
+  };
+
+  constructor(apiKey: string) {
+    this.client = new Anthropic({ apiKey });
+  }
+
+  async complete(
+    messages: Anthropic.MessageParam[],
+    options: {
+      system?: string;
+      maxTokens?: number;
+      onRefusal?: (actualModel: string) => void;
+    } = {}
+  ): Promise<{ text: string; refusal: boolean }> {
+    this.metrics.totalRequests++;
+
+    const response = await this.client.messages.create({
+      model: "claude-fable-5",
+      max_tokens: options.maxTokens ?? 8096,
+      system: options.system,
+      messages,
+    });
+
+    const isRefusal = response.stop_reason === "refusal";
+
+    if (isRefusal) {
+      this.metrics.refusalCount++;
+      this.metrics.refusalRate =
+        this.metrics.refusalCount / this.metrics.totalRequests;
+      options.onRefusal?.(response.model);
+    }
+
+    const text = response.content
+      .filter((b) => b.type === "text")
+      .map((b) => (b as Anthropic.TextBlock).text)
+      .join("");
+
+    return { text, refusal: isRefusal };
+  }
+
+  getMetrics(): FableMetrics {
+    return { ...this.metrics };
+  }
+}
+```
+
+## 代码：Python 集成
+
+```python
+import anthropic
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class FableResponse:
+    content: str
+    was_refused: bool
+    actual_model: str
+
+def call_fable5(
+    messages: list[dict],
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 8096,
+) -> FableResponse:
+    client = anthropic.Anthropic()
+    
+    kwargs = {
+        "model": "claude-fable-5",
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if system_prompt:
+        kwargs["system"] = system_prompt
+    
+    response = client.messages.create(**kwargs)
+    
+    was_refused = response.stop_reason == "refusal"
+    actual_model = response.model
+    content = "".join(
+        block.text for block in response.content
+        if block.type == "text"
+    )
+    
+    if was_refused:
+        print(f"[Fable5] Refusal triggered. Actual model: {actual_model}")
+    
+    return FableResponse(
+        content=content,
+        was_refused=was_refused,
+        actual_model=actual_model,
+    )
+
+
+# 示例：代码审查助手
+def code_review(code: str, language: str = "python") -> str:
+    result = call_fable5(
+        messages=[
+            {
+                "role": "user",
+                "content": f"请对以下 {language} 代码进行安全审查，找出潜在漏洞：\n\n```{language}\n{code}\n```",
+            }
+        ],
+        system_prompt="你是一名资深安全工程师，专注于代码审查和漏洞发现。",
+    )
+    
+    if result.was_refused:
+        # 回退到 Opus 4.8，内容依然有效
+        return f"[安全路由] {result.content}"
+    
+    return result.content
+```
+
+## Streaming 流式响应中的 refusal
+
+流式响应有所不同——`stop_reason` 出现在最终的 `message_delta` 事件中：
+
+```typescript
+async function streamFable5(messages: Anthropic.MessageParam[]) {
+  const stream = await client.messages.stream({
+    model: "claude-fable-5",
+    max_tokens: 8096,
+    messages,
+  });
+
+  let fullText = "";
+  
+  for await (const event of stream) {
+    if (event.type === "content_block_delta" && 
+        event.delta.type === "text_delta") {
+      fullText += event.delta.text;
+      process.stdout.write(event.delta.text);
+    }
+    
+    if (event.type === "message_delta") {
+      if (event.delta.stop_reason === "refusal") {
+        console.warn("\n[Fable5] Stream ended with refusal");
+        // 注意：被拒绝的流可能包含部分 Opus 4.8 输出
+      }
+    }
+  }
+  
+  return fullText;
+}
+```
+
+## 从 Opus 4.8 迁移的完整清单
+
+### 必须修改
+
+- [ ] `model: "claude-opus-4-8"` → `model: "claude-fable-5"`
+- [ ] 在响应处理中添加 `stop_reason === "refusal"` 检查分支
+- [ ] 确保 refusal 时不展示空内容给用户
+
+### 建议优化
+
+- [ ] 记录 `response.model` 字段，追踪实际使用模型分布
+- [ ] 在监控系统中添加 `refusal_rate` 指标
+- [ ] 为终端用户准备清晰的回退提示文案
+- [ ] 对于安全/研究场景，评估是否需要申请 Project Glasswing 访问
+
+### 不需要修改
+
+- [ ] API 端点地址（不变）
+- [ ] 鉴权方式（不变）
+- [ ] 上下文窗口大小（200K，与 Opus 4.8 相同）
+- [ ] 工具调用（tool use）格式（不变）
+- [ ] 系统提示格式（不变）
+
+## 计费规则详解
+
+Fable 5 的定价与 Mythos Preview 相同。触发回退时：
+
+```
+总费用 = 输入 token × Fable5输入单价
+       + 输出 token × 实际模型输出单价
+```
+
+如果回退到 Opus 4.8，输出部分按 Opus 4.8 的价格计，**通常比 Fable 5 贵**。这意味着高 refusal 率会同时影响体验和成本。建议在初始阶段对 refusal 率做好监控。
+
+## 系统提示优化减少误触发
+
+安全分类器基于意图判断，系统提示中的上下文非常关键：
+
+```typescript
+// 较差：缺乏上下文，容易误触发
+const systemPrompt = "你是一个安全专家，帮助用户发现系统漏洞。";
+
+// 较好：明确使用场景
+const systemPrompt = `你是一名企业内部安全工程师，为公司内部代码审计团队服务。
+你的任务是对公司自有代码库进行漏洞扫描和修复建议，不涉及对外部系统的渗透测试。
+所有分析结果仅用于内部安全加固。`;
+```
+
+明确的使用场景声明可以显著降低合法安全工作流的误触发率。
+
+## Agent 工作流中的注意事项
+
+在多步 agent 工作流中，refusal 的影响更复杂：
+
+```typescript
+async function agentLoop(task: string) {
+  const messages: Anthropic.MessageParam[] = [
+    { role: "user", content: task }
+  ];
+  
+  while (true) {
+    const result = await callFable5(messages);
+    
+    if (result.wasRefused) {
+      // 选项 1：中止当前任务
+      throw new Error("Task involves restricted content, aborting.");
+      
+      // 选项 2：记录并继续（Opus 4.8 的输出仍然有效）
+      // console.warn("Step refused, continuing with Opus 4.8 output");
+    }
+    
+    // 检查是否需要使用工具
+    // 检查是否任务完成
+    // ...
+    
+    messages.push({ role: "assistant", content: result.content });
+    break; // 简化示例
+  }
+}
+```
+
+对于长 agent 链，建议在任务级别（而非单步级别）决定如何处理 refusal，避免部分完成的任务产生不一致的状态。
+
+## 小结
+
+Claude Fable 5 是目前公开可用性能最强的 Claude 模型，对于代码生成、复杂推理和 agent 工作流都值得升级。迁移的核心工作只有两步：把 model ID 改成 `claude-fable-5`，以及在响应处理中加入 `stop_reason === "refusal"` 的判断。
+
+如果你的应用涉及安全工具或研究场景，额外考虑监控回退率和申请 Project Glasswing 访问权限。回退到 Opus 4.8 不是失败——那是 Anthropic 设计的安全机制，Opus 4.8 的输出在大多数场景下依然高质量。
