@@ -1,0 +1,229 @@
+---
+title: "TencentDB Agent Memory 实战：给多智能体系统加一层可审计记忆"
+description: "围绕 GitHub 热门项目 TencentDB Agent Memory，演示如何为多智能体应用设计可检索、可压缩、可审计的记忆层，并给出 TypeScript 接口、写入策略、检索策略和生产落地清单。"
+column: "workshop"
+tags: ["TencentDB", "agent-memory", "RAG", "AI-agent", "TypeScript", "vector-search"]
+pubDate: 2026-08-04
+featured: false
+tldr: "Agent 记忆不是把聊天记录塞进向量库，而是要把事实、偏好、工具结果、失败经验和权限边界分层管理。本文用 TencentDB Agent Memory 的思路搭一个可运行的 TypeScript 记忆层骨架。"
+author: "YOMXXX"
+faq:
+  - q: "Agent Memory 和普通 RAG 有什么区别？"
+    a: "普通 RAG 主要检索外部知识文档，Agent Memory 还要记录任务过程、用户偏好、工具调用结果、错误经验和长期状态。它既服务回答质量，也服务任务连续性、审计和安全控制。"
+  - q: "为什么不能直接把所有对话写进向量库？"
+    a: "原始对话噪声高、重复多、权限边界混乱，检索时容易把过期信息和敏感信息带回上下文。生产系统应先抽取事实，再按作用域、置信度、过期时间和来源做结构化存储。"
+  - q: "TencentDB Agent Memory 适合什么团队关注？"
+    a: "适合已经有多智能体工作流、企业知识库、数据库基础设施和审计需求的团队。它的价值不只在向量检索，而在把数据库能力、记忆治理和 agent 运行时连接起来。"
+  - q: "记忆层需要实时更新吗？"
+    a: "短期记忆可以实时写入，长期记忆最好经过异步压缩和事实抽取。这样能避免一次临时对话污染长期画像，也能降低向量写入、重排和审计成本。"
+  - q: "如何判断一条记忆是否应该进入长期层？"
+    a: "至少看四点：是否会被未来任务复用，是否有明确来源，是否存在隐私或权限风险，是否有过期条件。不能满足这些条件的内容更适合停留在会话层或任务日志中。"
+---
+
+8 月初 GitHub Trending 里出现了一个很有代表性的方向：面向 agent 的数据库记忆层。以 [TencentCloud/TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) 为例，它的定位不是再做一个聊天历史工具，而是把数据库、检索、长期记忆和多 agent 协作放在同一个工程问题里处理。
+
+这件事值得写成实战，是因为 2026 年的 agent 系统已经不缺“会调用工具”的 demo，缺的是能连续工作、能解释自己为何这么做、能在团队环境下管住记忆边界的运行时基础设施。一个销售 agent 记住客户偏好，一个代码 agent 记住仓库约定，一个运维 agent 记住上次故障处置过程，这些听起来都像“上下文更长一点”就能解决，实际不是。长上下文能承载更多文本，但不会自动告诉你哪些事实可信、哪些经验已经过期、哪些信息不该被另一个 agent 看到。
+
+本文不假设读者必须绑定某一个数据库实现。我们会用 TencentDB Agent Memory 代表的“数据库原生记忆层”思路，搭一个可运行的 TypeScript 骨架：短期记忆进入会话层，长期事实进入结构化层，向量索引用于召回，审计日志用于解释。你可以把示例里的内存存储换成 TencentDB、PostgreSQL、TiDB、Milvus 或任何支持向量检索的后端。
+
+参考线索来自 GitHub Trending 的 TencentDB Agent Memory 项目、Hacker News 对 agent 工程化的讨论，以及近几个月 arXiv 上关于 agent memory、tool-use trace 和长期上下文退化的论文。
+
+## 先定义记忆模型
+
+最常见的错误是把 memory 当成一个字符串数组。生产里至少要拆成四类：
+
+| 类型 | 内容 | 生命周期 | 检索方式 |
+|------|------|----------|----------|
+| session | 当前对话、临时中间结果 | 分钟到小时 | 最近窗口 |
+| episodic | 某次任务发生了什么 | 天到月 | 时间和任务 ID |
+| semantic | 可复用事实、用户偏好、项目约定 | 月到年 | 向量加过滤 |
+| procedural | 工具使用经验、失败修复路径 | 长期 | 任务类型加相似检索 |
+
+这四类的写入策略不同。session 允许噪声，semantic 必须抽取事实，procedural 要绑定触发条件，episodic 要保留可审计来源。一个成熟的 agent memory 系统，真正的难点不在“存”，而在“何时写、写成什么、谁能读、何时失效”。
+
+下面先写一个最小可运行接口。代码只依赖 Node.js 内置能力，可以直接保存为 `memory-demo.ts` 后用 `tsx` 或 TypeScript 运行环境执行。
+
+```typescript
+type MemoryKind = "session" | "episodic" | "semantic" | "procedural";
+
+type MemoryRecord = {
+  id: string;
+  kind: MemoryKind;
+  scope: string;
+  text: string;
+  source: string;
+  confidence: number;
+  createdAt: number;
+  expiresAt?: number;
+  tags: string[];
+};
+
+type SearchQuery = {
+  scope: string;
+  text: string;
+  kind?: MemoryKind;
+  limit?: number;
+};
+
+class InMemoryAgentMemory {
+  private records: MemoryRecord[] = [];
+
+  async write(record: Omit<MemoryRecord, "id" | "createdAt">) {
+    const item: MemoryRecord = {
+      ...record,
+      id: crypto.randomUUID(),
+      createdAt: Date.now(),
+    };
+    this.records.push(item);
+    return item;
+  }
+
+  async search(query: SearchQuery) {
+    const now = Date.now();
+    const terms = new Set(query.text.toLowerCase().split(/\s+/));
+
+    return this.records
+      .filter((r) => r.scope === query.scope)
+      .filter((r) => !query.kind || r.kind === query.kind)
+      .filter((r) => !r.expiresAt || r.expiresAt > now)
+      .map((r) => {
+        const score = r.text
+          .toLowerCase()
+          .split(/\s+/)
+          .filter((word) => terms.has(word)).length;
+        return { ...r, score: score + r.confidence };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, query.limit ?? 5);
+  }
+}
+```
+
+这个 demo 没有向量化，但接口已经把生产约束露出来了：`scope` 用来隔离用户、团队或项目；`kind` 用来控制不同记忆类型；`confidence` 用来表达抽取质量；`expiresAt` 用来处理过期事实；`source` 用于审计。
+
+换成 TencentDB Agent Memory 这类数据库后，核心变化是两点：文本相似度由向量索引承担，`scope`、`kind`、`tags`、`expiresAt` 这些结构化字段由数据库过滤承担。不要只做向量召回，因为纯向量相似度无法可靠表达权限、时效和记忆类型。
+
+## 写入：不要把日志当记忆
+
+Agent 每一步都可以产生日志，但只有一小部分应该进入长期记忆。推荐写入路径如下：
+
+1. 工具调用和模型回复先进入 raw trace。
+2. 任务结束后由 summarizer 抽取候选事实。
+3. verifier 检查事实是否来自可靠来源。
+4. policy 决定作用域、过期时间和可见 agent。
+5. 通过 memory writer 写入长期层。
+
+下面是一个简单的“候选事实过滤器”。实际生产中可以把 `extractFacts` 换成 LLM 函数调用，把 `shouldPersist` 换成规则引擎或人工审核队列。
+
+```typescript
+type CandidateFact = {
+  text: string;
+  source: string;
+  confidence: number;
+  sensitive: boolean;
+  reusable: boolean;
+};
+
+function shouldPersist(fact: CandidateFact) {
+  if (fact.sensitive) return false;
+  if (!fact.reusable) return false;
+  if (fact.confidence < 0.75) return false;
+  if (fact.text.length < 12) return false;
+  return true;
+}
+
+async function persistFacts(
+  memory: InMemoryAgentMemory,
+  scope: string,
+  facts: CandidateFact[],
+) {
+  for (const fact of facts) {
+    if (!shouldPersist(fact)) continue;
+    await memory.write({
+      kind: "semantic",
+      scope,
+      text: fact.text,
+      source: fact.source,
+      confidence: fact.confidence,
+      tags: ["fact"],
+    });
+  }
+}
+```
+
+这里有一个重要经验：写入越宽松，检索越难调。很多团队一开始想“先都存下来，之后再清洗”，结果长期记忆层很快变成垃圾堆。更稳的路线是 raw trace 全量保留，但长期 memory 慎重写入；trace 是取证材料，memory 是运行时资产，两者不能混用。
+
+## 检索：先过滤，再相似，再压缩
+
+Agent 调用记忆时也不能简单 top-k。推荐三段式：
+
+1. 结构化过滤：限定 scope、kind、权限、过期时间。
+2. 相似召回：按任务描述、当前计划、用户请求做向量检索。
+3. 上下文压缩：把召回结果改写成模型能直接使用的事实清单。
+
+示例：
+
+```typescript
+async function buildMemoryContext(
+  memory: InMemoryAgentMemory,
+  scope: string,
+  task: string,
+) {
+  const facts = await memory.search({
+    scope,
+    text: task,
+    kind: "semantic",
+    limit: 4,
+  });
+
+  const procedures = await memory.search({
+    scope,
+    text: task,
+    kind: "procedural",
+    limit: 3,
+  });
+
+  return [
+    "可复用事实：",
+    ...facts.map((f) => `- ${f.text} 来源：${f.source}`),
+    "历史操作经验：",
+    ...procedures.map((p) => `- ${p.text} 来源：${p.source}`),
+  ].join("\n");
+}
+```
+
+在接入真实 LLM 时，把这个上下文放进 system 或 developer message 都可以，但要明确它是“可参考记忆”，不是不可挑战的真理。模型应该被允许质疑低置信度记忆，否则旧错误会反复进入新任务。
+
+## 多 agent 共享记忆的边界
+
+多 agent 系统最容易踩坑的是共享范围。假设你有 planner、coder、reviewer、deployer 四个 agent，它们不应该看到完全相同的记忆：
+
+| Agent | 应读记忆 | 不应读记忆 |
+|-------|----------|------------|
+| planner | 项目目标、约束、历史失败路径 | 凭据、用户私密对话 |
+| coder | 代码约定、API 设计、测试命令 | unrelated 用户画像 |
+| reviewer | 缺陷模式、发布规则、风险清单 | 临时草稿和低置信事实 |
+| deployer | 部署步骤、回滚流程、环境状态 | 不相关业务偏好 |
+
+数据库层应该支持至少两级作用域：租户级和任务级。更严谨的系统会加入 agent role 过滤，例如 `scope = tenant:acme/project:billing`，再加 `visibleTo = ["coder", "reviewer"]`。不要只依赖 prompt 告诉模型“不要看不该看的内容”，因为模型根本不应该收到这些内容。
+
+## 生产落地清单
+
+把 demo 推进生产前，建议按下面顺序补齐：
+
+| 能力 | 最小要求 | 原因 |
+|------|----------|------|
+| 幂等写入 | 同一事实不要重复写十次 | 降低检索噪声 |
+| 删除机制 | 用户、项目、任务可删除 | 合规和纠错 |
+| 过期策略 | 价格、状态、临时偏好必须过期 | 避免旧事实污染 |
+| 审计日志 | 每条记忆保留来源 trace | 解释和追责 |
+| 权限过滤 | 数据库查询阶段完成 | 防止 prompt 泄漏 |
+| 质量评估 | 离线回放 memory 命中率 | 判断是否真的有帮助 |
+
+实际评估时，不要只看“召回相似度”。更有价值的指标是：任务成功率是否提升，错误复发率是否下降，人工纠错次数是否减少，平均 token 成本是否可控。如果记忆层让 prompt 变长三倍，却只带来微弱收益，那它不是资产，是成本中心。
+
+## 小结
+
+TencentDB Agent Memory 这类项目的出现，说明 agent 工程正在从“模型能力秀”进入“状态管理基础设施”阶段。记忆层的目标不是让模型显得更懂用户，而是让系统在长周期任务中保持可复用、可审计、可删除、可隔离的上下文。
+
+实战上，最稳的设计是：raw trace 全量留存，长期记忆谨慎写入；检索时先做权限和时效过滤，再做语义召回；传给模型前压缩成事实清单；每条记忆都能追溯来源。做到这些，再换成 TencentDB、PostgreSQL 或专用向量库只是后端选择问题，系统边界已经清楚了。
