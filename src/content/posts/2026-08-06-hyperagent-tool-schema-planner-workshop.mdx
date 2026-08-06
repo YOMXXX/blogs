@@ -1,0 +1,217 @@
+---
+title: "HyperAgent 实战工坊：用工具 Schema 图减少 Agent 的盲目调用"
+description: "基于 arXiv 新论文 HyperAgent，手把手实现一个轻量工具 Schema 图规划器，把 API 输入输出关系显式化，减少 LLM Agent 在复杂工具链中的无效探索和重复调用。"
+column: "workshop"
+tags: ["HyperAgent", "tool-use", "agent-planning", "schema-graph", "TypeScript", "workflow"]
+pubDate: 2026-08-06
+featured: false
+tldr: "HyperAgent 的核心启发是：不要只把工具描述塞进提示词，而要把工具输入输出建成可查询的 Schema 图。开发者可以先实现轻量版规划器，让 Agent 在调用前知道缺什么、谁能生产、什么时候该停。"
+author: "YOMXXX"
+faq:
+  - q: "HyperAgent 适合什么类型的项目？"
+    a: "它适合工具数量多、输入输出依赖明显、任务需要多步执行的 Agent 项目，例如客服后台、数据分析助手、运维机器人和企业内部自动化系统。"
+  - q: "本文实现的是论文完整算法吗？"
+    a: "不是。本文实现的是工程可落地的轻量版本：用工具输入输出 Schema 建图、检索候选工具、生成任务 DAG，并在执行时检查缺失字段。"
+  - q: "为什么不用提示词直接描述所有工具？"
+    a: "工具少时可以直接描述；工具多时，模型容易漏读、重复调用或选错顺序。Schema 图把依赖关系显式化，可以减少无效探索。"
+  - q: "这个方法会不会限制模型灵活性？"
+    a: "会限制一部分自由探索，但这是生产系统需要的约束。模型仍然负责理解任务和填补语义决策，图结构负责处理确定性的输入输出依赖。"
+  - q: "如何判断 Schema 图是否建对了？"
+    a: "可以用历史任务轨迹回放验证：检查计划中的每条边是否真的传递了字段，是否减少重复 API 调用，以及失败时是否能指出缺失字段。"
+---
+
+今天 arXiv cs.AI 新论文里，HyperAgent 是一个很适合开发者拆成工程实践的题目。论文提出的方向很直接：工具型 LLM Agent 不应该只靠模型在自然语言工具说明里“想象”调用顺序，而应该把工具之间的输入输出关系建成 Tool-Schema Hypergraph，再由图结构辅助规划和执行。arXiv 摘要显示，HyperAgent 会从任务中抽取相关工具上下文图，构造 schema-aware Task DAG，并在执行时根据当前状态做 deficit-oriented expansion，也就是围绕缺失字段寻找能提供支持的工具。
+
+这篇工坊不复刻完整论文系统，而是实现一个足够实用的轻量版。目标是让你在自己的 Agent 项目里先得到三个收益：知道任务需要哪些字段，知道哪些工具能生产这些字段，知道什么时候不该继续盲目重试。
+
+## 设计目标
+
+我们先定义一个最小工具模型。每个工具都有输入 Schema、输出 Schema 和执行函数。这里的 Schema 不需要一开始就接入完整 JSON Schema，先用字段名和类型就能做很多事。
+
+```typescript
+type FieldType = "string" | "number" | "boolean" | "object" | "array";
+
+type ToolSchema = {
+  name: string;
+  description: string;
+  inputs: Record<string, FieldType>;
+  outputs: Record<string, FieldType>;
+  run: (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+};
+```
+
+假设我们要做一个电商运营 Agent，它可以查商品、查库存、改价格、生成促销建议：
+
+```typescript
+const tools: ToolSchema[] = [
+  {
+    name: "searchProduct",
+    description: "Find product by keyword",
+    inputs: { keyword: "string" },
+    outputs: { productId: "string", title: "string" },
+    run: async ({ keyword }) => ({ productId: "sku_1001", title: String(keyword) }),
+  },
+  {
+    name: "getInventory",
+    description: "Get inventory by product id",
+    inputs: { productId: "string" },
+    outputs: { stock: "number" },
+    run: async () => ({ stock: 18 }),
+  },
+  {
+    name: "getCompetitorPrice",
+    description: "Get competitor price by product title",
+    inputs: { title: "string" },
+    outputs: { competitorPrice: "number" },
+    run: async () => ({ competitorPrice: 129 }),
+  },
+  {
+    name: "updatePrice",
+    description: "Update product price",
+    inputs: { productId: "string", newPrice: "number" },
+    outputs: { updated: "boolean" },
+    run: async () => ({ updated: true }),
+  },
+];
+```
+
+传统 Agent 会把这些工具说明都塞给模型，让模型决定先后顺序。工具少时没问题；工具变成几十个以后，模型很容易先调用 `updatePrice`，然后才发现缺 `productId` 和 `newPrice`。Schema 图的作用，就是在执行前先做一次确定性检查。
+
+## Step 1：建立字段到工具的反向索引
+
+轻量版不需要真的实现超图，只要先建立“字段由谁生产”的索引。
+
+```typescript
+function buildProducerIndex(tools: ToolSchema[]) {
+  const index = new Map<string, ToolSchema[]>();
+
+  for (const tool of tools) {
+    for (const field of Object.keys(tool.outputs)) {
+      const producers = index.get(field) ?? [];
+      producers.push(tool);
+      index.set(field, producers);
+    }
+  }
+
+  return index;
+}
+```
+
+这个索引回答一个关键问题：当当前状态缺少 `productId` 时，哪些工具可能补上它？这是 deficit-oriented expansion 的工程版本。模型不再从所有工具里瞎选，而是在“缺什么”驱动下搜索。
+
+## Step 2：检查工具是否可执行
+
+每次调用工具前，都应该检查输入字段是否齐全。
+
+```typescript
+function missingInputs(tool: ToolSchema, state: Record<string, unknown>) {
+  return Object.keys(tool.inputs).filter((field) => state[field] === undefined);
+}
+
+function canRun(tool: ToolSchema, state: Record<string, unknown>) {
+  return missingInputs(tool, state).length === 0;
+}
+```
+
+这一步看似简单，但能拦住很多线上问题。Agent 失败日志里常见的模式是：工具参数由模型硬编，API 返回 400，模型换一种硬编方式再试。显式输入检查可以把失败提前到规划阶段，并把错误变成可读反馈。
+
+## Step 3：为目标字段生成候选计划
+
+假设用户任务是“把某个商品价格调整到比竞品低 5%”。最终工具需要 `productId` 和 `newPrice`，其中 `newPrice` 可以由模型根据 `competitorPrice` 推导。我们可以写一个简单递归规划器：
+
+```typescript
+type PlanStep = {
+  tool: string;
+  reason: string;
+};
+
+function planForField(
+  field: string,
+  state: Record<string, unknown>,
+  producers: Map<string, ToolSchema[]>,
+  seen = new Set<string>(),
+): PlanStep[] {
+  if (state[field] !== undefined) return [];
+  if (seen.has(field)) return [];
+
+  seen.add(field);
+  const candidates = producers.get(field) ?? [];
+  const tool = candidates[0];
+  if (!tool) return [];
+
+  const deps = Object.keys(tool.inputs).flatMap((input) =>
+    planForField(input, state, producers, seen),
+  );
+
+  return [
+    ...deps,
+    {
+      tool: tool.name,
+      reason: `produce ${field}`,
+    },
+  ];
+}
+```
+
+真实系统里，候选工具可能不止一个，排序可以交给模型或启发式函数：优先无副作用工具、优先低成本工具、优先最近成功率高的工具。重点是候选空间已经被图结构缩小了。
+
+## Step 4：加入派生字段
+
+有些字段不是工具直接返回，而是由模型或规则计算得到。比如 `newPrice` 来自 `competitorPrice`：
+
+```typescript
+type DerivedField = {
+  output: string;
+  inputs: string[];
+  compute: (state: Record<string, unknown>) => unknown;
+};
+
+const derivedFields: DerivedField[] = [
+  {
+    output: "newPrice",
+    inputs: ["competitorPrice"],
+    compute: (state) => Math.floor(Number(state.competitorPrice) * 0.95),
+  },
+];
+```
+
+派生字段要显式登记，否则模型会把“算一个价格”混在自然语言推理里，审计时很难知道价格从哪里来。生产系统里，金额、权限、删除范围这类敏感字段最好使用确定性代码生成，而不是让模型自由填。
+
+## Step 5：执行计划并记录证据
+
+最终执行器可以按计划运行无副作用工具，把输出写入状态。
+
+```typescript
+async function executePlan(plan: PlanStep[], tools: ToolSchema[], initialState: Record<string, unknown>) {
+  const state = { ...initialState };
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
+  for (const step of plan) {
+    const tool = byName.get(step.tool);
+    if (!tool) throw new Error(`Unknown tool: ${step.tool}`);
+
+    const missing = missingInputs(tool, state);
+    if (missing.length > 0) {
+      throw new Error(`Cannot run ${tool.name}; missing ${missing.join(", ")}`);
+    }
+
+    const args = Object.fromEntries(
+      Object.keys(tool.inputs).map((key) => [key, state[key]]),
+    );
+    const output = await tool.run(args);
+    Object.assign(state, output);
+  }
+
+  return state;
+}
+```
+
+到这里，一个轻量 HyperAgent 雏形已经可用：先用 Schema 图找依赖，再执行工具，再把每次字段来源记录下来。如果后续工具调用失败，你能明确知道是字段缺失、工具异常、派生规则错误，还是模型选择了错误目标。
+
+## 生产化建议
+
+第一，给工具标注副作用等级。查询类工具可以自动执行，写入类工具必须二次确认，付款、删除、发信等不可逆动作要有人类审批。第二，给每条计划边记录证据：哪个字段由哪个工具在什么时间生产，是否被派生规则改写。第三，把“无法规划”作为正常输出，而不是让模型继续猜。
+
+这也是 HyperAgent 论文对工程界最有价值的提醒：Agent 可靠性不只来自更强模型，也来自把工具世界建模得更像一个系统。工具输入输出关系越明确，模型需要猜的东西越少，日志也越容易审计。
+
+参考来源：arXiv cs.AI 新论文 [HyperAgent: Planning and Acting over Tool-Schema Hypergraphs for Tool-Use LLM Agents](https://arxiv.org/abs/2608.02650)，Hugging Face Daily Papers 今日列表，以及 GitHub Trending 中关于 Agent 工具链的项目热度。
