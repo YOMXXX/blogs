@@ -1,0 +1,210 @@
+---
+title: "Cloudflare 本地追踪工坊：让 AI Agent 自己定位 Workers 故障"
+description: "Cloudflare 8 月新增 Workers 本地追踪能力后，AI Agent 可以读取本地 OpenTelemetry trace 和 console log。本文用一个可复现示例搭建可观测调试闭环。"
+column: "workshop"
+tags: ["Cloudflare", "Workers", "OpenTelemetry", "agent-debug", "wrangler", "observability"]
+pubDate: 2026-08-07
+featured: false
+tldr: "Cloudflare Workers 的本地追踪把 Agent 调试从猜日志变成查证据：wrangler dev 会捕获结构化 trace、console log 和 binding 调用，Agent 可以通过只读 Local Explorer API 找到失败 span、修改代码、重跑请求并验证结果。"
+author: "YOMXXX"
+faq:
+  - q: "这篇工坊需要部署到 Cloudflare 吗？"
+    a: "不需要。重点是本地调试闭环，使用 wrangler dev 或 vite dev 即可捕获 trace，只有后续查看线上 Agent traces 时才需要 Cloudflare Dashboard。"
+  - q: "Local Explorer API 会不会修改本地资源？"
+    a: "Cloudflare 文档描述它是只读观测查询接口，用于发现 telemetry、查询 traces 和 logs、检查 binding state，适合作为 Agent 调试输入。"
+  - q: "为什么不用普通 console log 就够了？"
+    a: "console log 只能告诉你某处打印了什么，trace 能把 handler、fetch、KV、D1、工具调用和错误放进同一条时间线，更适合多步骤 Agent 调试。"
+  - q: "这适合所有 Workers 项目吗？"
+    a: "适合需要定位异步调用、外部 fetch、数据库 binding、Agent 工具链失败的项目。极小的纯静态 Worker 收益有限，但配置成本也很低。"
+  - q: "生产环境也能按这个方式调试吗？"
+    a: "生产环境应使用 Cloudflare Agents 和 Workers traces 的线上观测能力，并谨慎配置 payload 记录，避免把用户隐私和敏感工具参数写入 trace。"
+---
+
+Cloudflare 在 2026 年 8 月 4 日的 Workers changelog 中发布了一个对开发者很实用的能力：`wrangler dev` 和 `vite dev` 会在本地 Worker 调用中自动捕获结构化 OpenTelemetry traces，并把相关 console logs 关联进去。更关键的是，当工具检测到当前是 AI Agent 会话时，终端会提示一个 Local Explorer API 地址，路径是 `/cdn-cgi/explorer/api`。这个 API 暴露 OpenAPI schema 和只读观测查询端点，Agent 可以发现 telemetry、查询 traces 和 logs、检查 binding state，然后定位失败操作、修代码、重跑请求、验证结果。
+
+这件事的意义不只是“日志更漂亮”。过去让 Agent 修 Workers 问题时，常见流程是让它读源码、猜测失败点、加 log、让人类复制粘贴终端输出，再继续猜。现在 trace 变成了 Agent 可查询的结构化事实。失败发生在哪个 span、哪个 `fetch()` 慢、哪个 KV 调用抛错、哪个工具参数为空，都可以进入同一条时间线。
+
+这篇工坊用一个最小 Worker 做演示：先故意写一个会失败的接口，再启用本地 trace，让 Agent 或脚本读取 Local Explorer 暴露的观测数据，最后把故障修掉。代码偏伪实战，因为不同项目的 wrangler 版本和模板细节会有差异，但调试结构可以直接迁移。
+
+## Step 1：创建最小 Worker
+
+如果你已有 Workers 项目，可以跳过初始化。这里用 TypeScript Worker，接口读取查询参数 `city`，再请求一个天气 API。为了避免占位符域名，示例使用 Cloudflare 文档常见的 `https://api.cloudflare.com/client/v4/ips` 作为可访问的外部请求，只演示 fetch span，不把它当真实天气源。
+
+```bash
+pnpm create cloudflare@latest trace-agent-demo
+cd trace-agent-demo
+pnpm install
+```
+
+把 `src/index.ts` 改成下面这样：
+
+```typescript
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const city = url.searchParams.get("city");
+
+    console.log("incoming request", {
+      path: url.pathname,
+      city,
+    });
+
+    if (url.pathname !== "/weather") {
+      return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+    }
+
+    const normalized = city!.trim().toLowerCase();
+
+    const upstream = await fetch("https://api.cloudflare.com/client/v4/ips");
+    const data = await upstream.json();
+
+    return Response.json({
+      ok: true,
+      city: normalized,
+      upstream: data,
+    });
+  },
+};
+```
+
+这里的 bug 很明显：当请求没有 `city` 参数时，`city!` 会让 TypeScript 安静，但运行时仍然会在 `trim()` 处报错。真实项目里，这类问题经常藏在更深的工具调用里，比如 D1 查询参数为空、R2 key 由模型硬编、外部 API token 没注入。
+
+## Step 2：启用 trace 配置
+
+Cloudflare Agents tracing 文档给出的配置很简单。JSON 形式可以写成：
+
+```json
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "observability": {
+    "traces": {
+      "enabled": true
+    }
+  }
+}
+```
+
+如果你的项目使用 `wrangler.toml`，可以写成：
+
+```toml
+[observability.traces]
+enabled = true
+```
+
+然后启动本地开发服务器：
+
+```bash
+pnpm wrangler dev
+```
+
+在另一个终端触发失败请求：
+
+```bash
+curl -i "http://localhost:8787/weather"
+```
+
+这时你应该能看到 500 错误。旧式调试会停在“哪里空了”的猜测上；本地 trace 的价值是把这次请求的 handler、console log、外部 fetch、错误栈放进一次可查询的 invocation 里。
+
+## Step 3：让 Agent 查询 Local Explorer
+
+Cloudflare changelog 说明，当检测到 AI Agent 会话时，终端会给出 Local Explorer API 提示。你也可以把它当成一个只读 observability server。实际路径是本地开发服务下的 `/cdn-cgi/explorer/api`。
+
+先查看 schema：
+
+```bash
+curl "http://localhost:8787/cdn-cgi/explorer/api"
+```
+
+不同版本输出可能不同，关键是让 Agent 先读 OpenAPI schema，而不是硬猜查询路径。一个适合放进 Agent system prompt 的规则是：
+
+```text
+When debugging a local Cloudflare Worker, first inspect the Local Explorer API schema.
+Use only read-only telemetry endpoints.
+Find the latest failed invocation.
+Summarize the failing span, related console logs, and suspected source line before editing code.
+After editing, rerun the same request and verify the trace status is successful.
+```
+
+这段规则的目的不是让 Agent “更聪明”，而是约束它先取证。很多编码 Agent 的失败来自过早编辑：还没确认异常发生在 binding、handler、fetch 还是序列化，就开始改业务逻辑。trace 查询把第一步改成事实收集。
+
+## Step 4：修复输入边界
+
+这个示例的修复很小：不要信任查询参数，先返回结构化错误。
+
+```typescript
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const city = url.searchParams.get("city");
+
+    console.log("incoming request", {
+      path: url.pathname,
+      city,
+    });
+
+    if (url.pathname !== "/weather") {
+      return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+    }
+
+    if (!city || city.trim().length === 0) {
+      return Response.json(
+        { ok: false, error: "missing_city" },
+        { status: 400 },
+      );
+    }
+
+    const normalized = city.trim().toLowerCase();
+    const upstream = await fetch("https://api.cloudflare.com/client/v4/ips");
+    const data = await upstream.json();
+
+    return Response.json({
+      ok: true,
+      city: normalized,
+      upstream: data,
+    });
+  },
+};
+```
+
+重跑请求：
+
+```bash
+curl -i "http://localhost:8787/weather"
+curl -i "http://localhost:8787/weather?city=Shanghai"
+```
+
+第一条应返回 400，第二条应返回 200。更重要的是，trace 里应该能看到失败从未处理异常变成可预期的业务错误。对 Agent 调试来说，这就是一次完整闭环：复现、定位、修改、验证。
+
+## Step 5：把 trace 变成测试提示
+
+真正有用的做法，是让失败 trace 生成回归测试。比如上面的 bug 应该变成一个输入校验测试：
+
+```typescript
+import { describe, expect, it } from "vitest";
+import worker from "../src/index";
+
+describe("weather worker", () => {
+  it("returns 400 when city is missing", async () => {
+    const res = await worker.fetch(new Request("http://local.test/weather"));
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: false,
+      error: "missing_city",
+    });
+  });
+});
+```
+
+本地 trace 给 Agent 的不是最终答案，而是足够具体的失败证据。好的调试 Agent 应该把证据转成最小测试，再改代码让测试通过。否则它只是在“修这一次”，没有把同类问题锁住。
+
+## 生产化注意事项
+
+第一，trace payload 里可能包含用户输入、工具参数和模型输出。Cloudflare Agents 文档提醒，消息和工具 payload 可能包含个人信息，记录时要按框架配置控制。开发团队应区分本地调试、预发环境和生产环境的记录策略。
+
+第二，Agent 只能读取观测数据，不能顺手访问密钥、修改 binding 或清空状态。Local Explorer API 的只读性质很适合调试，但你给 Agent 的 shell 权限、仓库权限、环境变量权限仍然需要单独控制。
+
+第三，trace 不是日志替代品，而是结构化索引。业务上仍然需要清晰的错误码、请求 ID、用户 ID 哈希、外部服务返回状态。trace 负责把这些线索串起来，方便人类和 Agent 共同定位。
+
+Cloudflare 这次更新最值得借鉴的地方，是把“AI Agent 调试”当作开发生命周期的一部分，而不是把 Agent 放在代码生成阶段就结束。Agent 真正进入生产工程后，最缺的往往不是多写几行代码，而是能不能看到失败、解释失败、验证修复。Workers 本地追踪正好补上了这个环节。
+
+参考来源：Cloudflare Workers changelog [AI agents can debug Workers with local tracing](https://developers.cloudflare.com/changelog/post/2026-08-04-local-tracing/)，Cloudflare Agents 文档 [Tracing](https://developers.cloudflare.com/agents/runtime/operations/observability/tracing/)，Braintrust 博客 [Trace and improve Cloudflare Agents](https://www.braintrust.dev/blog/cloudflare-agents)。

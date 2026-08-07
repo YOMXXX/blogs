@@ -1,0 +1,154 @@
+---
+title: "Agent 成本架构深度长文：从 Token 账单到路径预算"
+description: "多 Agent 系统的成本瓶颈正在从单次推理价格转向任务路径预算。本文结合近期论文、HN 和 Reddit 讨论，分析早停、模型路由、工具缓存、重试上限和审计指标。"
+column: "long-form"
+tags: ["agent-economics", "cost-routing", "LLM-serving", "observability", "multi-agent", "architecture"]
+pubDate: 2026-08-07
+featured: false
+tldr: "Agent 成本不再是每百万 token 单价问题，而是一次任务经过多少模型、工具、验证、重试和人工接管的问题。成熟系统需要路径预算：先定义任务风险，再决定模型、步骤、缓存、早停和审计深度。"
+author: "YOMXXX"
+faq:
+  - q: "为什么说 token 价格不是唯一成本？"
+    a: "因为 Agent 任务还会消耗工具调用、浏览器会话、测试运行、日志存储、重试时间和人工 review。token 只是最容易看见的一项账单。"
+  - q: "路径预算是什么意思？"
+    a: "路径预算是按一次任务完整执行路径计成本，包括模型选择、步骤数量、验证轮次、工具费用、延迟目标和失败后的升级策略。"
+  - q: "小模型能直接替代大模型吗？"
+    a: "不能简单替代。小模型适合分类、抽取、格式检查、低风险工具选择；复杂推理、长上下文规划和高风险判断仍然需要强模型或人类审批。"
+  - q: "早停策略最怕什么？"
+    a: "最怕把模型自信当事实。早停应该依赖测试、schema、规则、独立验证和历史置信校准，而不是只看模型说自己有把握。"
+  - q: "团队应该先优化哪一项？"
+    a: "先记录任务路径和失败原因，再优化高频路径。没有 tracing、token breakdown 和步骤成功率时，盲目换便宜模型很容易降低总体效率。"
+---
+
+过去一年，开发者讨论 Agent 成本时，经常从模型价格开始：输入 token 多少钱，输出 token 多少钱，缓存 token 多少钱。这个视角没有错，但已经不够了。Agent 不是一次聊天调用，而是一条会分叉、会重试、会调用工具、会跑测试、会等待审批的任务路径。真正决定账单的，不是某个模型单价，而是一次任务穿过了多少步骤。
+
+近期几个信号指向同一个趋势。ACL 2026 的 LLM-as-Scheduler 论文把固定多 Agent 流水线改成动态调度，在代码生成基准上报告显著 token 和延迟下降。Cloudflare 推出 Kitesurf，理由也是传统 Chromium 对 Agent 来说太重。Cloudflare Workers 本地 tracing 则把 Agent 的模型调用、工具调用、fetch、KV、D1 放到同一条 trace 里，说明平台开始把 Agent 当成可观测的分布式工作负载。Hacker News、Reddit 和 GitHub 社区围绕小模型、浏览器自动化、本地 LLM、便宜编码 Agent 的讨论，本质上也都在问一个问题：怎样用可控成本跑更多可靠任务？
+
+这篇长文的结论很直接：Agent 系统需要从 token budgeting 升级到 path budgeting。
+
+## Token 账单为什么误导
+
+单次 LLM 调用的价格很容易比较，但 Agent 的真实成本包含更多项：
+
+| 成本项 | 常见触发点 |
+|--------|------------|
+| 模型 token | 规划、生成、反思、验证、总结 |
+| 工具调用 | 搜索、数据库、浏览器、第三方 API |
+| 运行环境 | 沙箱、浏览器实例、测试容器、队列 |
+| 观测存储 | trace、日志、payload、截图、diff |
+| 重试成本 | 工具失败、格式错误、测试失败、超时 |
+| 人工成本 | 审查、审批、回滚、事故复盘 |
+
+一个便宜模型如果经常输出不可执行计划，可能触发更多工具失败和人工 review。一个贵模型如果一次通过率高、diff 小、测试完整，任务级成本反而更低。只看 token 单价，会把系统引向错误优化。
+
+更危险的是，团队会把成本优化等同于“换小模型”。小模型确实重要，但它应该出现在合适的路径节点，而不是盲目替换所有推理。
+
+## 路径预算的基本模型
+
+可以把一次 Agent 任务看成一个有向图。节点是模型调用、工具调用、规则检查、测试、审批；边是路由条件。路径预算就是给这张图定义成本上限和退出条件。
+
+```text
+task_path:
+  classify intent
+  choose risk tier
+  run planner
+  execute tools
+  validate output
+  repair if needed
+  request approval if high risk
+  finalize
+```
+
+每个节点都应该有四个字段：成本、延迟、可靠性证据、失败路由。没有失败路由的节点会导致 Agent 自由重试；没有可靠性证据的节点会导致系统无法早停；没有成本字段的节点会让预算失控。
+
+一个最小配置可以这样描述：
+
+```yaml
+steps:
+  intent_classifier:
+    model: small
+    max_latency_ms: 500
+    fallback: planner
+  planner:
+    model: frontier
+    max_tokens: 4000
+    fallback: human_review
+  validator:
+    type: tests_and_schema
+    max_latency_ms: 10000
+    fallback: repair
+  repair:
+    model: frontier
+    max_attempts: 1
+    fallback: human_review
+```
+
+这里的重点是 `max_attempts: 1`。很多 Agent 成本爆炸来自无限修复循环。生产系统里，重试次数必须是预算策略，不是模型心情。
+
+## 小模型的位置
+
+小模型最适合做窄任务：意图分类、风险分层、字段抽取、格式修复、候选工具粗排、摘要压缩、日志聚类。NVIDIA 研究社区关于 small language models for agentic AI 的讨论也强调，Agent 中很多语言模型调用只用到很窄的能力，不需要每次都使用通用大模型。
+
+但小模型不应该承担所有决策。跨仓库代码修改、复杂业务规划、合规边界判断、用户意图冲突处理，仍然需要强模型或人类。合理结构不是“小模型替代大模型”，而是“小模型守门，大模型处理高价值分支”。
+
+例如客服退款 Agent 可以这样分层：
+
+| 阶段 | 模型选择 | 原因 |
+|------|----------|------|
+| 意图分类 | 小模型 | 类别少，输入短 |
+| 订单事实抽取 | 小模型加规则 | 字段固定，可验证 |
+| 退款政策判断 | 强模型加规则 | 需要解释冲突条款 |
+| 执行退款 | 程序加审批 | 不应由模型自由执行 |
+| 用户回复 | 中型模型 | 需要语气，但风险可控 |
+
+这比“所有步骤用同一个模型”更接近工程现实。
+
+## 早停不是偷懒
+
+很多团队对早停有抵触，担心降低可靠性。但真正的问题不是早停本身，而是早停证据是否足够。若一个代码补丁通过类型检查、单元测试、格式化、影响范围小、历史同类任务合并率高，那么继续让两个 Agent 复述一遍可能只是浪费。
+
+反过来，如果任务涉及权限、支付、数据删除，即使模型回答非常自信，也不能早停。早停策略必须绑定风险等级。
+
+可以定义三层：
+
+```text
+low risk: 可读查询、草稿生成、文档摘要
+medium risk: 代码修改、配置变更、批量数据分析
+high risk: 资金动作、权限变更、删除、外发消息
+```
+
+低风险任务优先省成本，中风险任务优先可回滚，高风险任务优先审批和审计。路径预算不是统一压缩，而是按风险配置。
+
+## 缓存应该缓存什么
+
+Agent 缓存也容易被误解。提示词缓存只能解决部分成本；更大的机会在工作流级缓存。
+
+第一类是上下文缓存。仓库索引、API schema、政策文档、数据库表结构不应该每次重新读。第二类是工具结果缓存。对只读 API、搜索结果、依赖图可以设置短 TTL，避免 Agent 重复拉取。第三类是验证缓存。同一个 diff 的测试结果、同一份输出的 schema 校验结果可以复用。第四类是决策缓存。相同风险类型和相似输入可以复用路由策略，但不能复用最终行动。
+
+缓存的反面是污染。错误摘要、过期政策、失败工具结果如果被长期记忆，会让 Agent 在后续任务中持续犯错。因此缓存必须带来源、时间、失效条件和置信度。
+
+## 观测指标要从调用级升级到路径级
+
+如果只记录 token usage，你看不到系统真正的问题。Agent 平台至少应该记录这些路径指标：
+
+| 指标 | 用途 |
+|------|------|
+| average steps per task | 发现过长流程 |
+| early exit rate | 判断 gate 是否有效 |
+| repair rate | 发现生成质量问题 |
+| retry reason distribution | 区分工具失败和模型失败 |
+| human review minutes | 衡量真实工程成本 |
+| rollback rate | 衡量线上风险 |
+| cost per merged task | 编码 Agent 的核心指标 |
+
+Cloudflare Agents tracing 文档把模型调用、工具运行、审批请求放进 trace waterfall，是一个方向信号。Agent 可观测性不应只服务事故排查，也应该服务成本治理。
+
+## 最后的架构建议
+
+如果你正在搭建 Agent 平台，不要先追求最复杂的多 Agent 协作。先实现四件事：任务分级、路径预算、结构化中间产物、强制退出条件。模型可以换，工具可以换，框架可以换，但这四件事决定系统能否长期控制成本。
+
+更具体地说，每个 Agent 任务开始时先回答：这是低、中、高哪个风险？最多能花多少 token、多少工具调用、多少秒？哪些检查通过后可以退出？哪些失败必须交给人？这些问题回答清楚以后，Agent 才从“会做事的模型”变成“可运营的系统”。
+
+未来 Agent 成本竞争不会只发生在模型 API 价格表上，也会发生在调度器、浏览器运行时、trace 存储、沙箱、缓存和审批流里。谁能用更短、更可解释、更可回滚的路径完成任务，谁才是真正便宜。
+
+参考来源：ACL 2026 论文 [LLM-as-Scheduler](https://aclanthology.org/2026.acl-long.581.pdf)，Cloudflare [Kitesurf](https://blog.cloudflare.com/kitesurf/) 与 [Agents tracing](https://developers.cloudflare.com/agents/runtime/operations/observability/tracing/) 文档，NVIDIA 关于 [Small Language Models for Agentic AI](https://developer.nvidia.com/blog/how-small-language-models-are-key-to-scalable-agentic-ai/) 的技术讨论。
