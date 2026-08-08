@@ -1,0 +1,118 @@
+---
+title: "Agent Skills 工具速评：技能包正在取代超长 System Prompt"
+description: "GitHub Trending 同时出现 agent-skills、Google skills、mattpocock skills 和 superpowers。本文比较这些技能包的定位、安装方式、适用团队和落地风险。"
+column: "tools"
+tags: ["agent-skills", "coding-agent", "tools", "Codex", "Claude-Code", "workflow"]
+pubDate: 2026-08-08
+featured: false
+tldr: "Agent Skills 的流行说明开发者开始把 Agent 能力从一次性提示词迁移到可安装、可版本化、可审查的 workflow 包。选型时不要只看 star，而要看技能粒度、触发机制、验证要求、跨 Agent 兼容和团队能否维护自己的本地版本。"
+author: "YOMXXX"
+faq:
+  - q: "Agent Skills 和 system prompt 有什么区别？"
+    a: "System prompt 通常是一整段全局指令，Agent Skills 更像按任务加载的流程包，包含适用条件、步骤、检查清单和验证要求，便于复用和版本管理。"
+  - q: "这些技能包会让 Agent 自动变强吗？"
+    a: "不会自动变强。它们主要减少流程遗漏，例如先写规格、再分解任务、最后验证。模型能力、工具权限和项目上下文仍然决定最终效果。"
+  - q: "个人开发者应该装哪一个？"
+    a: "如果想要完整工程生命周期，可以试 addyosmani agent-skills；如果偏 TypeScript 项目和个人工作流，可以看 mattpocock skills；云上 Google 项目则优先看 google skills。"
+  - q: "企业团队能直接全量安装吗？"
+    a: "不建议一上来全量安装。企业应先挑 code review、testing、security、observability 等低风险技能，在一个仓库试点，再沉淀内部版本。"
+  - q: "技能包最大的风险是什么？"
+    a: "最大风险是把外部工作流当成不可审查的权威。技能会影响 Agent 行为，应该像依赖和 CI 配置一样 review、固定版本、记录变更。"
+---
+
+2026 年 8 月 7 日的 GitHub Trending 很少见地被 Agent 工作流类项目占据：addyosmani/agent-skills、mattpocock/skills、obra/superpowers、google/skills 都在前列。它们不是新模型，也不是新 IDE，而是一类更朴素但更重要的东西：把资深工程师的工作流程包装成 Agent 可加载的技能。
+
+这说明 AI 编程工具正在越过“更会写代码”阶段，进入“更会按流程工作”阶段。很多 Agent 失败不是因为不会生成 TypeScript，而是因为跳过需求澄清、没有小步提交、不写测试、看见报错就猜、合并前不复查、上线后没有观测。技能包试图把这些习惯变成可安装、可版本化、可触发的 instruction artifacts。
+
+本文不做泛泛推荐，而是从四个维度比较：定位、安装和兼容、流程粒度、团队落地风险。
+
+## 为什么技能包突然变热
+
+超长 system prompt 有三个问题。
+
+第一，它是全局的。无论你在写 API、修 CSS、做安全审计还是写测试，模型都背着同一套规则。上下文浪费大，触发也不精确。
+
+第二，它难维护。团队经常把新经验追加到 prompt 末尾，几个月后变成一份没人敢删的长文档。冲突规则越来越多，模型遵循质量反而下降。
+
+第三，它不容易验证。Prompt 说“要写测试”，但没有明确何时写、写到什么程度、如何证明通过、失败时怎么办。
+
+Agent Skills 的思路是把规则拆成任务包。比如需求不清时加载 interview 或 spec skill；改多文件时加载 incremental implementation；上线前加载 shipping checklist；做 Google Cloud Agent 时加载对应产品技能。好的技能不是知识库文章，而是流程和退出条件。
+
+## addyosmani/agent-skills：完整生命周期包
+
+addyosmani/agent-skills 的定位非常明确：production-grade engineering skills for AI coding agents。它把软件开发拆成 define、plan、build、verify、review、ship 六个阶段，提供 `/spec`、`/plan`、`/build`、`/test`、`/review`、`/ship` 等命令，并包含 24 个技能。
+
+它最大的优点是完整。README 里列出的技能覆盖需求澄清、规格驱动开发、任务拆解、增量实现、测试驱动开发、上下文工程、源驱动开发、前端工程、API 设计、调试恢复、代码审查、安全加固、性能优化、CI/CD、迁移、文档 ADR、可观测性和发布。
+
+这类包适合两种场景。第一是团队想统一 Agent 工作方式，不希望每个人写自己的提示词。第二是项目足够复杂，单次“请修 bug”已经不够，需要 Agent 按工程生命周期推进。
+
+风险也很明显：它会显著改变 Agent 的工作节奏。对小改动来说，完整流程可能显得重；对已有严格流程的团队来说，外部技能包的默认观念可能和内部规范冲突。因此最佳落地方式不是全量信任，而是先挑三类技能试点：code review、test-driven-development、observability-and-instrumentation。
+
+## Google skills：产品知识和云工作流
+
+google/skills 更像官方产品技能库。它覆盖 Google Cloud、Agent Platform、GKE、BigQuery、AlloyDB、Cloud Run、Firebase、Google Ads API 等大量产品和场景。它的价值不在通用工程流程，而在“让 Agent 少翻错文档”。
+
+如果你的 Agent 要操作 Google Cloud，这类技能非常实用。云平台细节多，权限、命令、区域、配额、产品名称和最佳实践都容易出错。把这些知识做成技能，比把几百行云文档粘进 prompt 更合理。
+
+它适合平台团队、云迁移团队、数据团队和 SRE 团队。尤其是 GKE、BigQuery、Cloud Logging、Agent Platform eval flywheel 这类任务，外部文档变动快，技能库可以作为任务入口。
+
+但产品技能也要警惕两点。第一，技能不是权限系统。Agent 会更懂 gcloud，不代表它应该拿到更大 IAM 权限。第二，技能可能滞后于产品变更。云资源操作必须以官方文档和实际 `gcloud` 输出为准，不能只信技能文本。
+
+## mattpocock/skills：个人工程师工作流
+
+mattpocock/skills 的气质和前两个不同。它强调“real engineering, not vibe coding”，更像一位资深 TypeScript 工程师把自己的 `.agents` 目录公开出来。README 里突出的问题也更贴近日常开发：Agent 没理解需求、太啰嗦、代码不能工作。
+
+它的优势是轻、个人化、容易改。安装方式也强调两种哲学：通过 Claude Code plugin 获取只读托管版本，或者用 skills installer 把普通文件复制到项目里自行修改。对个人开发者和小团队来说，这比大型生命周期包更容易消化。
+
+这类技能适合想训练 Agent 与自己协作风格对齐的人。比如先 grill me 澄清需求，沉淀共享语言，写 ADR，减少模型在项目术语上的啰嗦。它不一定覆盖所有企业上线流程，但能显著改善“Agent 总是误会我”的问题。
+
+## superpowers：方法论型技能框架
+
+obra/superpowers 在 Trending 上的描述是 agentic skills framework and software development methodology。它更偏“如何组织 Agent 工作法”，而不仅是若干 checklist。对于已经在多 Agent、长任务、技能复用上投入的团队，这类框架值得研究。
+
+不过方法论型工具更需要试用验证。它可能和团队现有流程产生重叠，也可能引入额外仪式。判断它是否适合，不看介绍词，而看三个问题：能否减少返工，能否让失败更早暴露，能否把成功经验沉淀为可复用技能。
+
+## 横向比较
+
+| 工具 | 主要定位 | 最适合谁 | 最大风险 |
+| --- | --- | --- | --- |
+| addyosmani/agent-skills | 完整工程生命周期 | 团队统一 Agent 流程 | 对小任务偏重 |
+| google/skills | Google 产品和云工作流 | 云平台与数据团队 | 技能滞后或权限过宽 |
+| mattpocock/skills | 个人工程师协作习惯 | 个人和小型 TypeScript 团队 | 过度个人化 |
+| superpowers | Agent 方法论和框架 | 已深度使用 Agent 的团队 | 流程引入成本 |
+
+## 选型不要只看 star
+
+技能包最容易被误选。GitHub star 只能说明关注度，不能说明它适合你的团队。更实际的评估标准是五个。
+
+第一，技能粒度是否足够小。一个技能应该处理一个明确场景，而不是试图重写整个开发哲学。
+
+第二，触发条件是否明确。Agent 应该知道什么时候加载，什么时候停止，不应该所有任务都加载所有技能。
+
+第三，验证要求是否具体。好的技能会要求测试、构建、运行时证据、审查结论，而不是只说“确保质量”。
+
+第四，能否跨 Agent 使用。今天团队可能用 Codex、Claude Code、Cursor、Gemini CLI、Copilot 混合工作。技能越接近普通 Markdown 和标准目录，迁移成本越低。
+
+第五，能否本地维护。企业最终需要内部技能库，包含自己的部署流程、安全要求、命名约定和事故复盘。外部技能只能是起点。
+
+## 推荐落地路径
+
+个人开发者可以直接从轻量技能开始。选一个仓库，安装一套技能，连续一周只观察三件事：需求澄清是否更充分，测试是否更稳定，最终 diff 是否更容易 review。如果没有改善，就不要保留。
+
+小团队可以把技能纳入仓库。不要依赖每个人全局安装，而是在项目里固定版本，写清楚哪些技能是推荐、哪些是必需。比如 PR 前必须跑 review skill，改 API 必须跑 interface design skill，改生产路径必须跑 security skill。
+
+企业团队应建立内部 skills registry。外部技能先经过安全和工程 review，再转成内部版本。每次技能更新像依赖升级一样走 changelog。尤其是涉及云资源、权限、发布和安全审计的技能，必须由平台团队维护。
+
+## 技能包不是替代人类判断
+
+技能包会改善 Agent 的流程一致性，但不会替代工程判断。模型仍然可能误读代码，工具仍然可能失败，测试仍然可能覆盖不足。技能的作用是把“应该做的步骤”变得更难遗漏，而不是保证每一步都正确。
+
+最健康的心态是把技能当作 executable engineering memory。它记录团队学到的工作法，帮助 Agent 在合适的时候调用。它不是魔法，也不是权威。任何影响代码、权限和发布的技能，都应该能被人类读懂、审查和修改。
+
+## 结论
+
+Agent Skills 的流行是一个重要信号：AI 编程的瓶颈正在从代码生成能力转向工程流程执行力。未来强 Agent 不只是更会写函数，而是更会按团队约定做事：先澄清，再计划，小步实现，持续验证，审查后发布。
+
+今天选型时，建议从任务痛点出发。流程混乱选 addyosmani/agent-skills，Google Cloud 场景选 google/skills，个人协作和 TypeScript 工作流看 mattpocock/skills，想研究方法论再看 superpowers。最终目标不是安装最多技能，而是沉淀一套你们团队愿意维护、Agent 能稳定执行的工作流。
+
+参考来源：GitHub Trending 2026-08-07、[addyosmani/agent-skills](https://github.com/addyosmani/agent-skills)、[google/skills](https://github.com/google/skills)、[mattpocock/skills](https://github.com/mattpocock/skills)、[obra/superpowers](https://github.com/obra/superpowers)。

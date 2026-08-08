@@ -1,0 +1,230 @@
+---
+title: "Cloudflare Computer 工坊：给 AI Agent 一个可回滚的云端工作区"
+description: "Cloudflare Computer 登上 GitHub Trending 后，Agent 工作区从临时容器走向 Durable Object 状态机。本文用 TypeScript 伪实战拆解虚拟文件系统、运行后端和安全边界。"
+column: "workshop"
+tags: ["Cloudflare", "Durable-Objects", "agent-runtime", "workspace", "TypeScript", "sandbox"]
+pubDate: 2026-08-08
+featured: false
+tldr: "Cloudflare Computer 的关键不是再包装一个 shell，而是把 Agent 的文件状态、执行后端和产物发布拆开：Durable Object 保存权威工作区，容器或 Worker 后端负责执行，调用方通过统一 runtime 入口选择成本、隔离和能力边界。"
+author: "YOMXXX"
+faq:
+  - q: "Cloudflare Computer 现在适合生产环境吗？"
+    a: "不适合直接上生产。官方 README 明确标注它是 preview，API 不稳定，适合原型、实验和设计验证。生产系统应等待接口稳定，并单独做隔离和权限审计。"
+  - q: "它和普通 Docker sandbox 有什么区别？"
+    a: "普通 sandbox 常把文件状态绑在容器生命周期里，Cloudflare Computer 把权威状态放在 Durable Object 的 SQLite 中，容器或 Worker 只是执行表面，状态更容易恢复、复用和审计。"
+  - q: "为什么 Agent 需要虚拟文件系统？"
+    a: "长任务通常要写草稿、补丁、测试输出和构建产物。虚拟文件系统能把这些中间状态结构化保存，避免 Agent 只依赖上下文窗口记忆。"
+  - q: "容器后端和 Worker 后端怎么选？"
+    a: "需要真实 Linux 工具链、二进制依赖或网络能力时选容器；只需要轻量 shell 或 JavaScript 模块执行时选 Worker 后端，成本和启动复杂度更低。"
+  - q: "这篇文章的代码能直接运行吗？"
+    a: "本文给的是面向架构迁移的伪实战代码，接口名称基于官方 README 暴露的概念整理。实际项目应以 `@cloudflare/computer` 包内 README 和示例为准。"
+---
+
+Cloudflare Computer 在 2026 年 8 月 7 日进入 GitHub Trending 前列。它的 README 用一句话概括自己：给你的 Agent 一台 computer。真正值得开发者关注的，不是这个口号，而是它把 Agent 运行时拆成了三个更清晰的层次：权威文件状态、可插拔执行后端、面向调用方的统一 workspace API。
+
+过去做 Agent sandbox，常见路线是启动一个 Docker 容器，把仓库挂进去，给模型一组 shell 工具，然后祈祷它不要把状态弄乱。这能跑 demo，但遇到长任务会暴露几个问题：容器挂了状态就难恢复，文件修改和工具输出混在一起，执行后端很难按任务切换，产物也缺少可审计的生命周期。Cloudflare Computer 的设计更像“Agent 工作区内核”：Durable Object 持有 SQLite-backed virtual filesystem，容器、Worker shell、Worker JavaScript 只是不同的执行面。
+
+这篇工坊不把它包装成成熟生产方案。官方已经明确说它是 preview，适合实验、探索和原型，不适合生产。我们更关心它背后的工程模式：如何给 Agent 一个可恢复、可审计、可替换执行面的云端工作区。
+
+## 为什么不是再开一个容器
+
+Agent 运行代码时有四类状态。
+
+第一类是输入状态：用户需求、仓库文件、依赖锁文件、配置。第二类是工作状态：Agent 写下的计划、临时脚本、测试日志、补丁。第三类是执行状态：shell 进程、网络请求、构建缓存、运行时环境变量。第四类是产物状态：压缩包、截图、报告、可下载仓库、部署包。
+
+传统容器方案通常把这四类状态混在一个文件系统里。这样做简单，但审计困难。你很难回答：某个文件是用户原始上传、Agent 修改、测试生成，还是恶意脚本落地？当任务失败重试时，你也很难只恢复工作区，而不是恢复整个容器。
+
+Cloudflare Computer 的思路是把权威文件状态放在 Durable Object 内，由 SQLite 保存。执行后端通过协议把这个状态投影成文件系统或模块环境。容器可以获得真实 FUSE mount，Worker shell 可以通过 RPC 访问 Workspace，Worker JavaScript 可以在新 Dynamic Worker 中执行 ECMAScript module。调用方看到的是一个 `workspace.runtime.exec(source, { backend })` 风格的统一入口。
+
+## 一个最小工作区模型
+
+先写一个不依赖 Cloudflare SDK 的本地抽象，理解边界。真实项目中这些接口由 `@cloudflare/computer` 提供，这里只是把设计意图拆出来。
+
+```typescript
+type RuntimeBackend = "container" | "worker-shell" | "worker-javascript";
+
+type ExecResult = {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  artifacts: string[];
+};
+
+type Workspace = {
+  write(path: string, content: string): Promise<void>;
+  read(path: string): Promise<string>;
+  list(path: string): Promise<string[]>;
+  exec(source: string, options: { backend: RuntimeBackend }): Promise<ExecResult>;
+};
+```
+
+这层抽象的重点是：文件读写和代码执行不是一回事。Agent 可以先写文件，再选择后端执行；也可以只操作文件，不执行任何命令。很多企业 Agent 平台一开始就把“工具调用”设计成 shell，自然会把文件权限、网络权限、包安装权限和产物权限混在一起。Workspace 模型让你先问：这一步是否真的需要执行？
+
+## Step 1：设计任务目录
+
+长任务不要把所有东西丢在根目录。一个可审计工作区至少要分出四个目录。
+
+```text
+/input
+  user-request.md
+  repo-manifest.json
+/work
+  plan.md
+  patch-notes.md
+  scratch.ts
+/runs
+  2026-08-08T10-00-00Z.json
+/artifacts
+  report.md
+  patch.diff
+```
+
+Agent 的第一步不是改业务文件，而是写 `plan.md` 和 `repo-manifest.json`。如果后续执行失败，人类可以从这些文件判断它理解了什么、遗漏了什么、为什么选择某个后端。
+
+伪代码如下：
+
+```typescript
+async function initializeTask(workspace: Workspace, request: string) {
+  await workspace.write("/input/user-request.md", request);
+  await workspace.write(
+    "/input/repo-manifest.json",
+    JSON.stringify(
+      {
+        createdAt: new Date().toISOString(),
+        policy: {
+          network: "deny-by-default",
+          writeRoots: ["/work", "/artifacts"],
+        },
+      },
+      null,
+      2,
+    ),
+  );
+}
+```
+
+这里故意把 policy 也放进 workspace。它不是安全边界本身，但它让 Agent 和审计者都能看到当前任务预期规则。真正的安全边界仍然要由后端隔离、网络策略和权限系统执行。
+
+## Step 2：按任务选择执行后端
+
+Cloudflare Computer 目前公开描述了三类后端。容器后端适合真实 Linux userland、二进制工具和复杂构建；Worker shell 适合轻量命令；Worker JavaScript 适合结构化模块执行。
+
+我们可以写一个保守路由器：
+
+```typescript
+function chooseBackend(task: {
+  needsBinary: boolean;
+  needsNetwork: boolean;
+  language: "shell" | "javascript";
+}): RuntimeBackend {
+  if (task.needsBinary || task.needsNetwork) {
+    return "container";
+  }
+
+  if (task.language === "javascript") {
+    return "worker-javascript";
+  }
+
+  return "worker-shell";
+}
+```
+
+这个路由器很简单，但比“全部给容器”更好。Agent 平台应当把后端能力变成显式决策：是否允许网络、是否允许安装包、是否允许执行二进制、是否允许写 artifact。后端不是性能优化选项，而是权限边界选项。
+
+## Step 3：执行前写入计划，执行后写入证据
+
+Agent 最大的问题不是写错，而是写错之后说不清楚自己做过什么。每一次 runtime 执行都应该生成 run record。
+
+```typescript
+async function runWithRecord(
+  workspace: Workspace,
+  command: string,
+  backend: RuntimeBackend,
+) {
+  const startedAt = new Date().toISOString();
+  const result = await workspace.exec(command, { backend });
+  const endedAt = new Date().toISOString();
+
+  await workspace.write(
+    `/runs/${startedAt}.json`,
+    JSON.stringify(
+      {
+        startedAt,
+        endedAt,
+        backend,
+        command,
+        ok: result.ok,
+        stdout: result.stdout.slice(0, 12000),
+        stderr: result.stderr.slice(0, 12000),
+        artifacts: result.artifacts,
+      },
+      null,
+      2,
+    ),
+  );
+
+  return result;
+}
+```
+
+这里有两个小细节。第一，stdout 和 stderr 要截断，避免日志把工作区撑爆。第二，产物只存路径和摘要，不要把大文件塞进 JSON。真正的文件仍然放在 `/artifacts`。
+
+## Step 4：把产物当成一等公民
+
+Cloudflare Computer 的示例里有把 Worker 项目发布成 Cloudflare Artifacts clone-ready repo 的路径，也有通过 Workers AI 生成图片再返回 shareable link 的例子。这个方向很重要：Agent 的输出不应该只是聊天里的大段文字，而应该是可下载、可复现、可追踪的 artifact。
+
+一个实用规则是：任何能被人类接收的结果，都要落到 `/artifacts`。
+
+```typescript
+async function publishPatch(workspace: Workspace, diff: string, summary: string) {
+  await workspace.write("/artifacts/patch.diff", diff);
+  await workspace.write(
+    "/artifacts/report.md",
+    [
+      "# Agent Change Report",
+      "",
+      "## Summary",
+      summary,
+      "",
+      "## Files",
+      "- /artifacts/patch.diff",
+    ].join("\n"),
+  );
+}
+```
+
+这会改变产品体验。用户不必在聊天历史里找“最终版本”，而是拿到一个工作区产物清单。对企业系统来说，这也是审计、审批和回滚的基础。
+
+## Step 5：给 Agent 设定硬边界
+
+Cloudflare Computer 解决的是工作区和执行面问题，不替你解决所有安全问题。尤其在 preview 阶段，最不该做的是把它接到真实生产凭据、真实客户数据和宽松网络权限上。
+
+一个保守的边界表可以这样设计：
+
+| 场景 | 后端 | 网络 | 写入范围 | 人工审批 |
+| --- | --- | --- | --- | --- |
+| 生成文档 | Worker JavaScript | 禁用 | `/work`、`/artifacts` | 不需要 |
+| 运行单元测试 | 容器 | 默认禁用 | 临时 repo clone | 失败时需要 |
+| 安装依赖 | 容器 | 允许 registry | 缓存目录和 worktree | 首次需要 |
+| 发布 artifact | Worker | 只允许 artifact API | `/artifacts` | 需要 |
+| 修改生产资源 | 不建议 | 不建议 | 不建议 | 必须 |
+
+这个表不是 Cloudflare 的内置策略，而是开发团队应该放在 Agent orchestration 层的策略。不要把“能执行”误解成“应该执行”。
+
+## 适合迁移的三类系统
+
+第一类是代码修复 Agent。它需要仓库文件、测试运行、补丁产物和日志记录。Workspace 能把这些状态留住，避免每轮对话重新读全仓。
+
+第二类是数据分析 Agent。它需要写 SQL、生成图表、保存中间数据和报告。文件系统比纯上下文更适合保存可复现 notebook 或脚本。
+
+第三类是内容生成 Agent。它需要草稿、素材、版本、图片和发布包。把产物放进工作区后，审核和回滚会简单很多。
+
+不适合的场景也很明确：强实时交互、高吞吐短请求、对 API 稳定性要求极高的生产执行链，以及任何需要处理高敏感数据但还没有完整隔离设计的系统。
+
+## 工程结论
+
+Cloudflare Computer 的价值在于把 Agent “执行一条命令”升级为“在一个持久工作区里工作”。这听起来只是架构层面的细节，但会直接影响可靠性：失败能不能复现，产物能不能追踪，执行后端能不能收敛权限，长任务能不能断线恢复。
+
+如果你今天要试它，建议只做三件事：用示例跑通一个 workspace，记录每次 runtime 执行的 run record，把最终结果落成 artifact。不要急着接生产凭据，也不要把 preview API 当稳定平台。真正值得先迁移的是思路：文件状态要独立于执行容器，后端能力要显式选择，Agent 输出要变成可审计产物。
+
+参考来源：GitHub Trending 2026-08-07 页面、Cloudflare Computer README、Cloudflare Computer examples 和 package layout。
