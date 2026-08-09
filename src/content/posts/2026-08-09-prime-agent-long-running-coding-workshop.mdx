@@ -1,0 +1,233 @@
+---
+title: "Prime Agent 工坊：把长任务 Coding Agent 跑成可恢复的后台作业"
+description: "Prime Agent 登上 GitHub Trending 后，长任务 coding agent 的重点从一次聊天转向持久 REPL、子代理、可回滚 harness 和后台会话。本文给出安全落地清单与可复用任务模板。"
+column: "workshop"
+tags: ["Prime-Agent", "coding-agent", "RLM", "long-running", "subagents", "workflow"]
+pubDate: 2026-08-09
+featured: false
+tldr: "Prime Agent 的看点不是又一个终端聊天界面，而是把 coding agent 拆成持久 IPython 控制面、durable harness、后台会话和子代理编排。适合长任务实验，但它不是安全沙箱，必须配合干净 worktree、外部隔离和质量门。"
+author: "YOMXXX"
+faq:
+  - q: "Prime Agent 适合直接接入生产仓库吗？"
+    a: "不建议直接接入。官方 README 明确提醒它会用用户权限执行模型生成的 Python 和项目命令，应先在 disposable clone、干净 worktree 或外部沙箱里试运行。"
+  - q: "它和普通 AI 编码 CLI 最大区别是什么？"
+    a: "它强调持久 REPL、可精炼的 harness 状态、后台会话和内置子代理。普通 CLI 更像一次对话，Prime Agent 更像一个可恢复的长任务控制环境。"
+  - q: "RLM 在这里是什么意思？"
+    a: "Prime Agent README 把 Recursive Language Model 描述成把上下文当变量、把工具和子代理当函数调用的模型编程方式，核心是让 agent 通过程序化接口组织工作。"
+  - q: "本文代码能直接运行吗？"
+    a: "文中的项目命令和检查脚本是可运行模板；Prime Agent 相关命令需要先按官方 README 安装并完成登录，具体参数以当前版本文档为准。"
+  - q: "什么时候不该用长任务 Agent？"
+    a: "需求不清、测试缺失、仓库有敏感凭据、任务需要生产权限或外部副作用不可控时，都不该让长任务 Agent 自主推进，应先补约束和隔离。"
+---
+
+Prime Agent 在 2026 年 8 月 9 日前后冲上 GitHub Trending。它的仓库描述是“面向 coding workflows 和 long-running autonomous tasks 的 self-improving RLM agent”。这个描述容易让人先看模型能力，但真正值得开发者拆解的是运行时：持久 Python 控制环境、durable harness、内置子代理、后台 daemon、可 reattach 的 session、可预算的 autonomous mode。
+
+过去的 coding agent 多半围绕一次聊天设计。用户发需求，agent 读文件、改文件、跑测试，最后交出 diff。这个模式适合小修小补，但面对长任务很快会卡住：上下文窗口需要反复压缩，执行状态随着终端断开丢失，多人协作时很难知道 agent 还在做什么，复用经验只能靠在提示词里越写越长。Prime Agent 把方向调到“长任务控制台”：把 agent 的工作状态从聊天 transcript 里拿出来，放进可恢复的 REPL、harness 和后台任务。
+
+本文把它当成一个工程模式来用，不把它包装成生产安全方案。官方 README 已经写得很直接：Prime Agent 会执行模型生成的 Python 和项目命令，worker 和 kernel 进程改善的是生命周期隔离与恢复，不是安全沙箱。正确使用方式是先把工作区、权限和质量门设计好，再让 agent 进入长任务。
+
+## 先建立干净工作区
+
+不要在主开发目录里直接启动长任务 agent。最低限度，给它一个可回滚分支和干净状态。
+
+```bash
+git clone git@github.com:your-org/your-repo.git /tmp/agent-task-repo
+cd /tmp/agent-task-repo
+git switch -c agent/prime-task-2026-08-09
+git status --short
+```
+
+如果仓库含 `.env`、云凭据、生产配置、客户数据或私有 fixture，先用脚本扫描。下面这个脚本可直接保存为 `scripts/agent-preflight.sh` 后运行：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "== git status =="
+git status --short
+
+echo "== suspicious secrets =="
+rg -n "(OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET|PRIVATE_KEY|DATABASE_URL)" . \
+  --glob '!node_modules' \
+  --glob '!dist' \
+  --glob '!coverage' || true
+
+echo "== large files =="
+find . -type f -size +20M \
+  -not -path './.git/*' \
+  -not -path './node_modules/*'
+```
+
+它不是完整的 secret scanner，但足够提醒你：长任务 agent 获得的是本机用户权限，不要把不能被模型看到或执行的东西留在目录里。
+
+## 用任务说明替代口头需求
+
+长任务最怕需求在对话中漂移。启动 agent 前，先写一个任务文件，让目标、禁止项、验收标准和预算都落地。
+
+```markdown
+# Task
+
+## Objective
+Refactor the invoice export flow so large exports run asynchronously and expose progress to the UI.
+
+## Constraints
+- Do not change database schema without an explicit migration proposal.
+- Do not call production services.
+- Keep public API backward compatible.
+- Prefer existing queue abstractions.
+
+## Acceptance
+- Unit tests cover queue enqueue, worker execution, and progress query.
+- Existing invoice export tests still pass.
+- A short implementation note is written to docs/invoice-export.md.
+
+## Budget
+- Maximum 8 agent turns.
+- Run tests after each meaningful edit batch.
+- Stop and report if migration is required.
+```
+
+这种文件有两个作用。第一，它让 agent 的初始上下文更稳定。第二，任务结束后你可以对照验收标准，而不是在聊天记录里猜它是否完成。Prime Agent 的 persistent goals 和 harness refinement 都应该围绕这类明确任务文件展开。
+
+## 启动 Prime Agent
+
+官方 README 给出的安装路径是：
+
+```bash
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+cd /path/to/project
+prime-agent
+```
+
+第一次启动需要 `/login` 选择订阅或 API-key provider。这里有一个重要细节：agent 工作在当前目录，可以修改文件和运行命令。因此我的建议是把启动动作固定成一个 wrapper，避免误进生产仓库。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ ! -f ".agent-task.md" ]; then
+  echo "missing .agent-task.md"
+  exit 1
+fi
+
+if [ -n "$(git status --short)" ]; then
+  echo "worktree is not clean"
+  git status --short
+  exit 1
+fi
+
+prime-agent
+```
+
+把它放在 `bin/start-prime-agent`，让每个长任务都必须先具备任务文件和干净 worktree。这个约束看起来小，但能挡住大部分“随手在错误目录启动”的事故。
+
+## 把子代理当成后台函数
+
+Prime Agent README 提到 `rlm(...)` 可以生成子代理，并以程序化方式返回结果。这是长任务 Agent 的关键能力，因为真实任务里有很多可并行的调查工作：一个子代理读测试，一个子代理读 API 调用链，一个子代理查文档，一个子代理做风险审计。
+
+但不要让子代理同时改文件。一个安全的使用模式是：主 agent 保留写权限，子代理只做只读调查并返回结构化报告。
+
+```python
+task = """
+Read the export-related tests and summarize:
+1. current behavior
+2. important fixtures
+3. likely files to modify
+Do not edit files.
+Return JSON with keys: behavior, fixtures, files, risks.
+"""
+
+report = rlm(task)
+print(report)
+```
+
+这段是 Prime Agent 环境中的伪代码，展示的是控制面思路。你要让子代理像函数一样有输入、输出和副作用边界。否则多个 agent 同时改同一个仓库，最后只会得到难以 review 的冲突 diff。
+
+## 给每轮执行写证据
+
+长任务 Agent 的成功，不应该只看最后是否说“完成”。每一轮都应该有证据：读了哪些文件、改了哪些文件、跑了哪些检查、失败时如何解释。可以要求 agent 在工作区维护 `agent-log.md`：
+
+```markdown
+# Agent Log
+
+## Turn 1
+- Read: src/export, tests/export
+- Decision: existing sync export path must remain
+- Risk: queue worker has no progress table
+- Next: inspect queue abstractions
+
+## Turn 2
+- Changed: src/export/enqueue.ts
+- Tests: pnpm test export-enqueue
+- Result: failed, missing mock queue factory
+- Next: add test helper
+```
+
+这个日志不替代 git diff，但它让 review 更快。尤其当 Prime Agent 后台运行、定时 heartbeat 或 autonomous mode 继续推进时，人类需要一个低成本入口知道它为什么改成这样。
+
+## 质量门必须外置
+
+Prime Agent 的 autonomous mode 可以在预算内继续推进，也可以运行用户定义的 quality gates。这里要记住一句工程原则：质量门只能证明它检查过的东西，不能证明任务一定成功。
+
+推荐把质量门写成仓库脚本，而不是只写在提示词里。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+pnpm lint
+pnpm test
+pnpm build
+
+git diff --check
+
+if rg -n "TODO|FIXME|console\\.log" src tests; then
+  echo "unexpected debug markers"
+  exit 1
+fi
+```
+
+如果项目没有这么完整的脚本，也至少保留类型检查、目标测试和 `git diff --check`。Agent 可能很擅长解释失败原因，但仓库应该用机器规则判断是否能合并。
+
+## 使用可恢复会话，但不要隐藏失败
+
+Prime Agent 的后台 daemon、`prime-agent agents`、`prime-agent attach`、`prime-agent --resume` 都是为长任务设计的。断开终端后还能 reattach 很有用，尤其适合跑大测试、长文档迁移、跨模块重构。
+
+问题是，后台继续运行容易让失败变得不显眼。我的做法是给长任务设置三个停止条件：
+
+1. 测试连续两轮失败且错误类别相同。
+2. 需要新增生产凭据、外部账号或真实网络访问。
+3. diff 超过预设规模，例如超过 800 行或触及 12 个文件。
+
+这些条件应该写进任务说明，并要求 agent 一旦触发就停止报告，而不是继续“尝试一下”。长任务 Agent 的价值是持续推进，不是绕过边界。
+
+## `/refine` 应该只沉淀小经验
+
+Prime Agent 的 continual harness 允许 `/refine` 基于当前轨迹写入补充 prompts、memories、skills 或子代理规格。这个能力很诱人，但也容易把错误经验固化。
+
+我建议只允许三类 refinement：
+
+第一类是项目事实，例如“本仓库的队列抽象在 `src/lib/jobs`，不要直接引入 BullMQ”。第二类是检查习惯，例如“修改导出流程后必须运行 `pnpm test export`”。第三类是可回滚技能草案，例如“生成迁移提案的固定模板”。不要把一次失败中的猜测写成永久规则，也不要让 `/refine` 改写基础系统提示词。官方 README 也强调它不会重写 immutable base system prompt，并有快照支持回滚。
+
+## 一个推荐工作流
+
+综合起来，Prime Agent 的长任务工作流可以这样跑：
+
+1. 创建 disposable clone 或专用分支。
+2. 写 `.agent-task.md`，包含目标、禁止项、验收、预算和停止条件。
+3. 跑 `scripts/agent-preflight.sh`，清理敏感信息。
+4. 启动 `prime-agent`，先要求它只读分析并写计划。
+5. 允许它分批编辑，每批后运行质量门。
+6. 用子代理做只读调查，不让子代理直接写文件。
+7. 任务完成后由人类 review `agent-log.md`、diff 和测试输出。
+8. 只把可验证的小经验通过 `/refine` 沉淀到 harness。
+
+这套流程的核心不是“信任 agent”，而是把 agent 放进一个可观察、可恢复、可中止的工作系统里。
+
+## 结论
+
+Prime Agent 把 coding agent 的竞争点推向了长任务基础设施：持久控制环境、后台生命周期、程序化子代理、可精炼 harness 和预算化 autonomous mode。这些能力对真实软件工程很重要，因为很多有价值的任务本来就不是一轮对话能完成的。
+
+但它也把风险暴露得更清楚：如果 agent 可以长期运行、调用工具、修改文件、沉淀经验，那么工作区隔离、任务边界、质量门和人工 review 就更不能省。把它当成“会写代码的后台作业系统”来设计，而不是当成“更聪明的聊天框”来使用，才是 Prime Agent 当前最稳妥的落地姿势。
+
+参考来源：[Prime Agent GitHub README](https://github.com/PrimeIntellect-ai/prime-agent)、[GitHub Trending](https://github.com/trending)、[Hacker News 首页](https://news.ycombinator.com/)。
