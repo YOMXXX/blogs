@@ -1,0 +1,204 @@
+---
+title: "OpenChamber 工坊：把 OpenCode Agent 变成可远程接管的开发工作台"
+description: "OpenChamber 登上 Hacker News 后，Agent IDE 的重点从单个终端转向桌面、浏览器、手机和 VS Code 统一工作台。本文给出本地部署、远程访问、安全门禁和团队验收流程。"
+column: "workshop"
+tags: ["OpenChamber", "OpenCode", "coding-agent", "remote-dev", "agent-IDE", "workshop"]
+pubDate: 2026-08-10
+featured: false
+tldr: "OpenChamber 不是新的模型，而是 OpenCode 之上的 agentic development environment。它把 session goal、multi-run、diff walkthrough、手机访问、VS Code 集成和远程 relay 合在一起。真正落地时，重点是把它放进隔离工作区、固定端口、UI 密码、只读预检和质量门，而不是让远程 Agent 获得无限制开发权限。"
+author: "YOMXXX"
+faq:
+  - q: "OpenChamber 和 OpenCode 是什么关系？"
+    a: "OpenChamber 官方 FAQ 写明当前运行在 OpenCode SDK 之上，它负责桌面、Web、移动端和 VS Code 的交互工作台，底层编码 Agent 能力来自 OpenCode。"
+  - q: "它适合在公司内网直接暴露吗？"
+    a: "不建议裸露。即使 OpenChamber 支持 UI 密码、隧道和 Private Relay，也应该先放在专用开发机、临时仓库和最小权限账号中，再按团队安全策略开放。"
+  - q: "本文的脚本需要真实安装 OpenChamber 吗？"
+    a: "安装命令需要按官方文档执行；本文提供的 preflight、启动 wrapper 和验收脚本是通用模板，可以直接放到项目里调整后使用。"
+  - q: "为什么要为 Agent 工作台设置端口和密码？"
+    a: "远程工作台一旦离开 localhost，就等于把项目上下文、diff 和命令入口放到网络边界上，固定端口、访问口令和日志能降低误暴露风险。"
+  - q: "手机上看 Agent 工作有什么实际价值？"
+    a: "价值不是在手机上写代码，而是在通勤、会议间隙或测试等待时查看进度、终止错误方向、审阅 diff 分组和补充任务约束。"
+---
+
+OpenChamber 这两天出现在 Hacker News 首页，标题是 “OpenChamber: An Agentic Development Environment”。它的官网把定位说得很清楚：这是一个面向 AI coding 的 agentic development environment，覆盖 desktop、browser、phone 和 VS Code；可以 watch agents work、review diffs、branch sessions，并把整个 agent board 保持可见。GitHub 仓库描述也很直接：它是 OpenCode AI agent 的 desktop 和 web interface。
+
+这类工具的意义，不是再发明一个“会写代码的聊天框”。过去的 AI 编码工具大多卡在两个界面之间：终端 CLI 适合跑命令，但难以观察多个会话；IDE 插件贴近代码，但不适合长任务和手机接管；Web 面板方便远程访问，却容易和本地环境脱节。OpenChamber 的看点是把 Agent 运行时变成一个可观察、可暂停、可恢复、可分支的开发工作台。
+
+本文不把它当成魔法 IDE，而是给出一个更保守的落地流程：先建隔离目录，再启动 OpenCode 和 OpenChamber，再开放浏览器或手机访问，最后用质量门决定 Agent 的修改是否可以进入真实分支。
+
+## 先准备隔离工作区
+
+远程 Agent 工作台最忌讳直接连主仓库。先创建任务分支，并确认目录里没有生产密钥。
+
+```bash
+git clone git@github.com:acme-ai/invoice-platform.git /tmp/openchamber-task
+cd /tmp/openchamber-task
+git switch -c agent/openchamber-2026-08-10
+git status --short
+```
+
+给项目加一个轻量预检脚本：
+
+```bash
+mkdir -p scripts
+cat > scripts/agent-preflight.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "git status"
+git status --short
+
+echo "secret-like strings"
+rg -n "(API_KEY|SECRET|PRIVATE_KEY|DATABASE_URL|TOKEN)" . \
+  --glob '!node_modules' \
+  --glob '!dist' \
+  --glob '!coverage' || true
+
+echo "large mutable files"
+find . -type f -size +20M \
+  -not -path './.git/*' \
+  -not -path './node_modules/*'
+SH
+
+chmod +x scripts/agent-preflight.sh
+./scripts/agent-preflight.sh
+```
+
+上面这段脚本只是预警，不是完整 secret scanner。它的作用是让团队在启动远程工作台前停一下：如果目录里有 `.env.production`、云账号 JSON、客户 fixture 或私有日志，就不要把它交给 Agent。
+
+## 安装底层 Agent
+
+OpenChamber 官网 FAQ 提到当前 harness 是 OpenCode SDK，安装 OpenCode 的命令以官方文档为准。可以先按 OpenCode 方式完成登录和模型配置，再启动 OpenChamber。
+
+```bash
+curl -fsSL https://opencode.ai/install | bash
+opencode --version
+```
+
+然后安装 OpenChamber。官网提供下载入口，也展示了 `openchamber serve --ui-password` 和 relay pairing link 的工作流。实际命令以当前文档为准，本文重点放在启动包装方式。
+
+## 用 wrapper 固定启动方式
+
+不要让每个人随手输入不同参数。把启动方式封装成脚本，固定端口、UI 密码和预检流程。
+
+```bash
+mkdir -p bin
+cat > bin/start-openchamber <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ ! -f ".agent-task.md" ]; then
+  echo "missing .agent-task.md"
+  exit 1
+fi
+
+if [ -n "$(git status --short)" ]; then
+  echo "worktree must be clean before starting"
+  git status --short
+  exit 1
+fi
+
+./scripts/agent-preflight.sh
+
+if [ -z "${OPENCHAMBER_UI_PASSWORD:-}" ]; then
+  echo "OPENCHAMBER_UI_PASSWORD is required"
+  exit 1
+fi
+
+openchamber serve --port 3000 --ui-password "$OPENCHAMBER_UI_PASSWORD"
+SH
+
+chmod +x bin/start-openchamber
+```
+
+为什么要求 `.agent-task.md`？因为 Agent 工作台一旦支持长会话、手机接管和多模型运行，需求漂移会变成第一风险。任务文件应该写清楚目标、禁止项和验收方式。
+
+```markdown
+# Agent Task
+
+## Objective
+Implement async invoice export progress without changing the public API.
+
+## Constraints
+- Do not use production services.
+- Do not edit migration files unless a migration proposal is requested.
+- Keep changes under 800 lines before human review.
+
+## Acceptance
+- Unit tests cover enqueue, worker execution, and progress query.
+- Existing export tests still pass.
+- The final diff is grouped into reviewable steps.
+```
+
+OpenChamber 的 changes walkthrough 和 session goals 正适合服务这类任务文件。它能把大 diff 分组讲清楚，但前提是你先给它一个稳定的 finish line。
+
+## 远程访问的边界
+
+OpenChamber 官网强调 browser、PWA、mobile、UI password、tunnel link、Private Relay 和 one-time QR pairing。对开发者来说，这意味着你可以在手机上查看 Agent 进度，也可以让团队成员在浏览器里看同一块工作板。
+
+但远程访问不是安全豁免。推荐三个边界：
+
+第一，默认只绑定 localhost。只有需要手机或同事接入时，才开启 tunnel 或 relay。
+
+第二，UI password 必须来自环境变量或密码管理器，不要写进仓库、shell history 或共享截图。
+
+第三，每个任务结束后轮换 tunnel、撤销 pairing，并关闭后台 daemon。远程链接不应该跨任务复用。
+
+## 多模型运行怎么用
+
+OpenChamber 的功能卡提到 multi-run 和 fusion：同一任务最多跨多个模型运行，保留最好结果或融合强项。这个能力适合探索，不适合直接并发写入同一分支。
+
+更稳的方式是把多模型拆成“候选方案评审”：
+
+```markdown
+Run three read-only plans for this task.
+
+Each plan must include:
+- files likely to change
+- expected risk
+- test strategy
+- reason not to touch unrelated modules
+
+Do not edit files in this step.
+```
+
+等三个模型给出方案后，选一个主线让单个 Agent 编辑。这样可以利用多模型视角，又不会把代码库变成多个 Agent 同时改写的冲突现场。
+
+## 质量门外置
+
+远程 Agent 的最后一步不是“它说完成”，而是仓库脚本通过。给项目加一个最小验收脚本：
+
+```bash
+cat > scripts/agent-quality-gate.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+pnpm lint
+pnpm test
+pnpm build
+git diff --check
+
+if rg -n "TODO|FIXME|console\\.log" src tests; then
+  echo "debug marker found"
+  exit 1
+fi
+SH
+
+chmod +x scripts/agent-quality-gate.sh
+```
+
+如果项目没有前端构建，就把对应命令换成后端测试。关键是让 OpenChamber 里的每个 session goal 都绑定一个可重复执行的门禁。
+
+## 适合和不适合的任务
+
+OpenChamber 适合三类任务。第一类是长时间运行但可回滚的重构，例如测试补齐、迁移脚手架、文档同步。第二类是需要多端观察的任务，例如测试跑很久、Agent 需要等待 review。第三类是需要 diff walkthrough 的任务，例如跨文件 API 调整。
+
+不适合的任务也很明确：生产数据库操作、真实支付流程、需要私密账号的后台、没有测试的核心业务逻辑、以及任何失败成本很高的外部副作用。OpenChamber 让 Agent 更容易被观察，不代表它自动获得了可信执行权。
+
+## 结论
+
+OpenChamber 的价值在“工作台”，不是在“更聪明”。它把 OpenCode Agent 的执行过程放进桌面、浏览器、手机和 VS Code，让团队能看见 session goal、多模型尝试、diff 解释和远程状态。对个人开发者，它降低了长任务 Agent 的接管成本；对团队，它提供了一个更接近真实开发流程的 Agent 控制面。
+
+真正上线的关键，是把它包进工程纪律里：隔离仓库、任务文件、UI 密码、可撤销远程链接、只读计划、多模型不并发写、外置质量门。这样 OpenChamber 才会从“漂亮的 Agent UI”变成可审计的开发工作台。
+
+参考来源：[OpenChamber 官网](https://openchamber.dev/)、[OpenChamber GitHub](https://github.com/openchamber/openchamber)、[Hacker News 讨论](https://news.ycombinator.com/item?id=49233448)。

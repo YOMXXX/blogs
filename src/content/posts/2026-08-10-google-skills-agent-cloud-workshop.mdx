@@ -1,0 +1,171 @@
+---
+title: "Google Skills 工坊：把云产品知识做成可安装的 Agent 能力包"
+description: "google/skills 冲上 GitHub Trending，它把 Google Cloud、Gemini、GKE、BigQuery、广告和分析产品沉淀为 Agent Skills 与插件。本文给出安装、筛选、审查和团队内复用流程。"
+column: "workshop"
+tags: ["Google-Skills", "agent-skills", "Google-Cloud", "Gemini", "MCP", "workshop"]
+pubDate: 2026-08-10
+featured: false
+tldr: "Google Skills 的价值不是把文档搬进仓库，而是把云产品操作知识、排障流程、架构建议和插件入口包装成 Agent 可安装的 skills。它支持 `npx skills add google/skills`，也面向 Claude Code、Codex 和 Antigravity CLI 提供插件安装路径。团队落地时要先筛选最小技能集、审查 Markdown 指令、限制云权限，再把技能和 MCP server 纳入版本治理。"
+author: "YOMXXX"
+faq:
+  - q: "google/skills 是什么？"
+    a: "它是 Google 维护的 Agent Skills 仓库，包含 Google Cloud、Gemini、GKE、BigQuery、广告、分析等产品和技术的技能说明与插件入口。"
+  - q: "它和普通文档有什么区别？"
+    a: "普通文档给人读；Agent Skills 会把步骤、约束、检查项和工具入口组织成 Agent 可以按需加载的能力包。"
+  - q: "可以直接把全部技能装进团队 Agent 吗？"
+    a: "不建议。技能越多，提示上下文、权限和误用面越大。应该按团队真实任务筛选最小集合，再做内部审查。"
+  - q: "安装技能是否等于授权云账号？"
+    a: "不是。安装 Markdown 技能只是增加指导材料；真正风险来自插件、MCP server、gcloud 凭据和云 IAM 权限，需要单独管理。"
+  - q: "Codex 用户能用这个仓库吗？"
+    a: "README 的插件表提到 Codex 可通过 `codex plugin marketplace add google/skills` 后从插件浏览器安装，具体可用性以本地 Codex 版本为准。"
+---
+
+GitHub Trending 今天出现了 `google/skills`，仓库描述是 “Agent Skills for Google products and technologies”。README 显示，这个仓库覆盖 Google Cloud、Gemini、GKE、BigQuery、Cloud Run、Firebase、广告、分析等大量产品，还包含面向 Claude Code、Codex 和 Antigravity CLI 的插件安装路径。
+
+这件事值得写成工坊，不是因为“Google 又开了一个文档仓库”，而是因为它代表 Agent 能力交付方式的变化。过去团队把云产品知识写在 wiki、runbook、Terraform module README 里；Agent 来了以后，这些知识需要变成可安装、可更新、可审查、可按需加载的 skill。
+
+一个好的 skill 不只是提示词。它应该告诉 Agent：什么时候使用、需要哪些前置条件、哪些命令可以跑、哪些操作要审批、常见错误如何排查、哪些链接是权威来源。`google/skills` 把这件事按产品和方案拆成了可复用单元。
+
+## 安装前先看目录
+
+README 给出的基础安装方式是：
+
+```bash
+npx skills add google/skills
+```
+
+但我不建议直接全量安装。先只读查看仓库结构：
+
+```bash
+git clone https://github.com/google/skills.git /tmp/google-skills
+cd /tmp/google-skills
+find skills -maxdepth 3 -type d | sed -n '1,120p'
+find plugins -maxdepth 3 -type f | sed -n '1,120p'
+```
+
+README 里列出的技能很多：Google Cloud onboarding、solution architecture、Build and deploy AI agents on Google Cloud、RAG for enterprise search using GKE and AlloyDB、Gemini API、Gemini Live API、GKE inference、BigQuery AI and ML、Cloud Monitoring chart generation、SecOps detection coverage 等。
+
+团队应该先按任务筛选。例如你只做 Gemini 和 GKE Agent 部署，就不要安装广告、分析、Bigtable、Spanner 全套技能。技能集越小，Agent 越容易选对上下文。
+
+## 建一个技能审查清单
+
+Skills 本质上是给 Agent 的操作说明。既然它会影响 Agent 行为，就应该像依赖一样审查。
+
+```markdown
+# Skill Review Checklist
+
+- Skill name:
+- Source repo:
+- Commit:
+- Product area:
+- Intended tasks:
+- Required external tools:
+- Required credentials:
+- Network access:
+- Commands that mutate cloud resources:
+- Human approval points:
+- Internal owner:
+- Review date:
+```
+
+这个清单能避免一个常见误区：以为 Markdown 没有风险。Markdown 本身不会执行，但 Agent 会读它，并可能据此调用 `gcloud`、MCP server 或 API。真正的风险在“指导材料加工具权限”的组合上。
+
+## 用最小权限跑第一个技能
+
+假设团队想让 Agent 帮助做 GKE 推理迁移调研。你可以只安装相关技能，然后给它一个只读云身份。
+
+```bash
+gcloud auth login
+gcloud config set project staging-ai-agents-42
+gcloud auth application-default login
+```
+
+云 IAM 应该从只读开始，例如查看集群、节点池、配额、日志和指标。不要一开始就给 Agent `roles/owner` 或生产项目写权限。即使技能里有部署步骤，也应该先让 Agent 生成计划，不让它直接执行。
+
+任务文件可以这样写：
+
+```markdown
+# Agent Task
+
+Use the selected Google Skills to assess whether this service can migrate to GKE inference.
+
+Constraints:
+- Read-only cloud access only.
+- Do not create, update, or delete resources.
+- Do not change IAM.
+- Produce a migration plan with risks, required quotas, and validation steps.
+
+Acceptance:
+- References the exact project, cluster, and service names inspected.
+- Lists commands that would be needed for a future approved migration.
+- Marks every mutating command as pending human approval.
+```
+
+这比“帮我迁移到 GKE”安全得多。Agent 可以利用技能里的产品知识，但权限和目标被锁住。
+
+## 插件和 MCP 要单独治理
+
+README 的插件表提到：Claude Code 可添加 marketplace 后安装插件；Codex 可 `codex plugin marketplace add google/skills`，再从 `/plugins` browser 安装；Antigravity CLI 可按插件路径安装。
+
+这里要把 skill 和 plugin 分开看。Skill 往往是 Markdown 指令和知识；plugin 可能携带 MCP server、工具定义或更深集成。安装 plugin 前要回答：
+
+1. 它会启动本地服务吗？
+2. 它会读取哪些环境变量？
+3. 它是否调用 `gcloud` 或外部 API？
+4. 它的工具 schema 是否区分只读和写入？
+5. 它是否有日志和错误输出？
+6. 它是否能按项目、账号和域名限制访问？
+
+这些问题没有答案时，不要把插件接进生产账号。
+
+## 团队内复用方式
+
+最稳妥的方式不是每个人各自从 upstream 安装，而是建立一个内部镜像或锁版本清单。
+
+```yaml
+skills:
+  google-cloud-solution-build-deploy-agents:
+    source: google/skills
+    commit: 753d99b7f98eb7fe572198470985585c4442f45c
+    owner: platform-ai
+    allowed_projects:
+      - staging-ai-agents
+    permissions:
+      - read-only-gcloud
+  gke-inference:
+    source: google/skills
+    commit: 753d99b7f98eb7fe572198470985585c4442f45c
+    owner: ml-platform
+    allowed_projects:
+      - staging-ml
+    permissions:
+      - read-only-gke
+```
+
+当 upstream 更新时，团队做 diff review，再升级 commit。这样 skill 变更和代码依赖一样可追踪。
+
+## 和内部 runbook 结合
+
+Google Skills 提供的是通用产品知识，企业还需要内部上下文：项目命名、组织策略、网络边界、审批流程、成本中心、SLO、事故联系人。不要把内部知识直接改进 upstream，而是叠加一个内部 skill。
+
+```text
+company-skills/
+  skills/
+    cloud/
+      company-gke-guardrails/
+        SKILL.md
+      company-gemini-budget-policy/
+        SKILL.md
+```
+
+内部 skill 可以写明：禁止生产项目自动写入；所有 Cloud Run 部署必须走 CI；GKE 节点池变更要经过平台团队；BigQuery 查询默认加 dry run；日志不能导出到个人目录。
+
+这样 Google Skills 负责产品知识，内部 skills 负责组织边界。
+
+## 结论
+
+`google/skills` 的出现说明大厂正在把产品知识 Agent 化。未来开发者使用云平台，不会只读文档和复制命令，而是让 Agent 按技能包加载产品流程、排障路径和工具接口。
+
+但技能包越有用，越需要治理。正确落地不是全量安装、直接授权、让 Agent 自己探索，而是筛选最小技能集、锁定版本、审查指令、限制 IAM、区分只读和写入、把插件与 MCP 纳入安全评审。这样，Google Skills 才会成为团队的可复用能力库，而不是另一个不可控的提示词来源。
+
+参考来源：[google/skills GitHub](https://github.com/google/skills)、[google/skills README](https://github.com/google/skills/blob/main/README.md)、[Agent Skills](https://agentskills.io/home)。

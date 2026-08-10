@@ -1,0 +1,136 @@
+---
+title: "HarnessOpt-Bench 论文速读：Agent 能力瓶颈正在从模型转向 Harness"
+description: "HarnessOpt-Bench 发布后，Agent 评测的焦点从模型本体扩展到 prompts、tools、control flow、memory 和 orchestration code。本文拆解 benchmark 设计、关键结论与工程落地方式。"
+column: "paper"
+tags: ["paper", "HarnessOpt", "agent-harness", "benchmark", "LLM-agent", "evaluation"]
+pubDate: 2026-08-10
+featured: false
+tldr: "HarnessOpt-Bench 的核心贡献是把自动化 harness 优化变成可评测任务：给优化器一个 seed harness、评分反馈和固定评测预算，让它改进目标 Agent 的提示词、工具、控制流、记忆和编排代码。它提醒开发者：Agent 的性能不再只取决于模型权重，优化器模型、评测预算和 harness 结构本身都会显著影响最终结果。"
+author: "YOMXXX"
+faq:
+  - q: "HarnessOpt-Bench 评测的是什么？"
+    a: "它评测 LLM 作为优化器时，能否在有限预算下改进一个 Agent harness，包括提示词、工具接口、控制流、记忆和编排代码。"
+  - q: "这和普通 prompt optimization 有什么区别？"
+    a: "普通 prompt optimization 多半只改提示词；harness optimization 还会改工具选择、执行流程、状态管理、错误恢复和评测适配。"
+  - q: "为什么它对开发者重要？"
+    a: "因为生产 Agent 的成功率常常被 harness 限制。只换模型可能收益有限，系统化改 harness 反而能更快提升成功率和成本效率。"
+  - q: "论文结论能直接套到所有项目吗？"
+    a: "不能。Benchmark 提供共同协议和方向，但每个项目的任务分布、风险边界、工具副作用和评测噪声都不同，需要本地验证。"
+  - q: "小团队该如何开始做 harness 优化？"
+    a: "先建立固定评测集和日志格式，再让优化器只生成候选 patch，由人类 review 后合入，避免让 Agent 在生产 harness 上无限自改。"
+---
+
+过去一年，Agent 开发者习惯把失败归因到模型：模型不够聪明、上下文不够长、工具调用不够稳定、推理预算不够大。HarnessOpt-Bench 提醒我们，另一个变量正在变得同样重要：harness。
+
+论文和项目页对 harness 的定义很宽：围绕模型的 prompts、tools、control flow、memory 和 orchestration code。换句话说，Agent 的能力不只是模型权重，也取决于你怎样给它观测、怎样定义动作、怎样处理失败、怎样保存状态、怎样把评测信号反馈给下一轮。
+
+HarnessOpt-Bench 把这个问题变成一个 benchmark：给优化器一个目标 Agent 的 seed harness、带评分的评测反馈和固定 target-evaluation budget，让优化器在昂贵且随机的评测环境中迭代改进 harness。Hugging Face 摘要写得很直白：社区缺少共同协议来衡量 frontier LLM 在自动化 harness optimization 上做得怎样。
+
+## 为什么 harness 是新瓶颈
+
+一个网页 Agent 失败，可能不是模型不会推理，而是 DOM 摘要丢掉了关键按钮；一个编码 Agent 失败，可能不是模型不会写代码，而是测试结果被截断、文件检索顺序错误、工具 schema 太宽；一个企业 RAG Agent 失败，可能不是模型不会回答，而是检索、重排、引用和权限过滤之间没有闭环。
+
+这些都不是单纯换模型能解决的问题。模型被放进一个低质量 harness 后，会持续收到低质量观测和低质量反馈。它可以更努力地推理，但无法弥补接口设计错误。
+
+这也是 HarnessOpt-Bench 值得关注的地方。它把“改提示词”升级成“改 Agent 运行时周边系统”，并要求优化结果经过评测预算约束。真实生产里，评测不是免费的：每次 rollout 都要花 token、时间、API 额度和人工复核成本。能在有限预算内找到有效 harness 改动，本身就是一种 Agent 能力。
+
+## Benchmark 的任务形态
+
+根据论文摘要，HarnessOpt-Bench 的优化器是一个 LLM 配合 coding harness。它收到三类输入：seed harness、graded evaluation feedback、固定目标评测预算。输出不是一句答案，而是对目标 Agent harness 的修改。
+
+这个设定很接近真实工作流。团队通常已经有一个能跑但不够稳的 Agent；有一组失败轨迹、评分日志或回归集；还有一个无法无限消耗的评测预算。优化器要做的不是从零设计系统，而是在已有 harness 上做可验证改进。
+
+这和传统 benchmark 不同。传统评测问“模型能不能完成任务”，HarnessOpt-Bench 问“模型能不能改进另一个系统，让它以后更会完成任务”。这是二阶能力：Agent 不只是使用工具，而是在优化工具、协议和执行环境。
+
+## 关键结论的工程含义
+
+AI Weekly 对论文的摘要提到，benchmark 覆盖 5 个 frontier LLM、4 个 downstream tasks 和 111 个 scored runs，并指出 optimizer model choice 往往比 coding harness choice 更能区分结果；native harness 并不总是优于 shared harness，收益会随任务和 seed 条件变化。
+
+这几个结论对工程团队很实用。
+
+第一，优化器模型很重要。你不能假设“任何强模型加上代码工具”都能稳定优化 harness。优化器需要理解评测噪声、避免过拟合、识别真实失败模式，还要写出可维护 patch。
+
+第二，原生集成不是万能。很多团队会相信“某模型配它自家的 harness 一定最好”。HarnessOpt-Bench 的结果提示，shared harness 在某些设置下也可能表现不错，关键是任务、反馈和编辑约束是否清晰。
+
+第三，seed harness 很重要。一个糟糕到无法观测失败原因的 harness，很难被自动优化。想让 Agent 自改系统，先要让系统暴露足够结构化的错误信号。
+
+## 如何在本地复刻思想
+
+小团队不一定要完整复刻 Benchmark，但可以采用它的协议思想。先把 harness 优化拆成四个目录：
+
+```text
+agent-harness/
+  prompts/
+  tools/
+  runtime/
+  evals/
+```
+
+然后为每次优化定义一个记录格式：
+
+```json
+{
+  "run_id": "harnessopt-2026-08-10-001",
+  "seed_commit": "abc1234",
+  "budget": {
+    "max_eval_runs": 20,
+    "max_tokens": 200000
+  },
+  "objective": "improve invoice export task success rate",
+  "changed_files": [
+    "agent-harness/prompts/planner.md",
+    "agent-harness/runtime/retry-policy.ts"
+  ],
+  "eval_before": 0.42,
+  "eval_after": 0.57,
+  "failure_notes": [
+    "planner skipped status polling after enqueue",
+    "tool output truncation hid worker error"
+  ]
+}
+```
+
+这个 JSON 不需要复杂，但必须把 seed、预算、改动、前后评分和失败解释记录下来。否则 harness optimization 会退化成“感觉这个提示词更好”。
+
+## 优化器不应直接无限自改
+
+HarnessOpt-Bench 研究的是能力评测，不是生产安全建议。工程落地时，优化器最好只生成候选 patch，而不是直接合入主线。
+
+一个安全流程是：
+
+```bash
+git switch -c harnessopt/invoice-export
+node scripts/run-agent-eval.js --suite invoice-export --out before.json
+node scripts/propose-harness-patch.js --feedback before.json --budget 8
+git diff
+node scripts/run-agent-eval.js --suite invoice-export --out after.json
+node scripts/compare-eval.js before.json after.json
+```
+
+人类 review 时重点看三件事：是否只改了 harness 相关文件；是否通过固定评测集和 held-out 集；是否引入更宽权限、更长上下文或更高成本来换取表面分数。如果优化只是把失败重试次数从 2 改成 20，成功率可能上升，但成本和副作用也会失控。
+
+## 防止评测过拟合
+
+自动化 harness 优化最容易过拟合评测集。优化器看到 graded feedback 后，可能学会针对测试格式做局部修补，而不是提升泛化能力。解决方法不复杂，但必须制度化。
+
+第一，保留 held-out set。优化器只能看到训练评测反馈，最终合入看隐藏任务。
+
+第二，记录成本指标。成功率、平均 token、平均 wall time、工具调用次数、失败恢复次数都要一起看。
+
+第三，保留人工 hard cases。那些历史上模型容易误判、工具容易截断、环境容易波动的样本，应该长期留在回归集中。
+
+第四，限制改动面。一次优化只允许改 prompts、tool schema 或 runtime policy 中的一类，避免 diff 太大无法归因。
+
+## 对 Agent 平台的长期影响
+
+HarnessOpt-Bench 代表一个方向：Agent 平台会从“提供模型调用”走向“提供可优化的运行时”。未来竞争点不只是上下文长度和单次推理能力，还包括评测反馈如何标准化、失败轨迹如何结构化、harness patch 如何回滚、优化器如何在预算内探索。
+
+这也解释了为什么近期 GitHub Trending、HN 和论文都在讨论 skills、harness、long-running sessions、trace debugging 和 reward models。Agent 工程开始进入第二阶段：不是让模型完成一次任务，而是让系统从失败轨迹中稳定变好。
+
+## 结论
+
+HarnessOpt-Bench 的价值不只是一个新榜单，而是把开发者每天都在做的隐性工作显性化：调 prompt、改工具、加状态、换控制流、补错误恢复。它告诉我们，Agent 能力瓶颈正在从“模型有多强”扩展到“harness 是否能被评测、优化和审计”。
+
+对团队来说，下一步很具体：把 harness 当成代码资产，给它评测集、预算、日志、候选 patch、held-out 验证和人工 review。只有这样，自动化 harness optimization 才可能成为生产能力，而不是一次又一次不可复现的提示词试错。
+
+参考来源：[arXiv: HarnessOpt-Bench](https://arxiv.org/abs/2608.06301)、[Hugging Face Papers](https://huggingface.co/papers/2608.06301)、[Scale Labs 论文页](https://labs.scale.com/papers/harnessopt-bench)、[AI Weekly 摘要](https://aiweekly.co/alerts/harnessopt-bench-finds-optimizer-llm-beats-harness-choice)。
