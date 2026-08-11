@@ -1,0 +1,203 @@
+---
+title: "Muse Glimmer 工坊：搭一个可审计的本地常驻 Agent"
+description: "Meta 发布 Muse Glimmer 30B 开源权重，定位本地常驻 agent、函数调用、长流程工具使用和本地编码。本文给出一套可审计的本地部署与任务队列实践。"
+column: "workshop"
+tags: ["Muse-Glimmer", "local-agent", "open-weight", "llama-cpp", "agent-workshop", "Meta-AI"]
+pubDate: 2026-08-11
+featured: false
+tldr: "Muse Glimmer 的重点不是又一个 30B 模型，而是把本地 agent 从一次性聊天推向常驻后台循环。工程落地时要把模型、任务队列、工具白名单、证据日志和升级通道拆开，让本地模型负责低风险分拣和准备工作，高风险动作继续交给人工或更强模型确认。"
+author: "YOMXXX"
+faq:
+  - q: "Muse Glimmer 适合哪些本地任务？"
+    a: "它适合低风险、长时间、可中断的本地 agent 任务，例如通知分拣、文件摘要、代码预检、工具调用草案和离线知识库整理。"
+  - q: "一定要有 24GB 显存吗？"
+    a: "不一定，但 Reddit 发布帖提到 4bit 后语言模型可压到 20GB 以内，实际还要给 KV cache、视觉编码器和 drafter 留空间。"
+  - q: "本地常驻 agent 最大风险是什么？"
+    a: "最大风险不是模型胡说，而是后台循环拿到过宽工具权限后持续执行。必须限制文件、网络、shell 和外部 API 权限。"
+  - q: "它能替代云端强模型吗？"
+    a: "不能。更合理的结构是让本地模型做分拣、草拟、检索和低风险自动化，把复杂推理、敏感操作和最终决策升级给强模型或人工。"
+  - q: "为什么要保存证据日志？"
+    a: "常驻 agent 很容易变成黑盒。保存输入、决策、工具调用、输出和人工确认记录，才能在误报、漏报或副作用发生时回放。"
+---
+
+Meta 今天把 Muse Glimmer 推到了社区视野里。HN 页面显示这条讨论在十几个小时内冲到接近千分和数百条评论；Reddit r/LocalLLaMA 的发布帖给出的定位更直接：30B dense、开源权重、Apache 2.0、面向 always-on local agent workflows。
+
+这篇工坊不急着做跑分复读。更值得开发者马上验证的是一个问题：如果本地 30B 模型真的足够擅长函数调用、长流程工具使用、失败恢复和本地编码，我们应该怎样把它接成一个不失控的常驻 agent？
+
+常驻 agent 和聊天机器人不是一类系统。聊天机器人等用户输入；常驻 agent 会轮询队列、读本地文件、看通知、调用脚本、生成草稿，甚至在你睡觉时继续工作。模型变成本地模型后，隐私和成本压力下降，但权限、审计和误动作风险上升。
+
+## 目标架构
+
+推荐先做最小闭环，而不是一上来让模型接管电脑。
+
+```text
+inbox/
+  tasks.ndjson
+runtime/
+  decisions.ndjson
+  tool-calls.ndjson
+  drafts/
+tools/
+  summarize_file.sh
+  inspect_git.sh
+  create_ticket.sh
+policy/
+  allowed-tools.json
+  escalation-rules.md
+```
+
+模型只做三件事：读取任务、选择允许的工具、写出下一步建议。真正修改代码、发邮件、删除文件、改云资源的动作，一律进入人工确认或强模型复核。
+
+这套结构的好处是可回放。你能看到 agent 为什么决定做某件事，调用了哪个工具，拿到了什么输出，最后给了什么建议。
+
+## 准备模型服务
+
+发布帖说权重已在 Hugging Face 的 Meta 模型组织下提供，社区也提到 Unsloth 的 GGUF 量化版本。实际命令会随模型卡更新变化，这里用通用 llama.cpp 方式示意：
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_METAL=ON
+cmake --build build -j
+
+./build/bin/llama-server \
+  -m ~/models/Muse-Glimmer-30B-Q4_K_M.gguf \
+  -c 32768 \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+macOS 用 Metal，Linux NVIDIA 用 CUDA，AMD 用户可以按 llama.cpp 当前 Vulkan 或 HIP 支持情况选择。HN 评论里已有用户讨论 24GB、32GB、7900XT、RTX 5090 等配置，但这些经验不是稳定规格。生产化之前要自己测：首 token 延迟、持续生成速度、上下文长度、工具调用 JSON 稳定性、长时间运行内存泄漏。
+
+## 定义任务队列
+
+不要让常驻 agent 直接监听所有系统事件。先用一个简单 NDJSON 队列：
+
+```json
+{"id":"t-001","kind":"git-review","path":"/Users/me/project-a","risk":"low","request":"检查今天的 diff，列出需要我处理的风险。"}
+{"id":"t-002","kind":"inbox-summary","path":"/Users/me/notes/inbox.md","risk":"low","request":"总结待办并按紧急程度排序。"}
+{"id":"t-003","kind":"deploy","path":"/Users/me/prod-service","risk":"high","request":"准备发布说明，但不要执行部署。"}
+```
+
+常驻循环只读取 `risk` 为 low 或 medium 的任务。high 任务可以生成计划，但必须标记为需要人工确认。
+
+## 工具白名单
+
+工具不要直接暴露 shell。用白名单包装。
+
+```json
+{
+  "tools": [
+    {
+      "name": "inspect_git",
+      "command": "tools/inspect_git.sh",
+      "mutates": false,
+      "allowed_paths": ["/Users/me/project-a", "/Users/me/project-b"]
+    },
+    {
+      "name": "summarize_file",
+      "command": "tools/summarize_file.sh",
+      "mutates": false,
+      "allowed_paths": ["/Users/me/notes"]
+    },
+    {
+      "name": "create_ticket",
+      "command": "tools/create_ticket.sh",
+      "mutates": true,
+      "requires_confirmation": true
+    }
+  ]
+}
+```
+
+本地模型的价值是低成本循环，不是无限授权。它可以读经过授权的文件，可以生成 ticket 草稿，可以解释 git diff，但不应该拿到全盘读写、浏览器 cookie、云凭据和公司聊天机器人 token。
+
+## Agent 循环伪代码
+
+下面是一个可运行思路的 Node 伪实现。它没有绑定某个 SDK，只假设本地 server 兼容 OpenAI 风格接口。
+
+```ts
+import fs from "node:fs";
+
+type Task = {
+  id: string;
+  kind: string;
+  path: string;
+  risk: "low" | "medium" | "high";
+  request: string;
+};
+
+const tasks = fs
+  .readFileSync("inbox/tasks.ndjson", "utf8")
+  .trim()
+  .split("\n")
+  .map((line) => JSON.parse(line) as Task);
+
+for (const task of tasks) {
+  const decision = await decide(task);
+  fs.appendFileSync("runtime/decisions.ndjson", JSON.stringify(decision) + "\n");
+
+  if (task.risk === "high" || decision.requires_confirmation) {
+    fs.writeFileSync(`runtime/drafts/${task.id}.md`, decision.draft);
+    continue;
+  }
+
+  for (const call of decision.tool_calls) {
+    const result = runAllowedTool(call);
+    fs.appendFileSync("runtime/tool-calls.ndjson", JSON.stringify({ task: task.id, call, result }) + "\n");
+  }
+}
+```
+
+关键点是：模型输出不等于执行。执行层还要检查工具名、路径、风险等级和确认状态。
+
+## 提示词边界
+
+常驻 agent 的 system prompt 要短，但必须明确：
+
+```text
+You are a local background agent.
+You may only propose calls to allowed tools.
+You must not ask for unrestricted shell, browser cookies, cloud credentials, or private tokens.
+For high-risk tasks, write a plan and mark requires_confirmation=true.
+Always include evidence: files inspected, commands proposed, and uncertainty.
+```
+
+这类约束不会彻底防止错误，但会让日志更容易检查。更强的约束应放在执行层，而不是只靠提示词。
+
+## 分层升级
+
+本地 Muse Glimmer 适合做第一层：读、分拣、归纳、准备。第二层可以是云端强模型或人工复核。一个实用分层如下：
+
+```text
+L0: 本地规则过滤垃圾任务和重复任务
+L1: Muse Glimmer 生成摘要、初判和草稿
+L2: 强模型处理复杂推理、代码修改计划和跨文件判断
+L3: 人工确认有副作用动作
+```
+
+这样可以把云端 token 用在真正需要的地方，也能把本地隐私数据留在机器上。
+
+## 验收清单
+
+上线前至少跑一组本地验收：
+
+```text
+- 连续运行 8 小时后内存稳定
+- 所有工具调用都有日志
+- high risk 任务不会直接执行
+- 模型无法访问白名单外目录
+- 端口只监听 127.0.0.1
+- 断网状态下能完成离线任务
+- 重启后不会重复执行已完成任务
+```
+
+Muse Glimmer 的发布时间点很有意思。社区不只在比较它和 Qwen、Gemma 的分数，也在讨论本地模型是否足够驱动 24 小时的个人工作循环。真正的工程答案不会来自榜单，而来自这种最小闭环：队列、白名单、日志、确认、升级。
+
+## 结论
+
+Muse Glimmer 让本地 agent 的讨论从“能不能跑”推进到“该不该常驻运行”。本地模型降低了隐私和成本门槛，但也让后台自动化更容易被低估。
+
+我的建议是把它当成本地 dispatcher，而不是本地万能员工。让它读可授权输入、整理上下文、生成候选工具调用和工作草稿；让执行层控制权限；让人工或强模型处理高风险决策。这样 Muse Glimmer 才会成为可靠的本地生产力部件，而不是一个永远在线的黑盒循环。
+
+参考来源：[Hacker News 讨论](https://news.ycombinator.com/item?id=49241679)、[Reddit r/LocalLLaMA 发布帖](https://www.reddit.com/r/LocalLLaMA/comments/1vkgsum/introducing_muse_glimmer_an_openweight_model/)、[Hugging Face Meta 模型页](https://huggingface.co/meta-models)。

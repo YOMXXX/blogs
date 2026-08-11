@@ -1,0 +1,146 @@
+---
+title: "DCAS 论文速读：Coding Agent 训练不能只绑定一个 Scaffold"
+description: "DCAS 指出开放 coding agent 轨迹数据过度集中在 OpenHands，微调模型跨 scaffold 部署会明显退化。本文拆解 backend-substitution 截获层和 planning-aware 数据的意义。"
+column: "paper"
+tags: ["DCAS", "coding-agent", "scaffold", "SWE-bench", "paper", "agent-training"]
+pubDate: 2026-08-11
+featured: false
+tldr: "DCAS 的核心提醒是：coding agent 模型学到的不只是写代码能力，还会学到训练 scaffold 的规划格式、工具节奏和隐式执行习惯。只在 OpenHands 等单一 scaffold 下收集轨迹并微调，部署到 Claude Code、OpenCode、mini-swe-agent 等不同 scaffold 时可能退化。"
+author: "YOMXXX"
+faq:
+  - q: "DCAS 研究的 scaffold 是什么？"
+    a: "这里的 scaffold 指 CLI coding agent 外围运行框架，包括提示格式、工具协议、规划方式、执行循环和反馈结构。"
+  - q: "为什么单一 scaffold 训练有问题？"
+    a: "模型会学习训练环境的规划和执行习惯，换到不同 CLI scaffold 后，这些习惯可能和新环境不匹配。"
+  - q: "DCAS 本身做了什么？"
+    a: "它提供 backend-substitution interception layer，在不修改 CLI scaffold 的情况下路由 API 流量，便于跨 scaffold 评测和采集轨迹。"
+  - q: "这对开源 coding 模型有什么意义？"
+    a: "它说明开源模型不能只报告单一 scaffold 下的 SWE-bench 分数，还要报告跨 scaffold 泛化能力。"
+  - q: "团队该如何借鉴？"
+    a: "训练和评测时至少覆盖两个以上 scaffold，并把显式规划、隐式规划和工具协议作为数据维度记录。"
+---
+
+Coding agent 模型评测里有一个容易被忽略的变量：scaffold。大家讨论模型、数据、SWE-bench、上下文长度、工具调用，但真实运行时，模型永远不是裸奔。它被放在某个 CLI agent 框架里：OpenHands、Claude Code、OpenCode、mini-swe-agent，或者团队自研 harness。
+
+DCAS 这篇论文把这个变量摆到台面上。arXiv 摘要指出，开放生态的轨迹数据几乎都在 OpenHands 下采集；基于这些数据微调的模型在 OpenHands 下分数不错，但部署到非训练 scaffold 时会明显退化；未训练 base model 不显示这种差异，说明退化和微调学到的 scaffold convention 有关。
+
+这对所有做 coding agent 训练和评测的团队都很重要。模型不只是学会“如何修 bug”，还会学会“在某个框架里如何计划、何时调用工具、如何解释 observation、如何结束任务”。换框架后，这些习惯可能变成负迁移。
+
+## Scaffold 为什么会被模型学进去
+
+一个 CLI coding agent scaffold 至少包含：
+
+```text
+- system prompt 和任务包装格式
+- plan 是否是 first-class artifact
+- shell、编辑器、搜索、测试工具的 schema
+- observation 如何截断和总结
+- 每轮是否要求显式 thought 或 plan
+- 失败后是重试、回滚还是请求帮助
+- 最终答案需要报告什么
+```
+
+微调数据里的每条轨迹都带着这些结构。如果 90% 轨迹来自同一个 scaffold，模型会把该 scaffold 的结构误认为“coding agent 的通用行为”。这和只用某个 IDE 录制操作数据训练助手类似：助手可能会学会 IDE 的快捷键，却以为所有环境都这样工作。
+
+## DCAS 的关键设计
+
+论文提出 Decoupling CLI Agent Scaffolding，也就是 DCAS。它是一个 backend-substitution interception layer，可以在不修改 scaffold 的情况下，把任意 CLI scaffold 和任意 backend model 接起来，并路由 API 流量。
+
+这件事的工程价值很大。过去如果要比较“同一个模型在不同 scaffold 下表现如何”，常常要改每个 scaffold 的代码、适配 API、改日志格式。DCAS 让研究者可以截获和替换 backend，形成更干净的实验。
+
+换句话说，DCAS 把变量拆开：
+
+```text
+backend model: 负责生成
+CLI scaffold: 负责运行循环和工具环境
+planning source: 负责显式或隐式规划结构
+trajectory collector: 负责采集训练数据
+```
+
+拆开以后，才能问清楚：性能差异来自模型，还是 scaffold，还是 planning source？
+
+## 显式规划和隐式规划
+
+论文特别区分两类 planning。显式规划是执行前产出的 plan artifact；隐式规划是贯穿 agent loop 的结构约定，例如先 inspect 再 edit，先跑最小测试再跑全量测试，遇到失败如何归因。
+
+这个区分很实用。很多团队只关注是否让 Agent 先写 plan，却忽略隐式规划。一个模型可能不输出漂亮计划，但工具节奏很稳；另一个模型 plan 写得完整，却在执行时乱跳。
+
+训练数据也应该记录这两类信号：
+
+```json
+{
+  "trajectory_id": "swe-2026-08-11-001",
+  "scaffold": "opencode",
+  "backend_model": "qwen-coder-30b",
+  "explicit_plan": true,
+  "implicit_plan_features": {
+    "inspect_before_edit": true,
+    "test_after_patch": true,
+    "rollback_on_failed_edit": false
+  },
+  "resolved": true
+}
+```
+
+如果只保存 prompt 和 response，后续很难分析模型到底学到了什么。
+
+## 对 SWE-bench 分数的影响
+
+Hugging Face 论文页社区评论提到一个非常醒目的实验细节：在 executor 和 scaffold 固定时，改变 plan source 可以让 Qwen3-Coder-30B-A3B-Instruct 的 Pass@1 从 42.8% 到 57.8%；使用 DCAS 收集的 576 条 planning-aware 轨迹做全参数 SFT 后，在训练未见 scaffold 上也获得提升。
+
+这些数字不该被理解为“DCAS 永远能涨这么多”。更合理的解读是：planning source 是高杠杆变量，而跨 scaffold 泛化必须单独测。一个模型在某个 leaderboard 上很强，不代表它在你的 CLI agent 里也强。
+
+## 团队训练数据该怎么改
+
+如果你在收集 coding agent 轨迹，不要只采一个 scaffold。最低限度也要覆盖两类环境：
+
+```text
+scaffold A: 强显式 planning，工具输出结构化
+scaffold B: 弱显式 planning，更接近普通终端循环
+```
+
+每条轨迹记录 scaffold 名称、版本、工具 schema、plan 形式、observation 截断策略、模型版本和任务来源。这样未来模型退化时，你可以分析是不是某个 scaffold convention 被过拟合。
+
+数据配比也要注意。不要让高分 scaffold 独占训练集。可以按任务、工具协议和规划结构分层采样，而不是简单按数量堆数据。
+
+## 评测报告应该新增一列
+
+以后 coding agent 模型报告不应只写：
+
+```text
+SWE-bench Verified: 58.2%
+```
+
+至少要写：
+
+```text
+SWE-bench Verified under OpenHands: 58.2%
+SWE-bench Verified under OpenCode: 52.1%
+SWE-bench Verified under mini-swe-agent: 47.8%
+Scaffold used for training trajectories: OpenHands 86%, custom 14%
+```
+
+这会让分数更诚实。企业选模型时，也应该要求供应商说明训练 scaffold 和评测 scaffold 是否一致。
+
+## 对框架作者的影响
+
+Open-source scaffold 作者也能从 DCAS 得到启发。一个好的 scaffold 不只是让模型跑起来，还要让轨迹可移植：
+
+```text
+- 工具调用日志结构化
+- plan artifact 可选但可记录
+- observation 截断策略透明
+- 后端模型可替换
+- 任务状态可导出
+- 失败原因可标注
+```
+
+如果 scaffold 把太多行为写死在 prompt 和隐藏规则里，模型训练出来后就更难泛化。
+
+## 结论
+
+DCAS 的核心贡献不是又做了一个 coding agent 框架，而是把 scaffold 从背景噪音变成可控变量。它提醒我们：模型能力、训练数据和运行框架不能混在一起讨论。
+
+对开发者来说，下一次看到某个开源 coding model 的 SWE-bench 分数，应该多问一句：它在哪个 scaffold 下训练，在哪个 scaffold 下评测，换到我的工具循环后还剩多少？对训练团队来说，跨 scaffold 数据和 planning-aware 轨迹将是提升泛化的关键。
+
+参考来源：[arXiv: DCAS](https://arxiv.org/abs/2608.06113)、[Hugging Face: DCAS](https://huggingface.co/papers/2608.06113)、[Engineering Signals 摘要](https://engineeringsignals.com/item/2026-W32/research-arxiv-003.md)。

@@ -1,0 +1,149 @@
+---
+title: "SkillProx 论文速读：Agent Skills 需要会删除的自进化机制"
+description: "SkillProx 提出近端文本梯度式的 agent skill 自进化框架，把诊断闭环、回滚、知识单元审计和删除合并进 skill 更新流程，适合做团队技能库治理参考。"
+column: "paper"
+tags: ["SkillProx", "agent-skills", "paper", "skill-evolution", "LLM-agent", "evaluation"]
+pubDate: 2026-08-11
+featured: false
+tldr: "SkillProx 的关键不是让 skill 越写越长，而是把失败诊断、任务反馈、回滚和知识单元级删除纳入同一个 forward-backward 框架。它提醒团队：Agent Skills 一旦成为可复用资产，就要像代码一样评估增益、压缩冗余、删除误导性规则，并用 held-out 任务验证泛化。"
+author: "YOMXXX"
+faq:
+  - q: "SkillProx 解决什么问题？"
+    a: "它解决 agent skills 在反复执行任务后如何自我更新的问题，尤其关注诊断反馈、回滚和删除低效知识单元。"
+  - q: "它和普通 prompt 优化有什么区别？"
+    a: "普通 prompt 优化多是改一段提示词；SkillProx 把技能拆成可审计知识单元，并对每个单元做贡献估计和验证门控。"
+  - q: "论文最实用的结论是什么？"
+    a: "最实用的结论是 skill 不应该只追加经验。冗余、冲突、过拟合和误导性经验都需要被降级或删除。"
+  - q: "能直接用于生产 agent 吗？"
+    a: "不能直接照搬。生产系统需要权限控制、人工 review、固定评测集和版本回滚，论文框架更适合作为治理设计参考。"
+  - q: "小团队如何借鉴 SkillProx？"
+    a: "先把 skills 版本化，再为每次更新记录失败样本、修改理由、前后评分、删除内容和 held-out 结果。"
+---
+
+过去几个月，Agent Skills 从一个 Claude/Codex 生态里的实用概念，变成了越来越多团队组织 AI 能力的基本单元。一个 skill 可以是一段 Markdown、一个 runbook、一个工具使用指南、一个产品操作流程，也可以是一组约束和检查项。
+
+问题随之出现：skill 用久了会不会变脏？
+
+答案几乎一定是会。Agent 在失败后追加经验，容易把偶然错误写成通用规则；某个模型的偏好会污染另一个模型；某个版本的工具行为会过期；同一条经验可能被重复写入三遍。SkillProx 这篇论文正好切中这个问题：自进化 skill 不应该只是“不断追加文本”，还要会诊断、回滚、审计和删除。
+
+arXiv 摘要显示，SkillProx 是一个 proximal-gradient-inspired forward-backward framework。forward 阶段做诊断驱动的编辑、重新执行、回滚回归，并把测得结果反馈给下一轮诊断；backward 阶段把 skill 拆成可审计知识单元，通过 frozen leave-one-out utility audit 估计贡献，再做验证门控的合并、降级或移除。论文报告相对最强 gradient baseline 平均准确率提升 3.0 个百分点。
+
+## 为什么 skill 会膨胀
+
+一个实际团队的 skill 通常会这样变长：
+
+```text
+第 1 周：记录基础安装步骤
+第 2 周：加一个常见错误处理
+第 3 周：加三个客户环境例外
+第 4 周：某次事故后加十条禁止事项
+第 5 周：工具升级后旧规则没删
+第 6 周：新人又把相同经验换一种说法写进去
+```
+
+结果是 skill 看起来越来越完整，Agent 实际使用时却更困惑。长文本增加上下文成本；互相冲突的规则降低执行稳定性；过期规则让 Agent 在新环境里走错路径。
+
+SkillProx 的思想是把 skill 当成可优化对象，而且优化目标不只是任务成功率，还包括复杂度。这个方向非常正确。团队的技能库一旦超过几十个文件，删除能力就和新增能力一样重要。
+
+## Forward 阶段：诊断必须有结果反馈
+
+很多自改 prompt 或自改 skill 流程会让模型读失败轨迹，然后写一段“下次注意”。问题是这段注意事项是否真的有效，常常没有闭环验证。
+
+SkillProx 的 forward 阶段强调 diagnosis-outcome feedback。简单说，Agent 先根据失败诊断提出 skill 编辑，再在同一批任务上重新执行，观察是否真的改善。如果修改造成回归，就回滚，并把结果喂回后续诊断。
+
+工程里可以做一个简化版本：
+
+```json
+{
+  "skill": "spreadsheet-cleanup",
+  "batch": "eval-2026-08-11-a",
+  "diagnosis": "Agent skipped hidden sheets when validating formulas.",
+  "patch": "Add a rule requiring sheet enumeration before formula checks.",
+  "before": {"success": 0.62, "cost_tokens": 184000},
+  "after": {"success": 0.69, "cost_tokens": 191000},
+  "decision": "keep"
+}
+```
+
+这比“感觉新规则有用”强得多。注意还要记录成本。如果成功率涨了 2 个点，但 token 成本翻倍，未必值得合入。
+
+## Backward 阶段：把 skill 拆成知识单元
+
+论文的 backward 阶段最值得借鉴。它不是把删除当成普通编辑，而是把 skill 分解成 auditable knowledge units，然后估计每个单元贡献。
+
+在团队实践中，可以让每条规则带上 ID：
+
+```markdown
+# Skill: spreadsheet-cleanup
+
+## K001: enumerate sheets
+Before validating formulas, enumerate all visible and hidden sheets.
+
+## K002: preserve formulas
+Never overwrite a formula cell with a static value unless the task explicitly asks for export.
+
+## K003: locale handling
+Check decimal separators before parsing currency columns.
+```
+
+评测时可以做近似 leave-one-out：禁用某条规则，跑小批样本，看成功率、成本和错误类型变化。严谨度不需要一步到位，但必须能回答一个问题：这条规则保留的理由是什么？
+
+## 删除不是危险动作，盲目保留才危险
+
+很多团队对删除知识有心理阻力。因为 skill 是经验沉淀，删掉像浪费。但过期经验也是风险。
+
+可以把删除分成三类：
+
+```text
+remove: 已被证明无效或有害，直接删除
+demote: 只在特定条件下有效，移到条件规则
+archive: 暂时不用，但保留到历史记录
+```
+
+例如“所有 CSV 都用 UTF-8 打开”可能在现代数据管道里大体正确，但面对老系统导出的 GBK 文件会失败。它不该是无条件规则，而应该被降级为“默认先探测编码，无法判断时优先 UTF-8”。
+
+## 生产落地流程
+
+我会把 SkillProx 思想落成一个 Git 工作流：
+
+```bash
+git switch -c skills/spreadsheet-cleanup-2026-08-11
+node scripts/run-skill-eval.js --skill spreadsheet-cleanup --suite id --out before.json
+node scripts/propose-skill-patch.js --failures before.json --out patch.md
+git diff
+node scripts/run-skill-eval.js --skill spreadsheet-cleanup --suite id --out after-id.json
+node scripts/run-skill-eval.js --skill spreadsheet-cleanup --suite ood --out after-ood.json
+```
+
+合入标准至少包括：
+
+```text
+- in-distribution 成功率提升或持平
+- out-of-distribution 不显著退化
+- token 成本没有异常增长
+- 删除或降级的规则有记录
+- 修改原因能追溯到失败样本
+- 高风险工具规则必须人工 review
+```
+
+这就是把 skill 从提示词资产升级成工程资产。
+
+## 和 Google Skills、团队 runbook 的关系
+
+最近 Google Skills 这类产品技能库开始出现，企业内部也会把部署、排障、安全、成本规范写成 Agent Skills。SkillProx 提醒我们：技能库不是一次性文档工程，而是一个长期演化系统。
+
+外部 skills 可以提供通用产品知识，内部 skills 提供组织边界。两者都需要版本化、审查和评测。不同的是，内部 skills 更容易积累环境特例，也更需要删除机制。没有删除机制的技能库，最后会变成一堆“每条都可能重要”的上下文垃圾。
+
+## 局限
+
+SkillProx 是论文框架，不等于生产安全方案。它关注准确率和 skill 复杂度，但真实企业还要考虑权限、审计、合规、机密信息、工具副作用和人类责任边界。
+
+另外，leave-one-out utility audit 的成本可能不低。小团队不能每条规则都跑大规模评测。可行做法是分层：高风险 skill 和高频 skill 做严格审计，低频 skill 做抽样检查。
+
+## 结论
+
+SkillProx 最重要的工程启发是：Agent Skills 要进化，必须同时具备添加和删除能力。只会追加经验的 skill 会越来越长、越来越贵、越来越难审计。
+
+未来的技能库治理应该像代码治理：有 diff、有评测、有回滚、有删除理由、有 held-out 验证。Agent 不只是学会新步骤，也要忘掉过期步骤。SkillProx 给这个方向提供了一个清晰框架。
+
+参考来源：[arXiv: SkillProx](https://arxiv.org/abs/2608.07449)、[SkillProx PDF](https://arxiv.org/pdf/2608.07449)、[Hugging Face Daily Papers](https://huggingface.co/papers)。
