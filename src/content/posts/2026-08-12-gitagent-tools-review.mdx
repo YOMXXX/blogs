@@ -1,0 +1,185 @@
+---
+title: "GitAgent 速评：把 Agent 定义拉回 Git 仓库"
+description: "GitAgent 在 HN 和 GitHub 获得关注，它把 agent.yaml、SOUL.md、RULES.md、memory、tools 和 skills 放进 Git，解决 Agent 可移植和审计问题。"
+column: "tools"
+tags: ["GitAgent", "OpenGAP", "agent-framework", "git-native", "skills", "tools"]
+pubDate: 2026-08-12
+featured: false
+tldr: "GitAgent 的重点不是又一个聊天 UI，而是把 agent 的身份、规则、工具、记忆和技能变成版本化文件。它适合需要审计、迁移和团队协作的 agent 项目，但动态记忆、敏感数据和运行态状态仍然不应该无脑提交到 Git。"
+author: "YOMXXX"
+faq:
+  - q: "GitAgent 是框架还是规范？"
+    a: "它既有开源实现，也强调 git-native agent 定义方式。实际采用时可以把它当成一种文件布局和治理思路。"
+  - q: "它和 LangGraph 有冲突吗？"
+    a: "不冲突。LangGraph 更偏执行编排，GitAgent 更偏 agent 定义、版本化和可迁移描述，两者可以互补。"
+  - q: "memory 放进 Git 安全吗？"
+    a: "不一定。规则、技能和公共知识适合版本化，用户隐私、密钥、运行态缓存和敏感业务数据不应该直接提交。"
+  - q: "团队试用 GitAgent 要注意什么？"
+    a: "先审查 install 脚本和 npm 包权限，在沙箱或测试仓库试用，再决定是否引入主仓库工作流。"
+  - q: "它最适合哪类场景？"
+    a: "适合需要 agent 行为可 review、技能可复用、配置可迁移、审计可追溯的开发者工具和内部自动化场景。"
+---
+
+[GitAgent 的 GitHub 仓库](https://github.com/open-gitagent/gitagent) 今天在搜索结果和 HN 讨论里都很显眼。[HN 帖子](https://news.ycombinator.com/item?id=47376584) 把它描述为一种开放标准：用 Git 仓库里的文件定义 AI agent，包括 `agent.yaml`、`SOUL.md`、`SKILL.md` 等核心文件，并可导出到 Claude Code、OpenAI Agents SDK、CrewAI、Google ADK、LangChain 等生态。
+
+这个思路值得认真看。过去很多 agent 框架的问题不是不能跑，而是“跑起来以后很难治理”。提示词散在代码里，工具定义散在 SDK 注册里，记忆散在数据库里，技能散在文档里。换框架时要重写，审计时找不到完整定义，团队协作时也很难做 review。
+
+GitAgent 的核心判断是：agent 应该像项目一样被版本控制。
+
+## 它提供了什么
+
+仓库 README 给出的结构大致是：
+
+```text
+agent.yaml    模型、工具、运行时配置
+SOUL.md       agent 身份和人格指令
+RULES.md      行为边界和约束
+memory/       可版本化记忆
+tools/        声明式工具定义
+skills/       可组合技能模块
+hooks/        生命周期脚本或程序化 hook
+```
+
+这套结构的吸引力不在于文件名，而在于治理方式。只要 agent 行为进入 Git，团队天然获得 diff、branch、tag、pull request、rollback、blame、release note 这些成熟工具。
+
+例如，某个 agent 昨天开始频繁误删临时文件。传统平台里你可能要查数据库、看后台配置、翻聊天记录。Git-native 方式下，可以直接看最近谁改了 `RULES.md`、哪个 skill 更新了文件清理策略、哪次 release tag 引入了新工具。
+
+## 快速试用建议
+
+官方 README 提供 curl 安装命令，也提供 npm 包安装。作为工具速评，我更建议先用手动方式，在临时目录里试：
+
+```bash
+mkdir gitagent-lab
+cd gitagent-lab
+npm install -g @open-gitagent/gitagent
+gitagent --help
+```
+
+如果要试 voice UI，再单独安装 voice 包。README 提到项目把 voice 拆成独立包，以降低 slim core 的包体和供应链扫描误报。这是一个正向信号：agent 工具越贴近本地环境，越要把可选能力拆开，避免核心包背上不必要权限。
+
+在团队环境里，不建议直接把 curl-bash 放进主机自动化脚本。先固定版本、审查 install 脚本、在容器或临时用户下运行，再决定是否放到开发机基线工具里。
+
+## 一个推荐的 Agent Repo 布局
+
+如果不想完整采用 GitAgent，也可以借它的布局：
+
+```text
+support-agent/
+  agent.yaml
+  SOUL.md
+  RULES.md
+  tools/
+    ticket-search.yaml
+    customer-profile.yaml
+  skills/
+    triage/
+      SKILL.md
+    refund-policy/
+      SKILL.md
+  evals/
+    refund-basic.jsonl
+    escalation.jsonl
+  memory/
+    public-playbooks/
+      billing.md
+```
+
+`agent.yaml` 保存模型和工具声明：
+
+```yaml
+name: support-agent
+version: 0.1.0
+model:
+  provider: openai
+  name: gpt-5
+runtime:
+  max_steps: 12
+  require_approval_for:
+    - refund.create
+    - account.close
+tools:
+  - tools/ticket-search.yaml
+  - tools/customer-profile.yaml
+skills:
+  - skills/triage
+  - skills/refund-policy
+```
+
+`RULES.md` 写不可变边界：
+
+```markdown
+# Rules
+
+## Must Always
+- Cite ticket IDs when making a recommendation.
+- Ask for approval before any refund action.
+
+## Must Never
+- Expose internal notes to customers.
+- Invent policy exceptions that are not in the refund-policy skill.
+```
+
+这比把所有内容塞进一个系统提示词更容易维护。配置归配置，身份归身份，规则归规则，技能归技能，eval 归 eval。
+
+## 和现有框架怎么对比
+
+GitAgent 不应该被看成 LangGraph、CrewAI 或 OpenAI Agents SDK 的直接替代。更准确的对比是：
+
+```text
+LangGraph：定义状态图和执行流
+CrewAI：定义多角色协作
+OpenAI Agents SDK：定义模型、工具、handoff 和 guardrail
+Claude Code Skills：定义可触发的能力包
+GitAgent：定义 agent 本身如何被文件化和版本化
+```
+
+如果你已经有 LangGraph，GitAgent 的价值是把 graph 外面的规则、工具声明、技能和 eval 整理成可迁移资产。如果你已经在用 Claude Code Skills，GitAgent 的价值是把技能放进更大的 agent repo 治理模型里。
+
+## 真正的亮点
+
+第一，review 变简单。Agent 行为变更可以走 PR，而不是口头说“我改了 prompt”。
+
+第二，迁移变容易。只要 agent 定义是文件，就可以写 adapter 导出到不同运行时。
+
+第三，审计变自然。Git 历史能回答“什么时候改了什么”，这对企业内部 agent 很重要。
+
+第四，实验变低成本。每个分支可以代表一种 agent 行为，eval 可以在 CI 里跑。
+
+第五，技能复用更清楚。一个 skill 是目录，而不是某个框架里的隐式对象。
+
+## 需要谨慎的地方
+
+第一，Git 不是数据库。动态记忆、用户会话、短期缓存、token、密钥、客户数据都不适合直接进 Git。可以提交记忆摘要和公开 playbook，但运行态记忆应进入受控存储。
+
+第二，文件标准可能碎片化。今天有 GitAgent、OpenGAP、Skills registry、Claude Skills、各家 agent manifest。标准价值取决于生态共识，不取决于单个 repo 的设计美感。
+
+第三，工具声明不等于权限安全。即使工具写在 YAML 里，运行时仍要做路径限制、参数校验、审批、超时和审计。
+
+第四，agent repo 可能诱导团队把 prompt 当代码，却不跑测试。版本化只是第一步，必须配 eval。
+
+## 适合与不适合
+
+适合：
+
+```text
+内部开发者工具
+客服和运营 agent 的规则治理
+多框架 agent 原型
+需要 PR 审批的自动化流程
+可复用 skill 库
+```
+
+不适合：
+
+```text
+强实时对话状态
+高敏感用户记忆原文
+完全依赖数据库权限的企业流程
+只做一次性 demo 的小脚本
+```
+
+## 结论
+
+GitAgent 最有价值的地方，是把 agent 从“某个 SDK 里的对象”变成“一个可 review 的仓库”。这符合软件工程团队的直觉，也补上了 agent 生产化里一直缺的治理层。
+
+我不会建议所有团队马上迁移到 GitAgent，但建议所有做 agent 的团队借鉴它的文件化思路：把 agent 的身份、规则、工具、技能、eval 和发布记录从业务代码里抽出来。即使最后不用 GitAgent，这个整理动作本身也会让你的 agent 更容易调试、迁移和审计。

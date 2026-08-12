@@ -1,0 +1,298 @@
+---
+title: "A2E 工坊：给 Agent Harness 加一层可复现审计"
+description: "A2E 把 Agent Harness 评测从单一成功率推向标准任务协议、自动插桩和执行轨迹审计。本文用一个 TypeScript 小框架复刻核心思路，并给出可落地的审计层。"
+column: "workshop"
+tags: ["A2E", "agent-audit", "harness", "tool-use", "TypeScript", "evaluation"]
+pubDate: 2026-08-12
+featured: false
+tldr: "A2E 的价值不是再造一个排行榜，而是提醒开发者把 agent harness 当成可审计系统：任务输入、工具调用、计划变化、错误恢复和最终结果都要落到统一轨迹里。最小可用版本可以用 ATP 风格任务协议、工具代理层和 NDJSON trace 实现。"
+author: "YOMXXX"
+faq:
+  - q: "A2E 主要评测模型还是评测框架？"
+    a: "它重点评测模型和 agent harness 的组合效果。相同模型换不同 harness，或相同 harness 换模型，执行效率、工具使用和错误恢复都会变化。"
+  - q: "小团队需要完整复现 A2E 吗？"
+    a: "不需要。先把任务协议、工具调用日志、错误分类和回放脚本做起来，就能明显提升 agent 调试质量。"
+  - q: "为什么不能只看任务成功率？"
+    a: "成功率会掩盖成本、重试次数、错误恢复路径和危险工具调用。两个 agent 都完成任务时，轨迹质量可能完全不同。"
+  - q: "执行轨迹应该保存多久？"
+    a: "研发阶段建议长期保存抽样轨迹，生产阶段按隐私和合规策略做脱敏与保留周期管理，至少要覆盖一次发布回滚窗口。"
+  - q: "A2E 和普通 eval 集有什么区别？"
+    a: "普通 eval 多关注输入输出，A2E 类方法关注执行过程，把任务协议、monitor、工具调用和 harness 行为一起纳入评估。"
+---
+
+[Hugging Face Daily Papers 8 月 11 日](https://huggingface.co/papers/date/2026-08-11) 把 A2E 放到了当天热门论文里。论文页的标题是 [A2E: An End-to-End Agent Auditing Engine](https://huggingface.co/papers/2608.07346)，核心动机很直接：Agent 评测不能只问“最后答对了吗”，还要问“怎么答对的、用了多少工具、是否走了危险路径、错误后能否恢复”。
+
+这篇工坊不尝试复现完整论文系统，而是把 A2E 背后的工程思想拆成一个团队今天就能落地的最小审计层。你可以把它接到 LangGraph、OpenAI Agents SDK、Claude Code wrapper、CrewAI，或者任何自研 harness 前面。目标不是限制模型，而是让每次执行都能被比较、回放和归因。
+
+## 为什么需要审计层
+
+很多 agent 项目第一版只有三个指标：任务成功、任务失败、人工觉得还行。这在 demo 阶段够用，一旦进入团队协作就不够了。
+
+第一，成功率无法解释成本。同一个 issue，一个 agent 调 3 次工具解决，另一个 agent 调 40 次工具解决，两者在成功率表里都是 1。
+
+第二，成功率无法解释风险。Agent 可能先读了不该读的目录，或者先尝试了破坏性 shell，只是最后没有造成损害。
+
+第三，成功率无法解释 harness 作用。模型本身、提示词、工具 schema、重试策略、上下文压缩、文件检索顺序都会影响结果。如果没有统一轨迹，团队只能靠猜。
+
+A2E 论文提出的 Agent Task Protocol 和自动插桩 Monitor，本质上是在 agent 外面加一层可观测接口。我们可以先做简化版：每个任务一份结构化输入，每次工具调用一条事件，每次计划变更一条事件，最终用脚本统计效率、工具使用和错误恢复。
+
+## 目录结构
+
+先建一个轻量项目：
+
+```bash
+mkdir a2e-lite
+cd a2e-lite
+pnpm init
+pnpm add zod
+pnpm add -D tsx typescript @types/node
+mkdir tasks traces src
+```
+
+写一个 ATP 风格任务文件：
+
+```json
+{
+  "id": "repo-risk-001",
+  "domain": "coding",
+  "goal": "检查当前仓库最近一次变更，列出可能影响发布的风险。",
+  "inputs": {
+    "repo": "/Users/me/service-a",
+    "base": "origin/master"
+  },
+  "allowedTools": ["git_diff", "read_file"],
+  "successCriteria": [
+    "列出至少一个证据来源",
+    "不得修改仓库文件",
+    "输出必须包含风险等级"
+  ],
+  "riskLevel": "medium"
+}
+```
+
+这不是普通 prompt。它把目标、输入、工具权限和成功标准分开，方便不同 harness 读取同一任务。后面你可以把这份任务同时喂给两个 agent 框架，比较轨迹而不是比较主观感受。
+
+## 定义 Trace Schema
+
+在 `src/schema.ts` 写入：
+
+```ts
+import { z } from "zod";
+
+export const TaskSchema = z.object({
+  id: z.string(),
+  domain: z.string(),
+  goal: z.string(),
+  inputs: z.record(z.string(), z.unknown()),
+  allowedTools: z.array(z.string()),
+  successCriteria: z.array(z.string()),
+  riskLevel: z.enum(["low", "medium", "high"]),
+});
+
+export const TraceEventSchema = z.object({
+  runId: z.string(),
+  taskId: z.string(),
+  ts: z.string(),
+  kind: z.enum(["start", "plan", "tool_call", "tool_result", "error", "final"]),
+  payload: z.record(z.string(), z.unknown()),
+});
+
+export type Task = z.infer<typeof TaskSchema>;
+export type TraceEvent = z.infer<typeof TraceEventSchema>;
+```
+
+关键点是 `kind`。不要把所有内容都塞进一段文本日志里。结构化事件能支持后续聚合：每个任务调了多少工具、哪个工具失败率最高、模型是否在失败后改变计划、是否违反工具白名单。
+
+## 写一个 Monitor
+
+在 `src/monitor.ts` 写入：
+
+```ts
+import fs from "node:fs";
+import path from "node:path";
+import type { TraceEvent } from "./schema";
+
+export class Monitor {
+  constructor(
+    private runId: string,
+    private taskId: string,
+    private traceDir = "traces",
+  ) {}
+
+  emit(kind: TraceEvent["kind"], payload: Record<string, unknown>) {
+    fs.mkdirSync(this.traceDir, { recursive: true });
+    const event: TraceEvent = {
+      runId: this.runId,
+      taskId: this.taskId,
+      ts: new Date().toISOString(),
+      kind,
+      payload,
+    };
+    fs.appendFileSync(
+      path.join(this.traceDir, `${this.runId}.ndjson`),
+      JSON.stringify(event) + "\n",
+    );
+  }
+}
+```
+
+Monitor 不应该依赖某个模型 SDK。它只记录事实。这样你把底层模型从一个 API 换成另一个 API，审计层仍然可复用。
+
+## 工具代理层
+
+不要让 agent 直接拿 shell。先把工具包起来：
+
+```ts
+import { execFileSync } from "node:child_process";
+import type { Monitor } from "./monitor";
+import type { Task } from "./schema";
+
+type ToolInput = Record<string, string>;
+
+export function callTool(
+  task: Task,
+  monitor: Monitor,
+  name: string,
+  input: ToolInput,
+) {
+  if (!task.allowedTools.includes(name)) {
+    monitor.emit("error", { name, reason: "tool_not_allowed" });
+    throw new Error(`Tool not allowed: ${name}`);
+  }
+
+  monitor.emit("tool_call", { name, input });
+
+  try {
+    const output =
+      name === "git_diff"
+        ? execFileSync("git", ["-C", input.repo, "diff", input.base], {
+            encoding: "utf8",
+            maxBuffer: 1024 * 1024,
+          })
+        : execFileSync("sed", ["-n", "1,160p", input.path], {
+            encoding: "utf8",
+            maxBuffer: 1024 * 1024,
+          });
+
+    monitor.emit("tool_result", {
+      name,
+      ok: true,
+      bytes: Buffer.byteLength(output),
+      preview: output.slice(0, 1200),
+    });
+    return output;
+  } catch (error) {
+    monitor.emit("tool_result", {
+      name,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+```
+
+这里故意只给 `git_diff` 和 `read_file` 两个能力。A2E 类审计最重要的不是功能多，而是权限边界清楚。生产里还要加入路径白名单、超时、输出截断、敏感字段脱敏和危险命令拒绝。
+
+## 包一个最小 Harness
+
+在 `src/run.ts` 写：
+
+```ts
+import fs from "node:fs";
+import crypto from "node:crypto";
+import { Monitor } from "./monitor";
+import { TaskSchema } from "./schema";
+import { callTool } from "./tools";
+
+const taskPath = process.argv[2];
+if (!taskPath) throw new Error("Usage: pnpm tsx src/run.ts tasks/repo-risk-001.json");
+
+const task = TaskSchema.parse(JSON.parse(fs.readFileSync(taskPath, "utf8")));
+const runId = `${task.id}-${crypto.randomUUID().slice(0, 8)}`;
+const monitor = new Monitor(runId, task.id);
+
+monitor.emit("start", { task });
+monitor.emit("plan", {
+  steps: [
+    "读取 git diff",
+    "按发布风险分类",
+    "输出证据和建议",
+  ],
+});
+
+const diff = callTool(task, monitor, "git_diff", {
+  repo: String(task.inputs.repo),
+  base: String(task.inputs.base),
+});
+
+const summary = [
+  "风险等级：medium",
+  "证据：最近 diff 长度为 " + diff.length + " 字符。",
+  "建议：把 diff 交给模型或规则引擎继续分类，并要求每条风险附文件路径。",
+].join("\n");
+
+monitor.emit("final", {
+  ok: true,
+  output: summary,
+  criteriaChecked: task.successCriteria,
+});
+
+console.log(summary);
+```
+
+这段代码还没有接 LLM，但审计骨架已经成立。下一步把 `summary` 部分替换成模型调用即可。建议先接一个便宜模型，让它只做分类，不让它发起工具调用；工具调用仍然由 harness 决定。等轨迹质量稳定后，再开放模型选择工具。
+
+## 统计轨迹质量
+
+在 `src/report.ts` 写：
+
+```ts
+import fs from "node:fs";
+import path from "node:path";
+import { TraceEventSchema } from "./schema";
+
+for (const file of fs.readdirSync("traces")) {
+  if (!file.endsWith(".ndjson")) continue;
+  const events = fs
+    .readFileSync(path.join("traces", file), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => TraceEventSchema.parse(JSON.parse(line)));
+
+  const toolCalls = events.filter((e) => e.kind === "tool_call").length;
+  const errors = events.filter((e) => e.kind === "error").length;
+  const final = events.find((e) => e.kind === "final");
+
+  console.log({
+    file,
+    taskId: events[0]?.taskId,
+    toolCalls,
+    errors,
+    ok: final?.payload.ok ?? false,
+  });
+}
+```
+
+跑起来：
+
+```bash
+pnpm tsx src/run.ts tasks/repo-risk-001.json
+pnpm tsx src/report.ts
+```
+
+这就是最小 A2E-lite。它无法替代论文里的完整 benchmark，但足够让团队从“看起来能跑”进入“能解释为什么能跑”。
+
+## 接入真实模型时的三条规则
+
+第一，模型输出必须结构化。让模型返回 `plan`、`tool`、`arguments`、`final` 这类字段，而不是让它在自然语言里夹带动作。
+
+第二，工具执行必须经过 harness。模型可以请求工具，不能直接执行工具。Monitor 要记录请求、拒绝、执行、失败和重试。
+
+第三，评测要固定任务集。每次改 prompt、换模型、改工具 schema，都跑同一批 ATP 任务。只有这样才能区分“模型更聪明”和“任务刚好更简单”。
+
+## 选题来源
+
+今天的信息源里，A2E 同时出现在 Hugging Face Daily Papers 和 GitHub 热门项目摘要中。它适合写成工坊，是因为它不只是论文概念，而是可以直接转化为开发者的 eval 基础设施：任务协议、插桩、轨迹、报告、回放。对 agent 团队来说，这比又多一个主观 demo 更有价值。
+
+如果你的团队已经在跑 coding agent 或 office agent，我建议先把这套审计层加到 staging 环境。不要等事故后再补日志。Agent 的能力越强，轨迹越应该先于权限升级。
