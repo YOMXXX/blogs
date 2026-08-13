@@ -1,0 +1,255 @@
+---
+title: "DeepSeek V4 Pro 0813 工坊：接入 OpenRouter 并跑回归评测"
+description: "DeepSeek V4 Pro 0813 登上 HN 首页，OpenRouter 已给出上下文、价格和工具参数信息。本文用 TypeScript 接入，并搭建小型回归评测。"
+column: "workshop"
+tags: ["DeepSeek", "OpenRouter", "regression-eval", "TypeScript", "tool-use", "model-routing"]
+pubDate: 2026-08-13
+featured: false
+tldr: "DeepSeek V4 Pro 0813 的看点不是单次聊天，而是 1048576 token 上下文、较低 token 价格、reasoning 参数和 tool calling 组合在一起后，能否进入真实 agent 流水线。上线前应先做兼容层、回归集、成本估算和失败分类。"
+author: "YOMXXX"
+faq:
+  - q: "为什么用 OpenRouter 接入 DeepSeek V4 Pro？"
+    a: "OpenRouter 提供 OpenAI 兼容接口，切换模型和记录用量比较方便，适合先做回归评测和灰度路由。"
+  - q: "这篇工坊需要真实 API key 吗？"
+    a: "需要。示例代码不会硬编码 key，而是从环境变量读取，便于在本地、CI 和部署环境复用。"
+  - q: "回归评测应该测哪些任务？"
+    a: "至少覆盖摘要、代码修改、工具调用、长上下文检索和结构化输出，避免只用聊天样例判断模型质量。"
+  - q: "reasoning effort 应该默认开到最高吗？"
+    a: "不建议。高 reasoning effort 适合复杂规划和推理，普通抽取、分类、格式转换应先用低档或默认档控制成本。"
+  - q: "能直接替换生产模型吗？"
+    a: "不建议直接替换。先做 shadow traffic、离线回归和小比例灰度，确认质量、延迟、成本、工具调用稳定性后再扩大。"
+---
+
+[Hacker News 首页](https://hn.algolia.com/api/v1/search?tags=front_page) 今天把 [DeepSeek V4 Pro 0813](https://openrouter.ai/deepseek/deepseek-v4-pro-0813) 推到了很靠前的位置。OpenRouter 页面给出的关键信息很适合开发者判断：这是 DeepSeek V4 Pro 的 GA release，模型上下文窗口为 1048576 token，最大输出 384000 token；价格是每百万输入 token 0.435 美元，每百万输出 token 0.87 美元，cache read 价格更低；同时支持 `reasoning`、`include_reasoning`、`tools`、`tool_choice`、`response_format` 等参数。
+
+这篇工坊不做排行榜复述，而是把它接进一个可回归的开发者工作流。目标是回答四个问题：接口能不能稳定跑，工具调用是否兼容，结构化输出是否可控，真实任务成本是否符合预期。任何新模型进生产前，都应该先过这四关。
+
+## 为什么先做兼容层
+
+很多团队接新模型时会把 SDK 调用散落在业务代码里。这样短期很快，长期很难维护。模型一变，温度、max tokens、reasoning 参数、错误结构、tool call 字段都可能变化。如果没有兼容层，回滚和 A/B 测试会变成全仓搜索。
+
+我们先做一个极薄的 OpenAI 兼容客户端。它只负责三件事：
+
+1. 从环境变量读取 base URL、API key 和模型名。
+2. 把业务请求转换成 chat completions 请求。
+3. 返回统一的文本、工具调用、usage 和原始响应。
+
+先建项目：
+
+```bash
+mkdir deepseek-v4-pro-eval
+cd deepseek-v4-pro-eval
+pnpm init
+pnpm add openai zod dotenv
+pnpm add -D tsx typescript @types/node
+mkdir src evals reports
+```
+
+`.env` 示例：
+
+```bash
+OPENROUTER_API_KEY=sk-or-v1-your-key
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+MODEL_ID=deepseek/deepseek-v4-pro-0813
+```
+
+不要把 key 写进仓库。CI 里用 secret 注入，本地用 `.env`，生产用平台环境变量。
+
+## 写统一客户端
+
+`src/client.ts`：
+
+```ts
+import "dotenv/config";
+import OpenAI from "openai";
+
+export const client = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1",
+  defaultHeaders: {
+    "HTTP-Referer": "https://yomxxx.dev",
+    "X-Title": "YOMXXX model regression",
+  },
+});
+
+export const model = process.env.MODEL_ID ?? "deepseek/deepseek-v4-pro-0813";
+```
+
+OpenRouter 建议带上 referer 和 title，方便后台统计。这里的值应换成你的真实站点或应用名。
+
+再写一个最小调用：
+
+```ts
+import { client, model } from "./client";
+
+const completion = await client.chat.completions.create({
+  model,
+  messages: [
+    {
+      role: "system",
+      content: "你是一个严谨的软件架构审查助手，回答必须给出证据和风险等级。",
+    },
+    {
+      role: "user",
+      content: "审查一个把支付回调改成异步队列处理的 PR，列出上线前需要验证的风险。",
+    },
+  ],
+  temperature: 0.2,
+  max_tokens: 1200,
+  reasoning: { effort: "low" },
+});
+
+console.log(completion.choices[0]?.message?.content);
+console.log(completion.usage);
+```
+
+运行：
+
+```bash
+pnpm tsx src/smoke.ts
+```
+
+如果第一步就失败，先不要看 benchmark。检查 key、base URL、模型名、账户余额、区域网络和 provider 状态。接入模型最怕“代码能跑但偶尔 500”，所以 smoke test 只证明最基础的链路可用。
+
+## 加工具调用
+
+OpenRouter 页面显示该模型支持工具参数。我们写一个只读工具，避免新模型测试时误改文件：
+
+```ts
+import { client, model } from "./client";
+
+const tools = [
+  {
+    type: "function" as const,
+    function: {
+      name: "get_release_checklist",
+      description: "返回指定服务的发布检查项",
+      parameters: {
+        type: "object",
+        properties: {
+          service: { type: "string" },
+        },
+        required: ["service"],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+const response = await client.chat.completions.create({
+  model,
+  messages: [
+    { role: "user", content: "帮我检查 billing-service 上线前要跑哪些验证。" },
+  ],
+  tools,
+  tool_choice: "auto",
+  temperature: 0,
+  max_tokens: 800,
+});
+
+console.dir(response.choices[0]?.message, { depth: null });
+```
+
+真实 agent 里要记录每一次工具调用，包括工具名、参数、执行耗时、返回大小和错误。不要只保存最终回答。新模型工具调用质量常见问题包括：参数字段拼错、过度调用工具、明明需要工具却直接编造、工具失败后不重试或重复同一个错误参数。
+
+## 设计回归集
+
+新模型评估不应该靠 3 个随手 prompt。建议用 JSONL 管理任务：
+
+```json
+{"id":"sum-001","kind":"summary","input":"把一段事故复盘压缩成上线风险清单","must":["风险等级","证据","下一步"]}
+{"id":"code-001","kind":"coding","input":"解释一个 React hydration bug 的可能原因","must":["客户端状态","服务端 HTML","复现步骤"]}
+{"id":"tool-001","kind":"tool","input":"需要调用发布检查工具后再回答","must":["tool_call","service"]}
+{"id":"json-001","kind":"structured","input":"抽取需求为 JSON","must":["valid_json","owner","deadline"]}
+{"id":"long-001","kind":"long-context","input":"从多段日志中找根因","must":["引用日志片段","排除项"]}
+```
+
+每条任务至少要有 `must` 条件。人工判断可以保留，但第一轮要能自动筛掉明显失败。
+
+## 自动评分脚本
+
+`src/eval.ts`：
+
+```ts
+import fs from "node:fs/promises";
+import { client, model } from "./client";
+
+type Case = {
+  id: string;
+  kind: string;
+  input: string;
+  must: string[];
+};
+
+const raw = await fs.readFile("evals/cases.jsonl", "utf8");
+const cases = raw.trim().split("\n").map((line) => JSON.parse(line) as Case);
+
+const rows = [];
+
+for (const item of cases) {
+  const started = Date.now();
+  const res = await client.chat.completions.create({
+    model,
+    messages: [
+      {
+        role: "system",
+        content: "你是生产环境模型回归评测助手。回答要具体，不能编造外部事实。",
+      },
+      { role: "user", content: item.input },
+    ],
+    temperature: 0.2,
+    max_tokens: 1200,
+    reasoning: { effort: item.kind === "coding" ? "high" : "low" },
+  });
+
+  const text = res.choices[0]?.message?.content ?? "";
+  const pass = item.must.every((needle) => text.includes(needle) || needle === "valid_json");
+  rows.push({
+    id: item.id,
+    kind: item.kind,
+    pass,
+    latencyMs: Date.now() - started,
+    usage: res.usage,
+    preview: text.slice(0, 200),
+  });
+}
+
+await fs.writeFile("reports/latest.json", JSON.stringify(rows, null, 2));
+console.table(rows.map(({ id, kind, pass, latencyMs }) => ({ id, kind, pass, latencyMs })));
+```
+
+这个评分很粗，但足够作为第一层烟雾报警。后续可以加 LLM-as-judge、JSON schema 校验、工具轨迹回放、人工抽样复核。关键是每次升级模型、提示词、工具 schema 或路由策略时，都能跑同一批任务。
+
+## 成本估算
+
+DeepSeek V4 Pro 0813 的价格低，但长上下文会放大任何浪费。一个 300000 token 输入、8000 token 输出的请求，输入成本约 0.1305 美元，输出成本约 0.00696 美元。看起来不高，但如果 agent 每个 issue 跑 20 轮，再乘以团队并发，月账单会很快上来。
+
+建议在报告里记录：
+
+```text
+prompt_tokens
+completion_tokens
+cache_read_tokens
+reasoning_effort
+tool_call_count
+total_latency_ms
+estimated_cost_usd
+```
+
+特别要区分 cache hit 和 cache miss。OpenRouter 页面显示 cache read 价格远低于普通输入，这意味着长上下文服务应该尽量复用稳定前缀，例如系统提示、仓库索引摘要、工具说明和项目规范。
+
+## 灰度策略
+
+上线时不要把所有任务切到新模型。可以先做三层：
+
+第一层是 shadow traffic。线上仍用旧模型返回给用户，同时把同样请求复制给新模型，只记录结果，不影响用户。
+
+第二层是低风险任务灰度。比如摘要、分类、标签生成、测试说明生成，出错可人工修正。
+
+第三层才是高风险 agent 工作流。包括自动改代码、自动发 PR、调用内部系统、读取敏感数据。这里必须有工具白名单、执行沙箱、审计日志和人工确认点。
+
+## 结论
+
+DeepSeek V4 Pro 0813 的上下文、价格和工具参数组合让它很适合作为 agent 候选模型，但“能聊天”不等于“能上线”。一个务实接入流程应该是：先建兼容层，再跑回归集，再看成本，再做 shadow traffic，最后才灰度生产。
+
+今天这类模型更新越来越频繁。真正能降低迁移成本的不是记住每个模型的参数，而是把模型当作可替换组件，把质量、成本和工具轨迹做成每天都能跑的工程事实。

@@ -1,0 +1,158 @@
+---
+title: "AI Bot 伪装扫描：Agent 时代的网站流量治理"
+description: "HN 今日讨论大规模漏洞扫描伪装成 ClaudeBot 等 AI bot。本文分析身份识别、限流、日志、robots 策略、agent 浏览、安全边界和网站流量治理。"
+column: "long-form"
+tags: ["AI-bots", "ClaudeBot", "web-security", "traffic-governance", "robots-txt", "agent-security"]
+pubDate: 2026-08-13
+featured: false
+tldr: "AI bot 流量已经不只是抓取问题，而是安全、成本和产品可用性问题。用户代理字符串可以被伪造，robots.txt 只能约束守规矩的爬虫。网站需要把 AI scraping、AI fetching、AI search indexing、agent browsing 和 security scanner 分开治理，并建立验证、限流和审计。"
+author: "YOMXXX"
+faq:
+  - q: "User-Agent 能证明请求来自真实 AI 公司吗？"
+    a: "不能。User-Agent 是客户端自报字段，可以被伪造。需要结合 IP 段、反向 DNS、请求行为、签名机制和历史画像判断。"
+  - q: "robots.txt 能阻止恶意扫描吗？"
+    a: "不能。robots.txt 主要约束守规矩的爬虫，恶意扫描和伪装流量可以直接忽略它，仍需网关和安全策略。"
+  - q: "所有 AI bot 都应该封禁吗？"
+    a: "不建议一刀切。搜索索引、助手实时抓取、开发者工具和恶意扫描价值与风险不同，应分类治理。"
+  - q: "中小网站最先该做什么？"
+    a: "先记录 bot 流量、区分路径和状态码、保护登录与管理接口、为高成本页面限流，并单独监控可疑 User-Agent。"
+  - q: "Agent 浏览会带来什么新风险？"
+    a: "Agent 会点击、提交表单、触发流程，不只是读取页面。网站需要把机器访问纳入权限、CSRF、防滥用和审计设计。"
+---
+
+今天 HN 首页有一条很值得安全团队关注的讨论：[Someone is running mass vulnerability scans, spoofing AI bots like ClaudeBot](https://knownagents.com/insights)。KnownAgents 的 [Insights 页面](https://knownagents.com/insights) 本身也提供了一个背景：它持续分析 5000 多个网站上的 human traffic、AI scraping、AI fetching、AI search indexing、AI browsing、robots.txt compliance 和 bot spoofing。
+
+这说明 AI bot 已经从“爬虫是否尊重内容版权”的话题，扩展成网站安全和流量治理问题。尤其当攻击者伪装成 ClaudeBot、GPTBot、ChatGPT-User 或其他看似正常的 AI agent 时，传统依赖 User-Agent 的规则会失效。
+
+## User-Agent 不再够用
+
+很多网站过去用 User-Agent 做简单分类：
+
+```text
+Googlebot 允许
+GPTBot 限制
+ClaudeBot 限制
+Unknown bot 挡掉
+```
+
+这个策略的前提是请求方诚实申报身份。现实里 User-Agent 只是一个字符串，任何脚本都能写：
+
+```bash
+curl -A "ClaudeBot" https://target.site/admin
+```
+
+如果攻击者用真实 AI bot 的名字发起漏洞扫描，你的日志里看起来像“ClaudeBot 在访问奇怪路径”。如果安全团队直接把它当成正常 AI 抓取，就会漏掉攻击；如果运营团队直接封禁所有 ClaudeBot，也可能误伤真实抓取或搜索引用。
+
+所以第一条原则是：User-Agent 只能作为线索，不能作为身份。
+
+## AI bot 流量要分类治理
+
+KnownAgents 页面把机器访问拆成多个类型，这个思路非常重要。至少应分成五类。
+
+第一类是 AI scraping。目标是抓取内容用于训练或数据转售。这类流量通常批量访问公开页面，价值取决于你是否希望内容进入训练集。
+
+第二类是 AI fetching。目标是实时为用户回答问题，例如用户让助手总结你的文章或读取文档。这类流量更像用户代理，访问频次低但需要实时性。
+
+第三类是 AI search indexing。目标是让内容进入 AI 搜索结果。它接近传统搜索引擎爬虫，但展示形态和点击回流不同。
+
+第四类是 AI browsing。agent 使用浏览器访问、点击、填写表单、完成任务。这类流量最接近真实用户，也最容易触发业务流程。
+
+第五类是 security scanner。它可能是合法安全扫描，也可能是漏洞探测。伪装成 AI bot 的扫描应归入这一类，而不是归入 AI fetching。
+
+不同类型的治理策略完全不同。训练抓取可以用 robots 和商业授权谈判；实时 fetching 可以限速但保留；search indexing 可以按 SEO 策略处理；agent browsing 需要业务权限；security scanner 要进入 WAF、IDS 和漏洞响应流程。
+
+## 最小识别体系
+
+一个实用的识别系统至少包含这些信号：
+
+```text
+User-Agent
+源 IP 和 ASN
+反向 DNS
+请求路径分布
+请求频率
+状态码分布
+是否访问敏感路径
+是否执行表单提交
+是否加载静态资源
+是否遵守 robots.txt
+历史行为画像
+```
+
+真实搜索爬虫通常有稳定 IP 范围、可验证 DNS、合理抓取节奏和明确文档。伪装扫描往往路径异常，例如访问 `wp-admin`、`.env`、`phpmyadmin`、旧插件路径、备份文件、API 探测路径。它可能不加载 CSS 和图片，只扫高风险 URL。
+
+不要只写一条正则。建议把 bot 识别输出成结构化日志：
+
+```json
+{
+  "ts": "2026-08-13T10:00:00Z",
+  "userAgent": "ClaudeBot",
+  "ip": "203.0.113.42",
+  "asn": "example-asn",
+  "path": "/.env",
+  "method": "GET",
+  "status": 404,
+  "botClaim": "claudebot",
+  "verifiedBot": false,
+  "risk": "high",
+  "reason": "claimed_ai_bot_accessed_sensitive_probe_path"
+}
+```
+
+这样安全团队可以按 `verifiedBot` 和 `risk` 查询，而不是在 nginx access log 里人工搜索。
+
+## robots.txt 的真实边界
+
+robots.txt 有价值，但不要把它当安全控制。它适合表达站点偏好：哪些路径不希望被抓取，哪些 bot 可以访问，sitemap 在哪里。守规矩的爬虫会读取并遵守它。
+
+恶意扫描不会遵守。伪装流量也不会因为 robots 规则停止。因此：
+
+robots.txt 可以管理内容访问意愿。
+
+WAF 和网关负责拦截异常请求。
+
+鉴权系统负责保护非公开资源。
+
+审计系统负责追踪和归因。
+
+把 robots.txt 当安全边界，是最常见的误区。
+
+## Agent browsing 的新问题
+
+传统爬虫主要读取页面。Agent browsing 会点击、输入、提交、下载，甚至跨站完成任务。这让网站安全模型出现新问题。
+
+第一，机器用户和真人用户的边界变模糊。如果一个真实用户授权助手访问你的页面，助手算不算用户代理？应该允许哪些操作？
+
+第二，CSRF 和表单防滥用更重要。Agent 如果误点删除按钮，或者被页面内容诱导提交表单，会造成真实后果。
+
+第三，动态页面成本更高。一个 agent 可能触发搜索、筛选、导出、预览、渲染图表等高成本操作，给后端带来压力。
+
+第四，审计需要记录“代表谁访问”。如果将来浏览器或 agent 平台提供签名身份，网站应能区分平台、用户授权和自动化脚本。
+
+## 防护策略
+
+中小网站可以先做六件事。
+
+第一，保护敏感路径。`.env`、备份文件、管理后台、调试端点、内部 API 都应在边缘层直接拒绝或强鉴权。
+
+第二，给高成本路径限流。搜索、导出、AI 生成、报表、图片处理等接口按 IP、会话、User-Agent 风险分级限流。
+
+第三，验证知名 bot。对宣称 Googlebot、Bingbot、ClaudeBot、GPTBot 的请求，不要只看名字。能验证的用官方方法验证，不能验证的降级为 unverified。
+
+第四，区分读取和执行。公开文章页可以宽松，表单提交、购买、删除、邀请、发布等动作必须有更强防滥用。
+
+第五，单独监控 AI bot。把 AI scraping、AI fetching、AI indexing、agent browsing 分开看，避免所有流量混成“bot”。
+
+第六，保留调查证据。安全事件发生时，需要 IP、时间、路径、请求头、响应状态、限流动作和关联 trace。
+
+## 对开发者文档站的影响
+
+AI fetching 对开发者文档有正面价值。用户在 ChatGPT、Claude、Cursor、Claude Code 或其他工具里问问题时，实时抓取文档可以减少幻觉，并把用户带回原站。完全封禁所有 AI 访问，可能降低文档在 AI 工作流中的可见性。
+
+但文档站也容易被滥用。长页面、搜索端点、示例下载、API schema、大量版本文档都会被反复抓取。最好的策略是提供机器友好入口，例如 sitemap、llms.txt、压缩文档包、稳定版本索引，同时对异常路径和高频扫描限流。
+
+## 结论
+
+AI bot 伪装扫描提醒我们：agent 时代的网站治理不能停留在 User-Agent 字符串和 robots.txt。机器访问会同时包含训练抓取、搜索索引、用户授权 fetching、浏览器 agent 和恶意扫描。它们看起来都像 bot，但风险完全不同。
+
+开发者应把 AI bot 当成一个新的流量平面来治理：身份验证、行为分类、限流策略、敏感路径保护、结构化日志和审计缺一不可。未来网站不是只服务人，也要服务可信机器；但可信机器必须经过验证，而不是自报一个好听的名字。
