@@ -1,0 +1,425 @@
+---
+title: "实战工坊：用 Gemini 3.7 Flash 搭一个低延迟工具调用 Agent"
+description: "Gemini 3.7 Flash 登上今日 HN 热点。本文用一个 TypeScript 项目演示低延迟工具调用 agent 的路由、预算、重试和可观测设计方法。"
+column: "workshop"
+tags: ["Gemini-3.7", "tool-calling", "agent-workshop", "TypeScript", "latency", "model-routing"]
+pubDate: 2026-08-14
+featured: false
+tldr: "Flash 型模型的价值不只是便宜，而是让 agent 可以把轻量判断、工具参数生成和短反馈循环放到更快的模型上。本文给出一个可运行的 TypeScript 骨架：用任务路由区分快慢模型，用 Zod 约束工具参数，用预算对象限制轮次和成本，并把每一步工具调用写入结构化日志。"
+author: "YOMXXX"
+faq:
+  - q: "为什么选择 Flash 型模型做 agent？"
+    a: "Flash 型模型通常强调低延迟和较低成本，适合处理工具选择、参数补全、短摘要和多轮轻量推理，不一定适合所有深度规划任务。"
+  - q: "这套代码能直接跑 Gemini 3.7 Flash 吗？"
+    a: "示例使用标准 fetch 和环境变量，模型名需要按你实际 API 供应商填写；工具接口和预算逻辑可以直接迁移到生产项目。"
+  - q: "工具调用最容易出什么问题？"
+    a: "常见问题是参数不符合 schema、重复调用同一工具、工具失败后继续编造结果，以及没有记录每一步输入输出导致无法排查。"
+  - q: "什么时候应该切到更强模型？"
+    a: "当任务需要跨多个文件推理、长上下文证据整合、复杂代码修改或高风险决策时，应由 Flash 模型升级到更强的规划模型。"
+  - q: "如何控制 agent 成本？"
+    a: "把最大轮次、最大工具调用次数、超时时间和每任务 token 预算放进同一个预算对象，并在每一步执行前检查预算是否耗尽。"
+---
+
+今日 HN 的 AI 讨论里，低延迟模型仍然是开发者最关心的方向之一。无论具体供应商把新版本命名为 Gemini 3.7 Flash、Flash Lite 还是其他变体，工程问题都一样：如果一个模型更快、更便宜，它应该放在 agent 系统的哪一层？
+
+很多团队会把 Flash 型模型误用成“便宜替代品”：把原来所有请求直接换过去，看 benchmark 掉多少，再决定要不要回滚。这种做法很粗糙。Flash 型模型真正适合的位置，是 agent 的短循环：意图分类、工具选择、参数补全、轻量摘要、失败重试判断、结果压缩。深度规划、复杂代码变更和高风险动作，仍然应该交给更强的模型。
+
+这篇工坊用 TypeScript 搭一个最小但可靠的工具调用 agent。它不依赖某个 SDK 的魔法封装，而是把生产系统必须关心的四件事展开：工具 schema、模型路由、预算控制、结构化日志。
+
+## 目标架构
+
+我们要做的是一个“开发者助手” agent。用户给一句自然语言指令，agent 可以调用三个工具：
+
+- `searchDocs`：在内部文档里查资料。
+- `readIssue`：读取工单或 GitHub issue 摘要。
+- `createPlan`：把工具结果整理成执行计划。
+
+Flash 模型负责判断该调用哪个工具以及生成参数。遇到复杂任务时，它可以把任务升级给 planner 模型。这里的重点不是模型名，而是路由策略。
+
+```text
+user request
+  -> classify with flash model
+  -> call typed tool
+  -> summarize observation with flash model
+  -> escalate to planner model when needed
+  -> return final answer
+```
+
+这个流程看起来简单，但比“把工具数组塞给模型”多了两个关键边界：每个任务有预算，每个工具调用有日志。
+
+## 初始化项目
+
+```bash
+mkdir flash-agent-workshop
+cd flash-agent-workshop
+pnpm init
+pnpm add zod
+pnpm add -D typescript tsx @types/node
+```
+
+创建 `tsconfig.json`：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+在 `package.json` 里加脚本：
+
+```json
+{
+  "scripts": {
+    "dev": "tsx src/index.ts"
+  }
+}
+```
+
+## 定义工具和预算
+
+先写 `src/tools.ts`：
+
+```ts
+import { z } from "zod";
+
+export type ToolResult = {
+  ok: boolean;
+  content: string;
+};
+
+export type ToolDef<TArgs> = {
+  name: string;
+  description: string;
+  schema: z.ZodType<TArgs>;
+  run: (args: TArgs) => Promise<ToolResult>;
+};
+
+const SearchDocsArgs = z.object({
+  query: z.string().min(3),
+  topK: z.number().int().min(1).max(5).default(3),
+});
+
+const ReadIssueArgs = z.object({
+  issueId: z.string().regex(/^ISSUE-[0-9]+$/),
+});
+
+const CreatePlanArgs = z.object({
+  title: z.string().min(4),
+  constraints: z.array(z.string()).max(8),
+});
+
+export const tools = [
+  {
+    name: "searchDocs",
+    description: "Search internal engineering documents.",
+    schema: SearchDocsArgs,
+    run: async (args) => ({
+      ok: true,
+      content: `Found docs for ${args.query}: deployment checklist, rollback policy, incident template.`,
+    }),
+  },
+  {
+    name: "readIssue",
+    description: "Read an engineering issue by id.",
+    schema: ReadIssueArgs,
+    run: async (args) => ({
+      ok: true,
+      content: `${args.issueId}: API timeout after the latest gateway change.`,
+    }),
+  },
+  {
+    name: "createPlan",
+    description: "Create a short execution plan.",
+    schema: CreatePlanArgs,
+    run: async (args) => ({
+      ok: true,
+      content: `Plan: ${args.title}. Constraints: ${args.constraints.join(", ")}`,
+    }),
+  },
+] satisfies ToolDef<unknown>[];
+
+export function getTool(name: string) {
+  return tools.find((tool) => tool.name === name);
+}
+```
+
+这里用 Zod 做运行时校验。很多 agent 失败不是因为模型不聪明，而是因为系统相信了一个错误参数。比如 `issueId` 应该是 `ISSUE-123`，模型却给了 `123`；如果没有 schema，工具层会把错误传播到更深处。
+
+预算对象写在 `src/budget.ts`：
+
+```ts
+export type Budget = {
+  maxSteps: number;
+  maxToolCalls: number;
+  deadlineMs: number;
+  startedAt: number;
+};
+
+export function createBudget(): Budget {
+  return {
+    maxSteps: 6,
+    maxToolCalls: 4,
+    deadlineMs: 30_000,
+    startedAt: Date.now(),
+  };
+}
+
+export function assertBudget(budget: Budget, state: { steps: number; toolCalls: number }) {
+  if (state.steps >= budget.maxSteps) {
+    throw new Error("Step budget exhausted");
+  }
+  if (state.toolCalls >= budget.maxToolCalls) {
+    throw new Error("Tool budget exhausted");
+  }
+  if (Date.now() - budget.startedAt > budget.deadlineMs) {
+    throw new Error("Deadline exceeded");
+  }
+}
+```
+
+生产 agent 必须有预算。没有预算的 agent 在工具失败、网页加载慢、模型重复调用时会无限扩张。Flash 模型便宜也不意味着可以无限循环，低成本任务更容易被批量调用，失控后总账单仍然可观。
+
+## 写一个模型适配层
+
+`src/model.ts`：
+
+```ts
+export type ModelRole = "flash" | "planner";
+
+export type ModelMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
+
+export async function callModel(role: ModelRole, messages: ModelMessage[]) {
+  const model =
+    role === "flash"
+      ? process.env.FLASH_MODEL ?? "gemini-3.7-flash"
+      : process.env.PLANNER_MODEL ?? "gemini-3.7-pro";
+
+  const apiKey = process.env.MODEL_API_KEY;
+  if (!apiKey) {
+    throw new Error("MODEL_API_KEY is required");
+  }
+
+  const response = await fetch(process.env.MODEL_ENDPOINT ?? "https://api.vendor.local/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: role === "flash" ? 0.2 : 0.4,
+      messages,
+      response_format: { type: "json_object" },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Model request failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return String(data.choices?.[0]?.message?.content ?? "");
+}
+```
+
+示例没有绑定某个官方 SDK，因为不同平台对 Gemini、OpenAI-compatible endpoint、工具调用字段的包装方式不同。生产里你可以换成官方 SDK，但建议保留这个适配层。业务代码只知道 `flash` 和 `planner` 两个角色，不应该知道具体模型字符串。
+
+## 让模型输出动作 JSON
+
+`src/agent.ts`：
+
+```ts
+import { z } from "zod";
+import { assertBudget, Budget } from "./budget.js";
+import { callModel } from "./model.js";
+import { getTool, tools } from "./tools.js";
+
+const AgentAction = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("tool"),
+    tool: z.string(),
+    args: z.record(z.unknown()),
+  }),
+  z.object({
+    type: z.literal("escalate"),
+    reason: z.string(),
+  }),
+  z.object({
+    type: z.literal("final"),
+    answer: z.string(),
+  }),
+]);
+
+type TraceEvent = {
+  step: number;
+  kind: "model" | "tool" | "error";
+  payload: unknown;
+};
+
+export async function runAgent(input: string, budget: Budget) {
+  const trace: TraceEvent[] = [];
+  const state = { steps: 0, toolCalls: 0 };
+  const observations: string[] = [];
+
+  while (true) {
+    assertBudget(budget, state);
+    state.steps += 1;
+
+    const prompt = [
+      {
+        role: "system" as const,
+        content:
+          "You are a tool-using engineering agent. Return strict JSON. Choose one action: tool, escalate, or final.",
+      },
+      {
+        role: "user" as const,
+        content: JSON.stringify({
+          input,
+          observations,
+          tools: tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+          })),
+        }),
+      },
+    ];
+
+    const raw = await callModel("flash", prompt);
+    trace.push({ step: state.steps, kind: "model", payload: raw });
+
+    const action = AgentAction.parse(JSON.parse(raw));
+
+    if (action.type === "final") {
+      return { answer: action.answer, trace };
+    }
+
+    if (action.type === "escalate") {
+      const answer = await callModel("planner", [
+        {
+          role: "system",
+          content: "You are a senior planning model. Return JSON with an answer field.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify({ input, observations, reason: action.reason }),
+        },
+      ]);
+      return { answer, trace };
+    }
+
+    assertBudget(budget, state);
+    const tool = getTool(action.tool);
+    if (!tool) {
+      trace.push({ step: state.steps, kind: "error", payload: `Unknown tool: ${action.tool}` });
+      observations.push(`Tool error: unknown tool ${action.tool}`);
+      continue;
+    }
+
+    const parsedArgs = tool.schema.safeParse(action.args);
+    if (!parsedArgs.success) {
+      trace.push({ step: state.steps, kind: "error", payload: parsedArgs.error.flatten() });
+      observations.push(`Tool argument error for ${tool.name}`);
+      continue;
+    }
+
+    state.toolCalls += 1;
+    const result = await tool.run(parsedArgs.data);
+    trace.push({ step: state.steps, kind: "tool", payload: { tool: tool.name, result } });
+    observations.push(`${tool.name}: ${result.content}`);
+  }
+}
+```
+
+这个 agent 有一个很重要的设计：模型输出的动作只是候选，工具层必须校验。模型可以建议调用 `readIssue`，但 `issueId` 不符合格式时，工具不会执行。错误会作为 observation 回到下一轮，让模型修正。
+
+## 入口文件
+
+`src/index.ts`：
+
+```ts
+import { createBudget } from "./budget.js";
+import { runAgent } from "./agent.js";
+
+const input =
+  process.argv.slice(2).join(" ") ||
+  "Investigate ISSUE-317 and draft a rollback plan using internal docs.";
+
+const result = await runAgent(input, createBudget());
+
+console.log(JSON.stringify(result, null, 2));
+```
+
+运行：
+
+```bash
+MODEL_API_KEY=sk-your-key \
+MODEL_ENDPOINT=https://your-provider.example/v1/chat/completions \
+FLASH_MODEL=gemini-3.7-flash \
+PLANNER_MODEL=gemini-3.7-pro \
+pnpm dev -- "Investigate ISSUE-317 and draft a rollback plan"
+```
+
+如果你使用的是官方 Gemini SDK，入口请求字段会不同，但 agent 主体不用变。替换 `callModel` 即可。
+
+## 什么时候用 Flash，什么时候升级
+
+一个实用规则是：Flash 模型处理“短、窄、可验证”的步骤，planner 模型处理“长、宽、难验证”的步骤。
+
+适合 Flash 的任务：
+
+- 判断用户意图属于哪类。
+- 从一句话里抽取工具参数。
+- 把工具返回压缩成三条观察。
+- 判断工具失败是否需要重试。
+- 对短文本做结构化输出。
+
+适合 planner 的任务：
+
+- 多文件代码修改方案。
+- 长文档证据冲突分析。
+- 生产事故处置建议。
+- 需要安全边界判断的动作。
+- 高价值客户请求。
+
+这不是能力歧视，而是系统分工。Flash 模型越快，越适合承担 agent 内循环。强模型越贵，越应该被用在真正需要深推理的节点上。
+
+## 可观测性比模型名更重要
+
+在上面的代码里，`trace` 记录了每一步模型输出、工具结果和错误。生产里还要补充：
+
+- `requestId`：贯穿一次用户请求。
+- `model`：记录实际命中的模型名和版本。
+- `latencyMs`：区分模型延迟和工具延迟。
+- `tokenUsage`：计算 cost per task。
+- `toolArgsHash`：避免泄露敏感参数，同时支持排查。
+- `decision`：记录为什么升级或停止。
+
+没有这些日志，模型升级后你只能看整体成功率波动，却不知道问题发生在工具选择、参数生成、网络超时还是最终总结。
+
+## 生产加固清单
+
+第一，所有工具参数都要 schema 校验。不要让模型输出直接进入数据库、shell、浏览器或支付接口。
+
+第二，工具要幂等。agent 可能重试，重试不应该造成重复删除、重复扣款或重复发送。
+
+第三，高风险工具要二次确认。读取类工具可以自动执行，写入类工具要有权限和人工确认。
+
+第四，预算要前置。每一步执行前检查预算，而不是任务结束后统计。
+
+第五，模型路由要配置化。今天是 Gemini 3.7 Flash，明天可能是另一个更快的模型。业务代码不应该到处写死模型名。
+
+## 结论
+
+Flash 型模型改变的是 agent 的系统形态。它让我们可以把更多短循环交给模型，但这也要求工程边界更清晰：工具参数要校验，预算要硬限制，日志要结构化，复杂任务要升级。
+
+如果你今天要试 Gemini 3.7 Flash，别只跑聊天 demo。把它放进工具调用、路由和预算框架里测。真正有价值的指标不是单轮回答多漂亮，而是一次完整任务的延迟、成本、成功率和可排查性。
