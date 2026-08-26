@@ -1,0 +1,294 @@
+---
+title: "实战工坊：Assistants API 关闭当天，迁移到 Responses API"
+description: "OpenAI 官方文档显示 Assistants API 于 2026-08-26 关闭。本文给出从 Assistant、Thread、Run 到 Prompt、Conversation、Response 的迁移路线、代码骨架和发布检查。"
+column: "workshop"
+tags: ["OpenAI", "Responses-API", "Assistants-API", "agent-migration", "Python", "workshop"]
+pubDate: 2026-08-26
+featured: false
+tldr: "Assistants API 的关闭不是简单改一个 endpoint，而是把状态、配置、工具循环和日志模型重新整理。最稳的迁移方式是先冻结旧 Assistant 配置，再把新会话切到 Conversation 与 Response，最后按 session 双写、回放和质量门逐步替换。"
+author: "YOMXXX"
+faq:
+  - q: "Assistants API 今天真的关闭了吗？"
+    a: "OpenAI 官方迁移文档写明 Assistants API 在 2026-08-26 关闭。生产系统应按关闭后的状态处理，不要再把新开发建立在 beta.threads 和 beta.assistants 上。"
+  - q: "Responses API 和旧 Run 最大区别是什么？"
+    a: "旧模型是 Assistant、Thread、Run 三层对象；新模型更强调 Prompt、Conversation、Response 和 item 流，工具调用循环也更显式。"
+  - q: "历史 Thread 必须一次性迁移吗？"
+    a: "不建议一次性搬空。更稳的方式是新会话走 Conversation，老会话在用户回访时按需回填，并保留旧 thread id 到新 conversation id 的映射。"
+  - q: "迁移是否需要重写所有工具？"
+    a: "通常不需要重写业务工具函数，但要重建工具 schema、调用结果提交、错误处理和日志字段，确保新旧工具调用有同等审计能力。"
+  - q: "上线前最该测什么？"
+    a: "重点测多轮状态、工具调用、文件引用、结构化输出、超时重试、账单标签和回滚路径。只测单轮聊天很容易漏掉真实问题。"
+---
+
+今天是 2026 年 8 月 26 日，OpenAI 官方 Assistants migration guide 明确写着 Assistants API 在这一天关闭，并建议迁移到 Responses API。这个时间点对开发者不是普通版本更新，而是一个生产接口生命周期事件。还在依赖 `openai.beta.assistants`、`openai.beta.threads`、`openai.beta.threads.runs` 的应用，应该把它当成事故演练来处理：先止血，再迁移新流量，最后清理历史状态。
+
+这篇工坊不讨论模型能力，也不复述宣传文档。目标很具体：把一个典型“聊天加工具”的 Assistant 应用，迁移到 Prompt、Conversation、Response 的新结构，并保留可回滚、可审计、可灰度的工程边界。
+
+## 迁移心智模型
+
+旧 Assistants API 的核心对象是三层。
+
+- `Assistant` 保存 instructions、model、tools。
+- `Thread` 保存用户和助手消息。
+- `Run` 把某个 Assistant 应用于某个 Thread，并在 run steps 中暴露工具调用与中间状态。
+
+Responses API 的迁移文档给出的对应关系更接近四层。
+
+- `Assistant` 变成可版本化的 `Prompt`。
+- `Thread` 变成可承载多种 item 的 `Conversation`。
+- `Run` 变成一次 `Response`。
+- `Run steps` 变成更通用的 `Items`，其中可以是消息、工具调用、工具结果或其他对象。
+
+这意味着迁移不是把 `runs.create` 改成 `responses.create` 就结束。真正的变化在于：配置从运行时 Assistant 对象前移到版本化 Prompt；会话状态不再只是消息数组；工具调用循环更适合由应用显式管理；日志和评测也要从 run step 维度改成 item 维度。
+
+## 第一步：盘点旧 Assistant
+
+先不要写代码。把旧系统里每个 Assistant 的配置导出来，整理成表。
+
+```yaml
+assistants:
+  - name: support-agent
+    assistant_id: asst_...
+    model: gpt-5.6-terra
+    instructions_file: prompts/support.md
+    tools:
+      - search_docs
+      - create_ticket
+      - escalate_to_human
+    output_contract: support_reply_v2
+    owners:
+      - support-platform
+```
+
+这张表的作用有三个。第一，确认到底有多少运行时配置被塞进了 Dashboard，而不是源代码。第二，找出工具 schema 是否有重复版本。第三，给迁移后的 Prompt 建立所有权。很多 Assistants API 项目最大的问题不是接口旧，而是行为配置漂在外面，没人知道线上 assistant id 对应哪版提示词。
+
+建议把每个 Prompt 的导出 spec 放进仓库，例如 `prompts/support-agent.prompt.json`。即使最后仍在 Dashboard 里管理 Prompt，也要让仓库里保留可 review 的副本。
+
+## 第二步：改会话状态表
+
+旧系统常见表结构如下：
+
+```sql
+create table chat_sessions (
+  id text primary key,
+  user_id text not null,
+  openai_thread_id text not null,
+  created_at timestamp not null
+);
+```
+
+迁移时不要删除 `openai_thread_id`。先加新字段。
+
+```sql
+alter table chat_sessions
+add column openai_conversation_id text;
+
+alter table chat_sessions
+add column ai_stack_version text not null default 'assistants-v1';
+```
+
+`ai_stack_version` 是灰度开关。新用户可以写 `responses-v1`，老用户保留 `assistants-v1`。当老用户回访时，你可以按需把历史 thread 回填成 conversation，再切换版本。这个策略比夜里跑一个全量迁移脚本更稳，因为历史 thread 里可能有文件、图片、工具输出、旧 schema 和异常消息。
+
+## 第三步：新聊天路径
+
+下面是一个最小 FastAPI 骨架，表达从 session 到 conversation，再到 response 的控制流。字段名以官方文档为准，真实项目应对 SDK 版本做一次锁定。
+
+```python
+import os
+from fastapi import FastAPI
+from pydantic import BaseModel
+from openai import OpenAI
+
+app = FastAPI()
+client = OpenAI()
+
+PROMPT_ID = os.environ["OPENAI_PROMPT_ID"]
+
+class MessageIn(BaseModel):
+    session_id: str
+    user_id: str
+    content: str
+
+sessions: dict[str, str] = {}
+
+@app.post("/messages")
+def create_message(payload: MessageIn):
+    conversation_id = sessions.get(payload.session_id)
+
+    if conversation_id is None:
+        conversation = client.conversations.create(
+            items=[
+                {
+                    "role": "user",
+                    "content": payload.content,
+                }
+            ],
+            metadata={
+                "user_id": payload.user_id,
+                "session_id": payload.session_id,
+            },
+        )
+        conversation_id = conversation.id
+        sessions[payload.session_id] = conversation_id
+        input_items = []
+    else:
+        input_items = [
+            {
+                "role": "user",
+                "content": payload.content,
+            }
+        ]
+
+    response = client.responses.create(
+        prompt={"id": PROMPT_ID},
+        conversation=conversation_id,
+        input=input_items,
+        metadata={
+            "user_id": payload.user_id,
+            "session_id": payload.session_id,
+            "stack": "responses-v1",
+        },
+    )
+
+    return {
+        "conversation_id": conversation_id,
+        "response_id": response.id,
+        "output": response.output_text,
+    }
+```
+
+这段代码故意没有包含工具循环，因为第一步要把“纯对话状态”跑通。你要先验证多轮上下文是否连续、metadata 是否进入日志、会话表是否能回写、超时重试是否不会重复创建 conversation。只有这些稳定后，再迁移工具。
+
+## 第四步：工具调用循环
+
+旧 Assistants API 常把工具处理隐藏在 Run 状态轮询里。新架构下，建议把工具执行器做成独立函数，并要求每个工具调用都写审计日志。
+
+```python
+def execute_tool(name: str, arguments: dict) -> dict:
+    if name == "search_docs":
+        return search_docs(arguments["query"])
+    if name == "create_ticket":
+        return create_ticket(
+            title=arguments["title"],
+            body=arguments["body"],
+            priority=arguments.get("priority", "normal"),
+        )
+    raise ValueError(f"unknown tool: {name}")
+
+def audit_tool_call(session_id: str, call_id: str, name: str, arguments: dict, result: dict):
+    print(
+        {
+            "session_id": session_id,
+            "call_id": call_id,
+            "tool": name,
+            "argument_keys": sorted(arguments.keys()),
+            "result_keys": sorted(result.keys()),
+        }
+    )
+```
+
+不要把完整参数和完整结果无脑写入日志。搜索 query、工单正文、客户邮件都可能包含敏感信息。审计日志应该先记录结构和 id，必要时把正文放进有权限控制的数据表。
+
+迁移工具时，最容易漏的是错误语义。旧 run 失败可能给你一个状态；新循环里工具可以失败、模型可以继续请求、网络可以重试。建议统一定义工具结果。
+
+```python
+def tool_result_ok(data: dict) -> dict:
+    return {"ok": True, "data": data}
+
+def tool_result_error(code: str, message: str, retryable: bool) -> dict:
+    return {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        },
+    }
+```
+
+模型看到稳定的错误结构，才有机会做合理恢复。否则每个工具抛出的异常文本都不同，迁移后会出现“旧系统能处理，新系统乱解释”的隐性回归。
+
+## 第五步：历史 Thread 回填
+
+官方迁移文档说明没有自动把 Threads 迁到 Conversations 的工具，建议迁移新会话，并按需迁移旧会话。工程上可以这样做：
+
+```python
+def convert_thread_message(message) -> dict:
+    content = []
+    for part in message.content:
+        if part.type == "text":
+            content.append({"type": "input_text", "text": part.text.value})
+        elif part.type == "image_url":
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": part.image_url.url,
+                    "detail": part.image_url.detail,
+                }
+            )
+    return {"role": message.role, "content": content}
+
+def backfill_thread_to_conversation(thread_id: str) -> str:
+    items = []
+    for message in client.beta.threads.messages.list(thread_id=thread_id, order="asc"):
+        items.append(convert_thread_message(message))
+
+    conversation = client.conversations.create(items=items)
+    return conversation.id
+```
+
+这只是骨架，不建议原样复制上线。生产实现还要处理分页、文件引用、空 content、旧工具输出、消息角色映射和失败重试。更重要的是，回填后要立刻写映射表，避免同一个 thread 被重复迁移。
+
+## 第六步：灰度与回滚
+
+最稳的灰度策略是 session 级别，而不是请求级别。一个用户会话如果第一轮用了 Responses，就应该整段会话继续使用 Responses。否则上下文会分裂，排查会非常痛苦。
+
+建议路由逻辑如下：
+
+```python
+def choose_stack(session) -> str:
+    if session.ai_stack_version == "responses-v1":
+        return "responses-v1"
+    if session.openai_conversation_id:
+        return "responses-v1"
+    if is_new_session(session):
+        return "responses-v1"
+    return "assistants-v1"
+```
+
+今天之后，`assistants-v1` 不应继续承接新流量。它只应该作为读取历史、诊断和有限回填的兼容层。如果旧接口已不可用，回滚也不能回到旧 API，而是回滚到“Responses 的上一版 Prompt、上一版工具 schema、上一版路由配置”。这点要提前和业务方讲清楚。
+
+## 质量门
+
+上线前至少准备 30 条回放样本。
+
+- 10 条普通多轮聊天。
+- 5 条触发单工具调用。
+- 5 条触发多工具调用。
+- 5 条包含结构化输出。
+- 3 条工具失败后恢复。
+- 2 条历史 thread 回填。
+
+每条样本都要记录旧输出、新输出、工具调用序列、延迟、token、错误码和人工判定。不要要求新旧文本完全一致，应该要求语义、动作和约束一致。
+
+还要加一个成本看板。Responses API 更灵活，但灵活不等于自动更便宜。Prompt 版本、Conversation item、工具结果大小、文件检索和重试次数都会影响成本。迁移后第一周，成本告警阈值要收紧。
+
+## 常见坑
+
+第一，把 Prompt 当成静态提示词。Prompt 现在承载的是行为配置，包括 model、instructions、tools 和结构化输出预期。它应该像 API schema 一样进版本管理。
+
+第二，只迁移 happy path。Assistants API 的 Run 状态帮你挡住了很多复杂性；显式工具循环会把失败暴露出来。错误处理必须成为首批迁移内容。
+
+第三，忽略审计字段。每个 Response 都应带 session、user、stack、prompt version、experiment id。否则出问题时只能在多个控制台里手工拼时间线。
+
+第四，历史会话全量迁移。老 thread 里的数据形态复杂，按需迁移更可控。
+
+第五，没准备 Prompt 回滚。关闭旧 API 后，真正可回滚的是新栈内部版本。
+
+## 结论
+
+Assistants API 关闭当天，开发者最该做的是把 agent 应用从“API 对象驱动”迁移到“配置版本、会话状态、工具循环、质量门”驱动。Responses API 给了更清晰的抽象，但也要求应用自己承担更多工程纪律。
+
+如果你今天还在救火，先做三件事：冻结 Assistant 配置，新会话切到 Conversation 与 Response，建立 session 级灰度和日志。等新流量稳定后，再按需回填历史 Thread。不要把迁移压成一次大爆炸发布。
+
+参考来源：[OpenAI Assistants migration guide](https://platform.openai.com/docs/assistants/migration)、[OpenAI Responses API 文档](https://platform.openai.com/docs/guides/responses)、[OpenAI Conversations 文档](https://platform.openai.com/docs/guides/conversation-state)。
