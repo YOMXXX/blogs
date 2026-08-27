@@ -1,0 +1,295 @@
+---
+title: "实战工坊：给 Coding Agent 加一道包名幻觉防火墙"
+description: "We Have a Package for You 研究了文本到代码模型的包名幻觉与 slopsquatting 风险。本文给出 npm 与 PyPI 依赖守门脚本，降低伪包引入概率。"
+column: "workshop"
+tags: ["slopsquatting", "coding-agent", "supply-chain", "npm", "PyPI", "security"]
+pubDate: 2026-08-27
+featured: false
+tldr: "包名幻觉不是小错误，而是供应链攻击入口。coding agent 可能生成看似合理但不存在的依赖名，攻击者可以注册同名包等待安装。最实用的防线是在 agent 写入依赖文件后立即做 registry 校验、相似包检查和人工审批。"
+author: "YOMXXX"
+faq:
+  - q: "什么是 slopsquatting？"
+    a: "它指攻击者注册模型容易幻觉出来的包名，等待开发者或 coding agent 安装这些伪造依赖，从而进入供应链。"
+  - q: "为什么 coding agent 更容易触发这个风险？"
+    a: "因为 agent 会自动写 package.json、requirements.txt 或安装命令，用户可能只看最终功能是否跑通，而忽略依赖来源。"
+  - q: "只用 lockfile 能防住吗？"
+    a: "lockfile 能提高可复现性，但不能判断新依赖是否可信。伪包一旦被加入 lockfile，风险反而被固定下来。"
+  - q: "这个工坊脚本会误报吗？"
+    a: "会。它是守门脚本，不是最终裁判。误报可以通过 allowlist 处理，但新增依赖必须留下审核理由。"
+  - q: "最适合接在哪个环节？"
+    a: "适合接在 coding agent 生成补丁之后、运行安装之前，也可以放进 pre-commit、CI 和 PR reviewer 流程。"
+---
+
+We Have a Package for You: A Comprehensive Analysis of Package Hallucinations by Code Generating LLMs 把一个很具体的安全问题重新推到开发者面前：文本到代码模型会生成不存在但看起来合理的包名。这个问题本身不新，但在 coding agent 普及后，风险变大了。
+
+过去模型给出一个不存在的依赖名，开发者可能复制安装失败，然后手动改掉。现在 coding agent 能直接修改 `package.json`、`requirements.txt`、`pyproject.toml`，甚至自动运行安装命令。如果攻击者提前注册了模型常幻觉的包名，agent 就可能把伪包带进项目。这类攻击被称为 slopsquatting。
+
+这篇工坊的目标很明确：给 coding agent 工作流加一道轻量防火墙。它不替代完整供应链安全体系，但能在“新增依赖”这个关键点挡住一批低成本攻击。
+
+## 风险在哪里
+
+包名幻觉通常来自三种情况。
+
+第一，模型把真实库名拼错。例如把 `langchain`、`langgraph`、`llama-index` 的组合写成一个不存在的新名字。第二，模型根据功能描述编造包名，例如 `fastapi-auth-jwt-plus`、`react-ai-table`、`openai-stream-utils`。第三，模型把不同生态的包名混用，例如把 Python 包当 npm 包安装。
+
+攻击者可以观察公开模型输出、教程、GitHub issue 和代码生成结果，注册高频幻觉包名。包一旦存在，安装命令就不再失败。更危险的是，伪包可以声明相似描述、相似 README、相似 API，让 agent 和开发者都更难察觉。
+
+## 防线设计
+
+一个实用防线应该做五件事。
+
+第一，识别本次 diff 新增了哪些依赖。第二，到官方 registry 查询包是否存在、发布时间、版本数量和维护信息。第三，检查包名是否像常见包的 typo 或组合幻觉。第四，对新包要求 allowlist 或人工审核。第五，把审核结果写进日志，方便后续追踪。
+
+下面实现一个 Node.js 脚本，覆盖 npm 和 PyPI 的基础检查。它不会安装任何包，只查询元数据。
+
+## 项目结构
+
+建议放在 `scripts/dependency-guard.mjs`。
+
+```javascript
+import fs from "node:fs";
+import process from "node:process";
+
+const allowlistPath = ".agent-dependency-allowlist.json";
+
+function readJson(path, fallback) {
+  if (!fs.existsSync(path)) return fallback;
+  return JSON.parse(fs.readFileSync(path, "utf8"));
+}
+
+function readPackageJson() {
+  const pkg = readJson("package.json", {});
+  return {
+    npm: {
+      ...pkg.dependencies,
+      ...pkg.devDependencies,
+      ...pkg.optionalDependencies,
+    },
+  };
+}
+
+function readRequirements() {
+  if (!fs.existsSync("requirements.txt")) return { pypi: {} };
+  const lines = fs.readFileSync("requirements.txt", "utf8").split("\n");
+  const deps = {};
+  for (const line of lines) {
+    const clean = line.trim();
+    if (!clean || clean.startsWith("#")) continue;
+    const name = clean.split(/[=<>~!]/)[0].trim();
+    if (name) deps[name] = clean;
+  }
+  return { pypi: deps };
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: { "user-agent": "dependency-guard" } });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`${url} returned ${res.status}`);
+  return res.json();
+}
+```
+
+代码块里出现比较符没有问题，因为它们在代码围栏内。正文里不要裸写小于号，避免 MDX 解析失败。
+
+## 查询 npm 与 PyPI
+
+继续补 registry 查询函数。
+
+```javascript
+async function inspectNpm(name) {
+  const encoded = encodeURIComponent(name);
+  const meta = await fetchJson(`https://registry.npmjs.org/${encoded}`);
+  if (!meta) return { ecosystem: "npm", name, exists: false };
+  const versions = Object.keys(meta.versions || {});
+  return {
+    ecosystem: "npm",
+    name,
+    exists: true,
+    latest: meta["dist-tags"]?.latest,
+    versions: versions.length,
+    created: meta.time?.created,
+    modified: meta.time?.modified,
+    description: meta.description || "",
+  };
+}
+
+async function inspectPypi(name) {
+  const meta = await fetchJson(`https://pypi.org/pypi/${encodeURIComponent(name)}/json`);
+  if (!meta) return { ecosystem: "pypi", name, exists: false };
+  const releases = Object.keys(meta.releases || {});
+  return {
+    ecosystem: "pypi",
+    name,
+    exists: true,
+    latest: meta.info?.version,
+    versions: releases.length,
+    created: null,
+    modified: null,
+    description: meta.info?.summary || "",
+  };
+}
+```
+
+只查存在性不够，因为 slopsquatting 包可能已经存在。我们还要做启发式风险评分。
+
+## 风险评分
+
+先准备一些常见高价值包名，真实项目应按团队技术栈扩展。
+
+```javascript
+const popular = [
+  "react",
+  "next",
+  "vite",
+  "express",
+  "fastapi",
+  "django",
+  "requests",
+  "numpy",
+  "pandas",
+  "openai",
+  "anthropic",
+  "langchain",
+  "langgraph",
+  "llama-index",
+  "transformers",
+];
+
+function levenshtein(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, () => []);
+  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost,
+      );
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function scoreRisk(info) {
+  const reasons = [];
+  let score = 0;
+
+  if (!info.exists) {
+    score += 80;
+    reasons.push("package not found in registry");
+  }
+
+  if (info.exists && info.versions <= 2) {
+    score += 25;
+    reasons.push("very few published versions");
+  }
+
+  for (const base of popular) {
+    const distance = levenshtein(info.name.toLowerCase(), base.toLowerCase());
+    if (distance > 0 && distance <= 2) {
+      score += 40;
+      reasons.push(`similar to popular package ${base}`);
+      break;
+    }
+  }
+
+  if (/(ai|llm|agent|openai|claude|gpt).*(utils|helper|tools|sdk)/i.test(info.name)) {
+    score += 20;
+    reasons.push("generic AI helper style name");
+  }
+
+  return { score, reasons };
+}
+```
+
+这个评分会误报，但误报是可以接受的。它的角色不是自动封杀所有新依赖，而是把可疑依赖推到人工审核面前。
+
+## 主程序
+
+最后串起来。
+
+```javascript
+async function main() {
+  const allowlist = readJson(allowlistPath, { npm: [], pypi: [] });
+  const deps = {
+    npm: readPackageJson().npm,
+    pypi: readRequirements().pypi,
+  };
+
+  const findings = [];
+
+  for (const name of Object.keys(deps.npm)) {
+    if (allowlist.npm.includes(name)) continue;
+    const info = await inspectNpm(name);
+    const risk = scoreRisk(info);
+    if (risk.score >= 40) findings.push({ ...info, ...risk });
+  }
+
+  for (const name of Object.keys(deps.pypi)) {
+    if (allowlist.pypi.includes(name)) continue;
+    const info = await inspectPypi(name);
+    const risk = scoreRisk(info);
+    if (risk.score >= 40) findings.push({ ...info, ...risk });
+  }
+
+  if (findings.length === 0) {
+    console.log("dependency guard passed");
+    return;
+  }
+
+  console.error(JSON.stringify(findings, null, 2));
+  process.exit(1);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+运行方式：
+
+```bash
+node scripts/dependency-guard.mjs
+```
+
+如果项目里新增了一个高风险依赖，脚本会失败并打印原因。审核通过后，把包名加入 `.agent-dependency-allowlist.json`。
+
+```json
+{
+  "npm": ["@astrojs/mdx", "tailwindcss"],
+  "pypi": ["fastapi", "pydantic"]
+}
+```
+
+allowlist 不应该无限增长。每个新增条目最好在 PR 里解释用途、来源、维护者和替代方案。
+
+## 接入 coding agent
+
+这个脚本应该接在 agent 修改依赖之后、安装之前。对本地 agent，可以把它写进 `AGENTS.md` 或项目规范。
+
+```text
+When you add or modify dependencies, run:
+node scripts/dependency-guard.mjs
+
+If the guard fails, explain the dependency, registry source, and why it is required.
+Do not install unverified package names.
+```
+
+在 CI 里也可以加一个 job。更严格的版本应该只检查本次 diff 新增依赖，而不是扫描全部依赖。这样历史包不会反复打扰开发者。
+
+## 还需要哪些防线
+
+依赖守门只是第一层。生产项目还应该启用 lockfile 审查、包完整性校验、许可证扫描、恶意包检测、最小权限安装和构建隔离。对 coding agent 来说，还要限制它自动运行安装脚本，因为很多生态会在安装阶段执行 postinstall 或构建钩子。
+
+另一个关键点是教育 agent。不要只在 CI 挡它，也要在提示词和仓库规范里明确：新增依赖必须优先选择成熟、已知、维护活跃的包；功能很小的时候优先用标准库；不确定包是否存在时先查 registry。
+
+## 结论
+
+包名幻觉从表面看只是模型编错库名，但在自动化 coding agent 时代，它已经是供应链入口。攻击者不需要攻破模型，只要注册模型可能编出来的名字，等待自动安装。
+
+最现实的防护不是禁止 agent 写依赖，而是给依赖变更加一道机器守门和人工确认。查询 registry、检查相似包、维护 allowlist、记录审核理由，这些步骤成本很低，却能挡住一批最容易发生的 slopsquatting 风险。
+
+参考来源：[We Have a Package for You arXiv](https://arxiv.org/abs/2406.10279)、[Trend AI Security slopsquatting analysis](https://www.trendaisecurity.com/en/resources-insights/deep-research/slopsquatting-when-ai-agents-hallucinate-malicious-packages)、[npm Registry API](https://github.com/npm/registry/blob/master/docs/REGISTRY-API.md)、[PyPI JSON API](https://docs.pypi.org/api/json/)。

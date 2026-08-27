@@ -1,0 +1,276 @@
+---
+title: "实战工坊：用 AutoSaddler 思路给 Agent Harness 自动调参"
+description: "AutoSaddler 把 agent 运行轨迹变成 harness 优化信号。本文用一个可运行的 Python 小框架，演示如何从失败轨迹里自动调整重试、工具顺序和检查点策略。"
+column: "workshop"
+tags: ["AutoSaddler", "agent-harness", "workflow", "Python", "agent-ops", "workshop"]
+pubDate: 2026-08-27
+featured: false
+tldr: "AutoSaddler 的重点不是再训练一个更聪明的模型，而是让 agent harness 根据执行轨迹自动学习运行策略。开发者可以先从三件事做起：把步骤、工具、错误和成本记录成结构化 trace；为常见失败定义可调参数；用离线回放评估新 harness 是否真的降低失败率。"
+author: "YOMXXX"
+faq:
+  - q: "AutoSaddler 解决的是什么问题？"
+    a: "它关注 agent 外层执行器的自动优化，例如重试、检查点、工具选择和恢复策略，而不是只改变底层大模型或提示词。"
+  - q: "普通团队需要完整复现论文系统吗？"
+    a: "不需要。更现实的做法是先收集结构化执行轨迹，再针对最常见失败点做小范围 harness 参数搜索。"
+  - q: "为什么不直接让模型自己反思失败？"
+    a: "模型反思有价值，但它通常缺少跨任务统计。harness 优化能从很多历史运行里学习哪些策略稳定、便宜、可恢复。"
+  - q: "这个方法适合哪些 agent 场景？"
+    a: "最适合长任务、工具调用多、失败原因可归类的场景，例如 coding agent、数据处理 agent、运维 agent 和研究助理。"
+  - q: "上线前最重要的保护是什么？"
+    a: "必须用离线回放和预算上限约束新策略，不能让自动优化直接扩大工具权限、无限重试或改变高风险动作。"
+---
+
+2026 年 8 月 25 日出现在 Hugging Face Daily Papers 的 AutoSaddler，把一个很容易被忽略的问题放到了台前：agent 的能力不只来自模型，也来自外层 harness。所谓 harness，可以理解为 agent 的运行支架：任务拆分、工具调度、错误恢复、检查点、预算控制、日志和最终验收都在这里发生。
+
+很多团队优化 agent 时，只会改 prompt、换模型、加工具。这样当然有用，但长任务失败往往不是模型完全不会，而是执行过程没有被良好管理：工具超时后不知道重试，文件写到一半没有检查点，错误消息没有归类，昂贵模型被用在低价值步骤，失败轨迹也没有回流。AutoSaddler 的思路是把这些运行轨迹变成优化信号，让 harness 自动学会更稳的执行策略。
+
+这篇工坊不复现完整论文系统，而是做一个开发者能马上改造到自己项目里的最小版本。目标是：记录 agent trace，定义可调 harness 参数，用历史任务回放比较策略好坏，最后产出一份可上线的配置。
+
+## Harness 到底调什么
+
+一个 agent harness 至少有五类可调参数。
+
+第一类是预算参数，例如最大步骤数、最大工具调用数、每步超时、是否允许升级到更贵模型。第二类是恢复参数，例如遇到网络错误重试几次，遇到 schema 错误是否重新生成参数，遇到测试失败是否进入修复循环。第三类是工具参数，例如优先查文档还是先读本地文件，搜索结果取几条，是否启用缓存。第四类是检查点参数，例如每完成几个文件保存一次状态，是否在高风险动作前要求确认。第五类是验收参数，例如只跑单测还是跑类型检查，失败时是否调用 reviewer agent。
+
+这些参数过去常常写死在代码里，或者凭经验调。AutoSaddler 的启发是：既然 agent 每天会产生大量执行轨迹，就应该用这些轨迹反推哪些参数有效。
+
+## 最小 trace 结构
+
+先定义一个足够简单的 trace。不要一开始就记录完整 prompt 和完整工具结果，因为里面可能包含隐私和密钥。先记录结构化摘要。
+
+```python
+from dataclasses import dataclass, field
+from time import time
+from typing import Any
+
+@dataclass
+class StepTrace:
+    name: str
+    tool: str | None
+    ok: bool
+    error_code: str | None
+    latency_ms: int
+    cost_units: float
+
+@dataclass
+class RunTrace:
+    task_id: str
+    harness_version: str
+    started_at: float = field(default_factory=time)
+    steps: list[StepTrace] = field(default_factory=list)
+    final_ok: bool = False
+    final_score: float = 0.0
+
+    def add_step(self, step: StepTrace) -> None:
+        self.steps.append(step)
+
+    @property
+    def total_cost(self) -> float:
+        return sum(step.cost_units for step in self.steps)
+```
+
+这里的 `final_score` 不是模型自评，而是任务验收分数。coding agent 可以是测试通过率和 lint 结果，数据 agent 可以是记录数、校验错误和人工抽样分，客服 agent 可以是解决率和升级率。没有外部验收分数，harness 优化很容易学会“看起来更顺”的策略，而不是真的更好。
+
+## 定义可调配置
+
+再定义一份 harness 配置。真实系统可以放在 YAML 或数据库里，这里用 dataclass。
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class HarnessConfig:
+    name: str
+    max_steps: int
+    retry_network: int
+    retry_schema: int
+    run_reviewer: bool
+    checkpoint_every: int
+    search_top_k: int
+
+BASELINE = HarnessConfig(
+    name="baseline",
+    max_steps=12,
+    retry_network=1,
+    retry_schema=1,
+    run_reviewer=False,
+    checkpoint_every=6,
+    search_top_k=5,
+)
+```
+
+注意这些参数都不会扩大权限。自动调参的第一条原则是：只能在已经批准的安全边界内搜索。不要把“允许访问生产数据库”“允许发邮件给客户”“允许删除文件”做成自动优化参数。
+
+## 从失败轨迹生成候选策略
+
+下面写一个很朴素的 optimizer。它读取历史 trace，统计失败原因，然后生成几组候选配置。
+
+```python
+from collections import Counter
+
+def summarize_failures(traces: list[RunTrace]) -> Counter[str]:
+    errors: Counter[str] = Counter()
+    for trace in traces:
+        if trace.final_ok:
+            continue
+        for step in trace.steps:
+            if not step.ok and step.error_code:
+                errors[step.error_code] += 1
+    return errors
+
+def propose_configs(base: HarnessConfig, traces: list[RunTrace]) -> list[HarnessConfig]:
+    errors = summarize_failures(traces)
+    candidates = [base]
+
+    if errors["network_timeout"] >= 3:
+        candidates.append(HarnessConfig(
+            name="more-network-retry",
+            max_steps=base.max_steps + 2,
+            retry_network=base.retry_network + 2,
+            retry_schema=base.retry_schema,
+            run_reviewer=base.run_reviewer,
+            checkpoint_every=base.checkpoint_every,
+            search_top_k=base.search_top_k,
+        ))
+
+    if errors["schema_invalid"] >= 3:
+        candidates.append(HarnessConfig(
+            name="schema-repair",
+            max_steps=base.max_steps + 2,
+            retry_network=base.retry_network,
+            retry_schema=base.retry_schema + 2,
+            run_reviewer=base.run_reviewer,
+            checkpoint_every=base.checkpoint_every,
+            search_top_k=base.search_top_k,
+        ))
+
+    if errors["test_regression"] >= 2:
+        candidates.append(HarnessConfig(
+            name="reviewer-gate",
+            max_steps=base.max_steps + 4,
+            retry_network=base.retry_network,
+            retry_schema=base.retry_schema,
+            run_reviewer=True,
+            checkpoint_every=max(2, base.checkpoint_every - 2),
+            search_top_k=base.search_top_k,
+        ))
+
+    return candidates
+```
+
+这不是“智能”的全部，但已经够用。很多 agent 系统的问题不是缺高级优化算法，而是连失败原因都没有计数。先把 `network_timeout`、`schema_invalid`、`permission_denied`、`test_regression`、`budget_exceeded` 这些错误码打准，收益会非常明显。
+
+## 离线回放评估
+
+自动优化不能直接改线上策略。你需要一组回放任务。回放任务可以是真实任务的脱敏版本，也可以是历史输入加固定 mock 工具。
+
+```python
+def replay_task(task: dict[str, Any], config: HarnessConfig) -> RunTrace:
+    trace = RunTrace(task_id=task["id"], harness_version=config.name)
+
+    for step_index, planned_step in enumerate(task["planned_steps"][:config.max_steps]):
+        if step_index > 0 and step_index % config.checkpoint_every == 0:
+            trace.add_step(StepTrace(
+                name="checkpoint",
+                tool=None,
+                ok=True,
+                error_code=None,
+                latency_ms=10,
+                cost_units=0.01,
+            ))
+
+        simulated = task["outcomes"].get(config.name, task["outcomes"]["baseline"])
+        event = simulated[min(step_index, len(simulated) - 1)]
+        trace.add_step(StepTrace(**event))
+
+        if not event["ok"] and event["error_code"] == "network_timeout":
+            for _ in range(config.retry_network):
+                trace.add_step(StepTrace(
+                    name=planned_step,
+                    tool="retry",
+                    ok=True,
+                    error_code=None,
+                    latency_ms=120,
+                    cost_units=0.2,
+                ))
+                break
+
+    expected = task["scores"].get(config.name, task["scores"]["baseline"])
+    trace.final_score = expected
+    trace.final_ok = expected >= task["accept_score"]
+    return trace
+
+def evaluate(tasks: list[dict[str, Any]], config: HarnessConfig) -> dict[str, float]:
+    traces = [replay_task(task, config) for task in tasks]
+    success_rate = sum(t.final_ok for t in traces) / len(traces)
+    avg_cost = sum(t.total_cost for t in traces) / len(traces)
+    avg_score = sum(t.final_score for t in traces) / len(traces)
+    return {
+        "success_rate": success_rate,
+        "avg_cost": avg_cost,
+        "avg_score": avg_score,
+    }
+```
+
+真实回放不应该用这种硬编码模拟，而应该调用你的 agent runner、mock 外部工具、固定模型温度，并保存完整输出差异。这里的重点是评估接口：任何新 harness 都必须同时看成功率、成本和分数。
+
+## 选择策略
+
+选择策略时不要只看成功率。一个把成功率从 70% 提到 72%、成本翻三倍的配置，可能不值得上线。可以定义一个简单的效用函数。
+
+```python
+def utility(metrics: dict[str, float]) -> float:
+    return (
+        metrics["success_rate"] * 100
+        + metrics["avg_score"] * 20
+        - metrics["avg_cost"] * 3
+    )
+
+def pick_best(tasks: list[dict[str, Any]], configs: list[HarnessConfig]) -> tuple[HarnessConfig, dict[str, float]]:
+    scored = []
+    for config in configs:
+        metrics = evaluate(tasks, config)
+        scored.append((utility(metrics), config, metrics))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    _, best_config, best_metrics = scored[0]
+    return best_config, best_metrics
+```
+
+这个函数很粗，但它迫使团队讨论真实权衡：成功率、质量分、成本、延迟、风险到底哪个更重要。不同场景权重应该不同。客服机器人可能更看升级率和延迟，coding agent 更看测试通过和可维护性，运维 agent 更看误操作风险。
+
+## 上线灰度
+
+上线时建议只对低风险任务灰度，并保留 old harness 和 new harness 的对照。
+
+```python
+def choose_harness(task: dict[str, Any], user_id: str) -> str:
+    if task["risk"] != "low":
+        return "baseline"
+    bucket = hash(user_id) % 100
+    if bucket < 10:
+        return "reviewer-gate"
+    return "baseline"
+```
+
+灰度指标至少包括四项：最终成功率、平均成本、人工接管率、严重错误率。严重错误率权重最高。如果新配置让成本下降但高风险错误上升，就应该立刻回滚。
+
+## 生产建议
+
+第一，trace schema 要稳定。不要今天叫 `tool_error`，明天叫 `function_failed`。错误码不稳定，后续统计全部失真。
+
+第二，区分模型失败和 harness 失败。模型没有理解任务是一类问题，工具超时、检查点缺失、重试策略错误是另一类问题。混在一起会导致错误优化。
+
+第三，保持候选空间小。每次只调 3 到 6 个参数，先解决最常见失败。参数太多会让回放结果不可解释。
+
+第四，把优化结果写成变更记录。谁批准了新 harness，覆盖哪些任务，回放集是什么，指标变化多少，回滚条件是什么，都要留档。
+
+第五，不要把自动优化等同于自动上线。AutoSaddler 的价值在于从轨迹中提出更好的 harness，不是让系统绕过工程治理。
+
+## 结论
+
+AutoSaddler 给 agent 工程的提醒很直接：当模型能力进入高原期，外层 harness 会成为稳定性和成本的关键杠杆。很多失败并不需要更大的模型，而需要更好的重试、检查点、错误归类和验收策略。
+
+开发者今天就能开始做三件事：记录结构化 trace，定义安全边界内的可调参数，用离线回放选择新配置。只要这三步跑通，你就已经从“凭感觉调 agent”进入“用运行数据优化 agent”的阶段。
+
+参考来源：[AutoSaddler arXiv](https://arxiv.org/abs/2608.23041)、[AutoSaddler Hugging Face Papers](https://huggingface.co/papers/2608.23041)、[Hugging Face Daily Papers](https://huggingface.co/papers)。
+
