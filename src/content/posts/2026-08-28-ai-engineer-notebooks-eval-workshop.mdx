@@ -1,0 +1,184 @@
+---
+title: "实战工坊：用 AI Engineer Notebooks 搭一条评测优先的 Agent 学习线"
+description: "AI Engineer Notebooks 把模型 API、RAG、评测、Agent、安全和推理服务拆成可运行 notebook。本文给出一条可复制的评测优先学习与项目落地路线。"
+column: "workshop"
+tags: ["AI-Engineer", "notebooks", "evals", "RAG", "agents", "Groq", "workshop"]
+pubDate: 2026-08-28
+featured: false
+tldr: "AI Engineer Notebooks 的价值不是又一套教程，而是把应用型 AI 工程的关键习惯前置：先定义任务、黄金集、指标和回归检查，再写 RAG、工具调用和 agent loop。团队可以把它改造成内部训练营，也可以直接复用评测优先的项目骨架。"
+author: "YOMXXX"
+faq:
+  - q: "AI Engineer Notebooks 适合什么人？"
+    a: "最适合已经会后端或全栈开发、正在转向 AI Engineer、FDE、Applied AI 或解决方案工程的人。它强调 raw API、评测和生产约束。"
+  - q: "为什么文章强调评测优先？"
+    a: "因为 RAG 和 agent 的失败通常不是代码不能跑，而是质量无法判断。先建黄金集和指标，后续调 prompt、模型、检索和工具才有比较基准。"
+  - q: "必须使用 Groq API 吗？"
+    a: "不必须。项目选择 Groq 是为了免费运行和快速上手，但它使用 OpenAI 兼容调用模式，迁移到 OpenAI、Anthropic 或本地网关都比较直接。"
+  - q: "Notebook 能直接变成生产服务吗？"
+    a: "不能直接等同生产服务。Notebook 适合学习、验证和小实验，生产化还需要配置管理、日志、权限、CI、成本预算和可观测性。"
+  - q: "团队内部如何使用这套材料？"
+    a: "建议把每个 notebook 变成一个可验收任务：先跑基线，再改一个变量，最后提交评测报告。这样比只看教程更接近真实工作。"
+---
+
+AI Engineer Notebooks 最近出现在 GitHub 与 Hacker News 的 AI 工程讨论里。它的定位很清楚：不用 LangChain、LlamaIndex 这类框架起步，而是用 raw API 写模型调用、结构化输出、工具调用、RAG、eval、agent loop、安全和推理服务。项目 README 还明确把 evals 称为主线，并且大部分内容可以通过免费的 Groq API 跑通。参考来源：[GitHub 仓库](https://github.com/calmrocks/ai-engineer-notebooks)、[Hacker News 首页](https://news.ycombinator.com/)。
+
+这类项目值得写成工坊，不是因为 notebook 本身多稀缺，而是因为它给了一个更健康的学习顺序。很多开发者做 AI 项目时先堆功能：接一个模型，接一个向量库，加一个网页，最后才问效果怎样。这个顺序在 demo 阶段很快，到了生产环境就会变成灾难。你无法回答换模型是否变好，无法解释 RAG 为什么漏召回，无法知道 agent 多跑三步到底值不值。
+
+下面我们用它的思路搭一个最小项目骨架：一个支持知识库问答的小型 RAG agent，先写评测，再写检索和生成。代码可以在本地 Python 里跑，也可以搬到 notebook。
+
+## 项目目录
+
+先建一个很薄的目录结构。目标不是造框架，而是把“数据、系统、评测”分开。
+
+```text
+ai-eval-lab/
+  data/
+    docs.jsonl
+    golden.jsonl
+  app/
+    rag.py
+    evals.py
+  run_eval.py
+```
+
+`docs.jsonl` 放知识库片段，`golden.jsonl` 放人工确认过的问题与期望答案。真实团队可以从客服工单、产品文档、内部 runbook 中抽样，但第一版不要太大，30 到 80 条高质量样本已经够发现问题。
+
+示例黄金集如下：
+
+```json
+{"id":"q1","question":"免费套餐是否支持导出审计日志？","must_contain":["不支持","专业版"],"category":"billing"}
+{"id":"q2","question":"API key 泄露后应该怎么处理？","must_contain":["立即轮换","吊销旧 key"],"category":"security"}
+```
+
+注意 `must_contain` 不是完美评分器，但它稳定、便宜、可复现。早期不要一上来就把所有评测交给 LLM judge。先用规则抓住硬事实，再让 judge 处理语义一致性。
+
+## 写一个朴素检索器
+
+为了让代码可运行，这里先不用向量库，用 BM25 风格的词重叠做基线。这个基线很重要，因为它会告诉你“复杂系统是否真的值得”。
+
+```python
+import json
+import re
+from pathlib import Path
+
+def tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[a-zA-Z0-9_\u4e00-\u9fff]+", text.lower()))
+
+def load_jsonl(path: str) -> list[dict]:
+    return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+
+def retrieve(question: str, docs: list[dict], top_k: int = 3) -> list[dict]:
+    q = tokenize(question)
+    scored = []
+    for doc in docs:
+        terms = tokenize(doc["text"])
+        score = len(q & terms) / max(1, len(q))
+        scored.append((score, doc))
+    return [doc for score, doc in sorted(scored, key=lambda x: x[0], reverse=True)[:top_k]]
+```
+
+很多团队不愿意写这种“土”的 baseline，直接上 embedding、reranker 和 graph RAG。问题是，没有 baseline，你不知道高级方案究竟提升了什么。AI Engineer Notebooks 强调 raw API 的原因也类似：先知道模型调用、工具 schema、重试、输出解析如何工作，再判断框架替你做的事是否值得。
+
+## 生成回答前先保留证据
+
+RAG 的核心不是把文档拼进 prompt，而是把证据链留住。即使你用最强模型，也要记录检索到了什么、用了哪个 prompt、输出是否覆盖关键事实。
+
+```python
+def build_prompt(question: str, contexts: list[dict]) -> str:
+    evidence = "\n\n".join(
+        f"[{i+1}] {doc['title']}\n{doc['text']}"
+        for i, doc in enumerate(contexts)
+    )
+    return f"""你是产品支持助手。只根据证据回答问题。
+
+证据:
+{evidence}
+
+问题:
+{question}
+
+要求:
+1. 如果证据不足，直接说无法确认。
+2. 回答必须简洁。
+3. 涉及操作步骤时使用编号。"""
+```
+
+生产中这里会调用模型 API。为了让评测骨架先跑起来，可以先写一个伪生成器：返回 top 文档摘要，保证流程可测。
+
+```python
+def fake_generate(question: str, contexts: list[dict]) -> str:
+    if not contexts:
+        return "无法确认。"
+    return contexts[0]["text"][:220]
+```
+
+等规则评测跑通后，再把 `fake_generate` 换成 OpenAI 兼容客户端。这样做的好处是，评测、数据加载、检索记录和报告逻辑不会依赖具体模型。
+
+## 写回归评测
+
+评测脚本应该输出每条样本的结果，而不只是一个平均分。平均分能看趋势，单条失败才能指导修复。
+
+```python
+def evaluate_case(case: dict, answer: str) -> dict:
+    required = case.get("must_contain", [])
+    hits = [term for term in required if term in answer]
+    return {
+        "id": case["id"],
+        "category": case.get("category", "default"),
+        "score": len(hits) / max(1, len(required)),
+        "missing": [term for term in required if term not in hits],
+        "answer": answer,
+    }
+
+def run_eval(docs: list[dict], golden: list[dict]) -> list[dict]:
+    rows = []
+    for case in golden:
+        contexts = retrieve(case["question"], docs)
+        answer = fake_generate(case["question"], contexts)
+        row = evaluate_case(case, answer)
+        row["sources"] = [doc["id"] for doc in contexts]
+        rows.append(row)
+    return rows
+```
+
+这就是“evals are the spine”的最小实现。后续你可以替换任意组件：换 embedding、加 reranker、改 prompt、换模型、加工具调用、让 agent 多走一步。只要评测输入不变，就能知道变化是否真的改善了任务。
+
+## 加一个失败分析报告
+
+不要只打印 pass 或 fail。你需要把失败聚类。
+
+```python
+from collections import defaultdict
+
+def report(rows: list[dict]) -> None:
+    by_category = defaultdict(list)
+    for row in rows:
+        by_category[row["category"]].append(row["score"])
+
+    total = sum(row["score"] for row in rows) / max(1, len(rows))
+    print(f"overall={total:.3f}")
+    for category, scores in by_category.items():
+        print(f"{category}={sum(scores) / len(scores):.3f}")
+
+    print("\nfailures:")
+    for row in rows:
+        if row["score"] < 1:
+            print(row["id"], row["missing"], row["sources"])
+```
+
+当失败集中在 security 类问题时，你该补安全文档或提高安全片段权重；当失败集中在 billing 类问题时，可能是价格页更新没入库；当所有类别都差，可能是 prompt 太松或检索器太弱。评测的目的不是证明系统厉害，而是给下一步修改排序。
+
+## 从学习材料变成团队训练营
+
+如果你要把 AI Engineer Notebooks 改造成内部训练营，不要让成员“看完 12 个 notebook”。更好的安排是每周一个可验收任务。
+
+第一周，完成模型 API、结构化输出和成本保护，提交一个能重试、能解析 JSON、能记录 token 成本的脚本。第二周，完成 RAG baseline 和黄金集，提交检索命中率与答案覆盖率报告。第三周，写 agent loop，但必须和固定 pipeline 对比，说明什么时候 agent 多余。第四周，做安全和运维：注入测试、日志脱敏、fallback、超时、预算上限。第五周，做 serving 与推理性能，给出吞吐、延迟、缓存和并发的估算。
+
+这条路线比单纯学习框架慢一点，但会省掉大量生产返工。真正的 AI Engineer 不是会调用一个 SDK，而是能解释系统为什么失败，能用评测证明修改有效，能在成本和质量之间做可审计的取舍。
+
+## 结论
+
+AI Engineer Notebooks 的核心启发是：应用型 AI 工程不应该从框架开始，而应该从可测任务开始。raw API、RAG、agent、LoRA、serving 都只是手段；黄金集、指标、失败分析和回归检查才是系统能长期迭代的骨架。
+
+如果你今天要启动一个 AI 项目，先不要问“用哪个 agent 框架”。先问四个问题：任务样本在哪里，正确答案怎么判，失败能不能复现，改动能不能回归。能回答这四个问题，再接入任何框架都不晚。
+

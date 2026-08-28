@@ -1,0 +1,83 @@
+---
+title: "论文速读：Prefix Sliding 让长思考不再保留全部中间 token"
+description: "Prefix Sliding 面向测试时扩展的内存成本问题，只保留关键前缀与最近窗口，丢弃低价值中间推理 token。本文解释机制、收益、工程接入方式和适用边界。"
+column: "paper"
+tags: ["Prefix-Sliding", "test-time-scaling", "KV-cache", "reasoning", "vLLM", "paper-review"]
+pubDate: 2026-08-28
+featured: false
+tldr: "Prefix Sliding 的核心判断是：长推理中的许多中间 token 在后续阶段价值下降，不值得一直占用全注意力 KV cache。它保留任务前缀与最近窗口，从而限制内存增长，让长思考、代码生成和 agent 推理有机会以更低成本扩展。"
+author: "YOMXXX"
+faq:
+  - q: "Prefix Sliding 解决什么问题？"
+    a: "它解决长推理时 KV cache 随中间 token 线性增长的问题，通过只保留前缀和最近窗口来降低内存与解码成本。"
+  - q: "它和普通 sliding window 一样吗？"
+    a: "不一样。普通 sliding window 只保留最近窗口，Prefix Sliding 额外保留关键前缀，使模型不会丢掉任务、工具和格式约束。"
+  - q: "是否需要重新训练模型？"
+    a: "论文报告无训练也能用于现有模型并获得加速，但结合强化学习训练可进一步适配超长推理轨迹。生产采用仍要逐模型评测。"
+  - q: "会不会降低答案质量？"
+    a: "可能会，尤其是任务需要引用早期中间结论时。它适合中间草稿价值衰减明显的推理，不适合所有长上下文任务。"
+  - q: "开发者现在能直接用吗？"
+    a: "论文开源了 vLLM 和 Flash-Attention 相关实验代码，但 README 提到依赖版本较旧，工程团队应先在离线评测和非关键任务中验证。"
+---
+
+Prefix Sliding for efficient test-time scaling 是 2026 年 8 月 26 日提交到 arXiv 的论文，作者包括 Niklas Muennighoff、Percy Liang、Jason Wei、Andrew Ng、Yejin Choi、Mike Lewis 等。论文也出现在 Hugging Face Papers。摘要给出的核心结果很直接：不训练的情况下，Prefix Sliding 可以让现有模型在保持性能的同时达到约 3 倍速度提升；如果配合强化学习训练，还可以扩展到超过 10 万 token 的 reasoning trace。参考来源：[arXiv 2608.26070](https://arxiv.org/abs/2608.26070)、[Hugging Face paper page](https://huggingface.co/papers/2608.26070)、[GitHub 仓库](https://github.com/Muennighoff/prefix-sliding)。
+
+这篇论文抓住了 test-time scaling 的一个痛点。过去一年，很多推理模型通过“想更久”来提高准确率。模型可以生成更长的 chain、探索更多解法、反复检查答案。问题是，Transformer 的生成不是免费延长的。只要保留全注意力，推理轨迹越长，KV cache 越大，显存和调度成本越高。长思考让质量变好，也让 serving 变贵。
+
+Prefix Sliding 的问题意识是：模型真的需要一直看见所有中间草稿吗？论文的答案是否定的。许多中间 token 在推理继续推进后重要性会下降，继续保留它们并不总是值得。
+
+## 方法直觉
+
+普通全上下文生成可以想象成：
+
+```text
+[system + task + tools + all previous reasoning tokens] -> next token
+```
+
+当 reasoning tokens 增长到几万甚至十几万时，每一步都要维护越来越大的上下文。Prefix Sliding 改成：
+
+```text
+[prefix: system + task + tools + metadata] + [recent window: latest reasoning tokens] -> next token
+```
+
+中间部分会被丢弃。这里的关键是 prefix 不能丢。prefix 包含任务说明、格式要求、工具描述、安全边界和问题原文。只用最近窗口会让模型忘掉目标；保留 prefix 则让模型在长思考过程中仍然知道自己在解什么题、可用什么工具、最终输出格式是什么。
+
+这就是它和 vanilla sliding window 的区别。Prefix Sliding 不是单纯截断历史，而是把上下文分成“始终重要的前缀”和“最近重要的工作区”。
+
+## 为什么中间 token 可以丢
+
+长推理中的中间 token 有点像草稿纸。草稿帮助模型走到当前状态，但并不是每一行草稿都需要永久引用。解决数学题时，早期错误尝试、重复解释、临时假设、被推翻的路径，后面可能不再重要。代码生成时，模型当前正在写的函数和任务说明最重要，几千 token 前的一段探索性推理未必还要全量参与注意力。
+
+当然，这个假设不是永远成立。如果任务需要回看早期分支，或者早期中间结论没有被压缩进当前状态，丢弃会伤害质量。Prefix Sliding 的价值在于把“很多中间 token 价值衰减”变成可测试的系统策略，而不是说所有历史都没用。
+
+## 与 KV cache 优化的关系
+
+Prefix Sliding 可以看成 KV cache 管理的一种策略。传统 KV cache 优化包括量化、分页、压缩、prefix cache、offloading 和 eviction。Prefix Sliding 特别针对长 reasoning trace：它不只是为了缓存相同前缀，而是主动限制中间推理带来的缓存增长。
+
+对 serving 系统来说，这很有吸引力。假设一个模型为了 AIME、GPQA 或代码题生成超长 reasoning，普通全注意力会让请求显存占用不断上升，batch 中其他请求也受影响。Prefix Sliding 通过固定 prefix 加固定 recent window，让单请求占用更可控。
+
+不过它不是简单配置开关。GitHub README 提到实验代码涉及自定义 Flash-Attention 和 vLLM，且使用较旧版本。也就是说，短期生产落地需要 inference 团队移植内核、改调度器、加评测，而不是 pip install 后立刻上线。
+
+## Agent 场景的启发
+
+Prefix Sliding 对 agent 也很重要。agent 的轨迹天然很长：计划、工具调用、观察结果、错误恢复、修复循环、review、再修复。如果每一步都把完整历史塞回模型，成本会快速膨胀。
+
+但 agent 不能粗暴丢历史。工具调用结果、文件路径、测试错误、用户约束都有不同重要性。借鉴 Prefix Sliding，agent harness 可以把上下文分成三层。
+
+第一层是固定前缀：系统规则、任务目标、工具 schema、权限边界。第二层是工作窗口：最近几步推理、最近工具结果、当前文件 diff。第三层是可检索历史：较早步骤的摘要、trace、证据和检查点，需要时通过工具查回。
+
+这种结构比“全塞上下文”更可控，也比“每轮总结一下”更少丢关键约束。总结会把历史改写成新文本，可能引入错误；Prefix Sliding 的精神是明确保留什么、明确丢弃什么。
+
+## 评估要看什么
+
+生产评估不能只看速度。至少要看五类指标。
+
+第一，质量曲线。不同窗口大小下，AIME、MATH、LiveCodeBench、内部 coding eval 是否下降。第二，长尾失败。平均分不变不代表安全，可能只是少数超难题崩了。第三，格式保持。工具调用、JSON 输出和代码块边界是否更容易出错。第四，成本曲线。显存、吞吐、p95 延迟和 batch size 是否真的改善。第五，可恢复性。模型丢掉中间 token 后，如果需要回看，是否有外部检索或检查点补救。
+
+尤其要警惕“更快但更自信地错”。长推理模型有时会在中间验证自己，丢弃这些验证痕迹后，最终答案可能看起来顺滑但少了反证路径。评测集必须包含需要早期条件回忆的样本。
+
+## 结论
+
+Prefix Sliding 是 test-time scaling 从“堆更多计算”走向“管理计算形态”的信号。长思考不是越长越好，关键是哪些 token 值得继续占用注意力。保留任务前缀和最近工作窗口，丢弃价值衰减的中间草稿，是一个朴素但强的思路。
+
+短期内，它会先影响 vLLM、Flash-Attention 和高端推理服务。中期看，它会影响 agent harness 的上下文管理设计。未来的长任务系统不应该默认保存全部历史，而应该把历史分成前缀、窗口、检查点和可检索证据，让模型真正把注意力花在当前最有用的部分。
