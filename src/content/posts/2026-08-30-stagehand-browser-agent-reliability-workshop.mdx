@@ -1,0 +1,185 @@
+---
+title: "实战工坊：用 Stagehand 给浏览器 Agent 加可靠性护栏"
+description: "Stagehand 和 Browser Use 继续在浏览器 agent 场景升温。本文用一个订单状态巡检工坊，展示如何把自然语言动作、确定性定位、结构化抽取和回放日志组合成可上线的浏览器自动化。"
+column: "workshop"
+tags: ["Stagehand", "browser-agent", "Playwright", "workshop", "automation", "evals"]
+pubDate: 2026-08-30
+featured: false
+tldr: "浏览器 agent 的核心不是让模型随意点网页，而是把不稳定页面动作拆成可观察、可回放、可验证的步骤。Stagehand 的价值在于把 Playwright 风格 API、自然语言动作和结构化抽取放在同一条链路里，适合做半确定性的生产自动化。"
+author: "YOMXXX"
+faq:
+  - q: "Stagehand 和 Playwright 是替代关系吗？"
+    a: "不是。Stagehand 更像在 Playwright 之上增加 agent 友好的观察、动作和抽取能力。确定性路径仍然应该优先用 locator、断言和固定选择器。"
+  - q: "浏览器 agent 最适合什么业务？"
+    a: "适合页面结构复杂、没有稳定 API、但流程可以被验证的后台操作，例如订单巡检、表单录入、供应商门户查询和人工质检辅助。"
+  - q: "为什么不直接让模型看截图操作？"
+    a: "纯截图路径成本高、可解释性弱，页面变化时难以回放。DOM、可访问性树、结构化抽取和截图应该一起使用，而不是只依赖视觉。"
+  - q: "上线前必须做哪些限制？"
+    a: "必须限制域名、账号权限、动作类型、最大步数、并发数和写操作审批。浏览器 agent 不应该拥有超过人类操作者所需的权限。"
+  - q: "这个工坊能直接用于生产吗？"
+    a: "代码是生产骨架，不是完整平台。落地时还需要密钥管理、审计日志、失败截图归档、人工接管和站点服务条款审查。"
+---
+
+GitHub Trending 和 Hacker News 最近都在持续出现浏览器自动化与本地 AI 工具的讨论。浏览器 agent 这一支里，[Stagehand](https://github.com/browserbase/stagehand) 的定位很清楚：它把 Playwright 风格 API、自然语言动作、页面观察、结构化抽取、自愈动作和 OTel 观测放在一个 SDK 里；[Browser Use](https://github.com/browser-use/browser-use) 则强调用 Python 库或云端 agent 自动完成真实网页任务。参考来源：[Stagehand 仓库](https://github.com/browserbase/stagehand)、[Browser Use 仓库](https://github.com/browser-use/browser-use)、[Hacker News 首页](https://news.ycombinator.com/)。
+
+这类工具真正值得开发者关注的地方，不是“让 AI 代替 Selenium”，而是浏览器自动化的边界正在改变。传统脚本适合稳定 DOM，遇到供应商后台、动态表格、Shadow DOM、登录弹窗、字段微调时维护成本很高。纯 LLM 操作又太漂，成本、复现和责任边界都不够。更稳的路线是混合式：确定性步骤交给 Playwright，页面理解和脆弱选择交给 agent，输出必须由结构化校验器验证。
+
+下面做一个订单状态巡检工坊。目标是登录一个供应商门户，按订单号查询状态，抽取预计交付日和异常备注，最后生成一份可复查日志。示例代码以 TypeScript 为主，真实运行需要准备 `BROWSERBASE_API_KEY` 和模型 API key；如果你只在本地试验，也可以把 Stagehand 部分替换成普通 Playwright，再保留同样的状态机和验证层。
+
+## 目录结构
+
+```text
+browser-agent-lab/
+  src/
+    policy.ts
+    schema.ts
+    runner.ts
+    report.ts
+  evals/
+    orders.jsonl
+```
+
+先把任务数据写成 JSONL。每条任务只给必要输入，不把账号、cookie 或私密字段写进评测文件。
+
+```json
+{"id":"o-1001","portal":"vendor-a","orderId":"PO-2026-1001","expectedFields":["status","eta","notes"]}
+{"id":"o-1002","portal":"vendor-a","orderId":"PO-2026-1002","expectedFields":["status","eta","notes"]}
+```
+
+## 策略层先于模型
+
+浏览器 agent 最常见的事故是权限太宽。不要把“只查订单”写成 prompt 里的温柔建议，要写成运行时策略。
+
+```ts
+const allowedHosts = new Set(["portal.vendor-a.internal"]);
+
+export function assertNavigationAllowed(url: string) {
+  const host = new URL(url).host;
+  if (!allowedHosts.has(host)) {
+    throw new Error(`blocked host: ${host}`);
+  }
+}
+
+export function assertActionAllowed(action: string) {
+  const blocked = ["delete", "submit payment", "change bank account"];
+  if (blocked.some((word) => action.toLowerCase().includes(word))) {
+    throw new Error(`blocked action: ${action}`);
+  }
+}
+```
+
+这个策略层要放在 agent 调用之前和之后。调用之前限制目标站点，调用之后审计模型建议的动作。生产里还要加账号分级：查询账号不能修改订单，测试账号不能访问真实客户数据，高风险写操作必须进入审批队列。
+
+## 用结构化 Schema 约束抽取
+
+浏览器自动化的失败不只发生在点击阶段，也发生在“看错结果”。因此抽取结果必须过 schema。
+
+```ts
+import { z } from "zod";
+
+export const OrderStatus = z.object({
+  orderId: z.string(),
+  status: z.enum(["pending", "processing", "blocked", "shipped", "delivered", "unknown"]),
+  eta: z.string().nullable(),
+  notes: z.array(z.string()).default([]),
+  evidence: z.array(z.string()).min(1),
+});
+```
+
+`evidence` 是关键字段。它可以是页面上的文本片段、表格行 ID、截图路径或 DOM selector。没有证据的抽取结果不应该进入报告。
+
+## 混合动作流程
+
+在 runner 里把流程拆成三段：确定性导航、agent 辅助定位、结构化抽取。
+
+```ts
+import { browserbase, Stagehand } from "@browserbasehq/stagehand";
+import { OrderStatus } from "./schema";
+import { assertActionAllowed, assertNavigationAllowed } from "./policy";
+
+export async function inspectOrder(orderId: string) {
+  const browser = await browserbase.launch({
+    apiKey: process.env.BROWSERBASE_API_KEY!,
+  });
+
+  const stagehand = await Stagehand.create({
+    browser,
+    model: {
+      modelName: "openai/gpt-5.4-mini",
+      apiKey: process.env.OPENAI_API_KEY!,
+    },
+  });
+
+  const [page] = await browser.context.pages();
+  const url = "https://portal.vendor-a.internal/orders";
+  assertNavigationAllowed(url);
+  await page.goto(url);
+
+  await page.getByLabel("Order ID").fill(orderId);
+  await page.getByRole("button", { name: "Search" }).click();
+  await page.waitForLoadState("networkidle");
+
+  const instruction = "find the row for this order and open the details panel";
+  assertActionAllowed(instruction);
+  await stagehand.act(instruction);
+
+  const { data } = await stagehand.extract(
+    "extract order id, normalized status, ETA, visible notes, and evidence text",
+    OrderStatus,
+  );
+
+  return OrderStatus.parse(data);
+}
+```
+
+注意这里没有让 agent 接管整个流程。输入订单号、点击搜索按钮这类稳定步骤仍然用 Playwright。只有“找到结果行并打开详情”这种页面变化较多的步骤交给 Stagehand。这样做会显著降低 token 成本，也让失败更容易定位。
+
+## 记录可回放日志
+
+上线前至少记录四类事件：导航、动作、抽取、验证。不要只保存最终 JSON。
+
+```ts
+type TraceEvent = {
+  runId: string;
+  kind: "navigation" | "action" | "extract" | "validation";
+  at: string;
+  payload: unknown;
+};
+
+const trace: TraceEvent[] = [];
+
+export function record(event: Omit<TraceEvent, "at">) {
+  trace.push({ ...event, at: new Date().toISOString() });
+}
+```
+
+每次 `act` 前后都写日志。失败时保存截图和页面标题。这样当供应商后台改版时，你能知道是选择器失败、登录失效、模型误判，还是页面真实没有数据。
+
+## 做最小评测
+
+评测不要只问“成功率”。浏览器 agent 的上线指标应该包含成本、步数、越权次数、结构化校验失败次数和人工接管率。
+
+```ts
+const cases = [
+  { orderId: "PO-2026-1001", mustStatus: "shipped" },
+  { orderId: "PO-2026-1002", mustStatus: "blocked" },
+];
+
+for (const item of cases) {
+  const result = await inspectOrder(item.orderId);
+  if (result.status !== item.mustStatus) {
+    throw new Error(`wrong status for ${item.orderId}`);
+  }
+  if (result.evidence.length === 0) {
+    throw new Error(`missing evidence for ${item.orderId}`);
+  }
+}
+```
+
+第一版评测集可以很小，但必须保留真实失败样本。供应商后台的分页、空状态、重复订单、权限不足、会话过期、弹窗遮挡，都是比正常路径更重要的样本。
+
+## 何时不用浏览器 agent
+
+如果系统有稳定 API，用 API。如果你可以和供应商约定文件交换，用文件。如果流程涉及资金、法务、医疗、删除数据或外部消息发送，先把写操作拆成待审批任务。浏览器 agent 适合处理“页面可见、动作低风险、结果可验证”的中间地带。
+
+结论：Stagehand 这类 SDK 的价值不是让浏览器自动化变得神秘，而是把模型能力收进工程边界里。真正可靠的浏览器 agent 应该像测试系统一样可回放，像数据管道一样可校验，像生产作业一样可审计。

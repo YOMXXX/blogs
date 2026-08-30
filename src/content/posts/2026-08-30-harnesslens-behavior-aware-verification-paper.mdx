@@ -1,0 +1,130 @@
+---
+title: "论文速读：HarnessLens 让 Agent Harness 进化少跑冤枉评测"
+description: "HarnessLens 提出行为感知验证框架，把 agent harness 的候选改动和相关任务子集绑定起来，用可归因证据门控减少无效 rollout。本文解读它对自动化 agent 调优的工程价值。"
+column: "paper"
+tags: ["HarnessLens", "agent-harness", "paper", "verification", "evals", "rollout"]
+pubDate: 2026-08-30
+featured: false
+tldr: "HarnessLens 的重点是把 harness 改动从全量评测拉回行为相关验证：候选修改来自执行轨迹，只在可能受影响的任务上验证，并用可归因证据阻止总分掩盖局部回归。对预算有限的 agent 团队，这是比盲目扩大评测更务实的方向。"
+author: "YOMXXX"
+faq:
+  - q: "什么是 agent harness？"
+    a: "它是包住模型的运行环境，包括系统提示、工具定义、记忆、路由、重试、校验器和观测组件。模型能力相同，harness 不同，agent 表现可能差很多。"
+  - q: "HarnessLens 解决的核心问题是什么？"
+    a: "它解决 harness 自动进化时验证成本过高的问题。不是每个候选改动都需要跑全量任务，关键是找到行为相关任务并检查可归因证据。"
+  - q: "为什么总分会掩盖回归？"
+    a: "一个改动可能让多数简单任务变好，同时破坏少数高风险任务。平均分上升不代表可上线，必须看具体行为类别和失败证据。"
+  - q: "这篇论文能直接替代人工评审吗？"
+    a: "不能。它更适合减少候选验证成本和发现局部回归。生产发布仍然需要人工审查权限、成本、安全和业务影响。"
+  - q: "小团队怎么借鉴 HarnessLens？"
+    a: "先给任务打行为标签，保存 rollout 轨迹，把每次 prompt 或工具改动映射到受影响标签，再只跑相关回归集和少量哨兵任务。"
+---
+
+arXiv 2026 年 8 月 27 日提交的 [Verify Smarter, Evolve Further: Efficient Harness Evolution through Behavior-Aware Verification](https://arxiv.org/abs/2608.27311) 提出 HarnessLens。论文指出，agent harness 会决定语言模型如何使用指令、工具和运行时组件，但自动调整 harness 需要昂贵验证；传统 propose-and-verify 往往让每个候选都跑固定任务集，浪费 rollout，也容易让平均分掩盖具体行为回归。摘要报告中，HarnessLens 在三个 agent harness 和四个 benchmark 上带来 7.6% 到 13.6% 的 held-out 平均性能提升，并消耗更少评测预算。参考来源：[arXiv 论文页](https://arxiv.org/abs/2608.27311)、[arXiv cs.AI recent](https://arxiv.org/list/cs.AI/recent)、[Hugging Face Daily Papers](https://huggingface.co/papers)。
+
+这篇论文适合每个做 agent 平台的人读。过去一年大家已经接受“模型不是全部”，开始调系统提示、工具 schema、记忆策略、planner、反思器、重试器、验证器和权限策略。但 harness 改动有个麻烦：它不像普通函数改动，有清楚输入输出。一个 prompt 小改动可能影响搜索任务、代码任务、表单任务和拒答行为；一个工具 schema 小改动可能让模型更会调用工具，也可能让它更容易在无证据时乱调用。
+
+因此 harness 进化真正的瓶颈不是生成候选，而是验证候选。HarnessLens 的贡献就在这里：它试图让验证更聪明，而不是更粗暴。
+
+## 为什么全量评测很浪费
+
+假设你维护一个代码 agent harness。某次改动只调整了“当测试失败时如何读取日志”。如果每个候选都跑完整评测集，包括文档问答、依赖升级、UI 微调、长上下文搜索，那么大量 rollout 与该改动无关。更糟的是，模型成本、环境成本和排队时间会迫使团队降低迭代频率。
+
+反过来，如果只跑少量样本，又容易漏掉回归。比如新规则让 agent 更积极重跑测试，平均成功率提升，但在数据库迁移任务里多执行了一次危险命令。总分看起来更好，实际风险更高。
+
+HarnessLens 的切入点是“行为相关性”。每个候选改动都应该被问两个问题：它试图改变哪类行为？哪些任务能观察到这类行为？验证结果能否归因到这个改动？
+
+## 行为标签比任务 ID 更重要
+
+很多评测集只按任务来源组织：SWE、Web、RAG、客服、表格。对 harness 调优来说，这个维度不够。更有用的是行为标签。
+
+例如：
+
+```text
+tool_selection: chooses the right tool before answering
+error_recovery: diagnoses tool failures before retrying
+evidence_grounding: cites only observed evidence
+permission_boundary: refuses or escalates risky actions
+state_tracking: preserves task state across long runs
+```
+
+一个任务可以有多个标签。修复构建失败既涉及工具选择，也涉及错误恢复和验证纪律。浏览器自动化既涉及状态跟踪，也涉及证据抽取。候选 harness 改动如果声明要改善 `error_recovery`，验证时就优先跑带这个标签的任务，同时抽样少量其他标签做哨兵检查。
+
+这比“每次跑全部任务”更便宜，也比“只跑作者觉得相关的几个样本”更可审计。
+
+## 可归因证据门控
+
+论文摘要里最值得工程化的词是 attributable-evidence gate。可以理解为：不要只看候选是否让结果变好，还要看证据是否支持“这个变好确实来自目标行为改善”。
+
+举个例子。你新增一条规则：“工具失败后先总结错误类型，再决定是否重试。”一次 rollout 成功了，但日志显示工具从未失败。这条样本不能证明新规则有效。另一次 rollout 中工具确实失败，agent 正确分类为权限错误并停止重试，这才是相关证据。
+
+因此评测日志必须保存中间轨迹。没有轨迹，就无法做归因。最终答案只告诉你结果，轨迹才告诉你 harness 是否通过预期行为产生了结果。
+
+## 给开发团队的最小实现
+
+不需要等论文代码完全产品化，小团队也能做 HarnessLens 的简化版。
+
+第一步，给评测样本补行为标签。
+
+```json
+{"id":"swe-17","task":"fix failing tests","tags":["error_recovery","verification"]}
+{"id":"rag-09","task":"answer with citations","tags":["evidence_grounding"]}
+{"id":"ops-04","task":"rotate a test token","tags":["permission_boundary","tool_selection"]}
+```
+
+第二步，要求每个 harness 改动声明目标行为。
+
+```json
+{"change_id":"h-42","summary":"classify tool errors before retry","targets":["error_recovery"],"risk":"medium"}
+```
+
+第三步，构建选择器：目标标签全跑，邻近标签抽样，高风险标签永远跑。
+
+```ts
+const sentinelTags = new Set(["permission_boundary", "data_deletion"]);
+
+export function selectEvalCases(change, cases) {
+  return cases.filter((item) => {
+    const hitTarget = item.tags.some((tag) => change.targets.includes(tag));
+    const hitSentinel = item.tags.some((tag) => sentinelTags.has(tag));
+    return hitTarget || hitSentinel;
+  });
+}
+```
+
+第四步，让验证器读轨迹，而不是只读 final answer。
+
+```ts
+export function hasAttributableEvidence(trace, target) {
+  if (target === "error_recovery") {
+    return trace.some((event) => event.kind === "tool_error") &&
+      trace.some((event) => event.kind === "error_classification");
+  }
+  if (target === "evidence_grounding") {
+    return trace.every((event) => event.kind !== "uncited_claim");
+  }
+  return true;
+}
+```
+
+这段代码很朴素，但方向正确：先限制验证范围，再用轨迹证明候选改动真的影响了目标行为。
+
+## 和 prompt optimization 的关系
+
+8 月底的论文趋势里，prompt optimization 和 harness evolution 同时升温。二者不是一回事。Prompt optimization 改的是指令文本，harness evolution 改的是整个运行壳，包括工具、组件、状态机和验证器。Prompt 是 harness 的一部分。
+
+HarnessLens 对 prompt 优化也有启发。不要让每个 prompt 候选都跑全量任务，也不要只按平均分选 winner。给 prompt diff 标注目标行为，跑相关任务，检查轨迹证据，这会让 prompt 迭代更便宜，也更少出现“整体涨分但关键任务退化”的问题。
+
+## 局限和风险
+
+行为标签本身可能错。一个任务被漏标，就可能逃过相关验证。候选改动的目标也可能写得太窄，实际影响更广。因此任何行为感知选择都需要哨兵任务和周期性全量回归。
+
+另一个风险是过拟合轨迹模式。验证器如果只检查“是否出现某个事件名”，agent harness 可能学会制造形式正确的轨迹，而没有真实改善。更好的做法是结合任务结果、轨迹事件、环境状态和人工抽检。
+
+最后，安全类行为不能完全预算驱动。权限、删除、外部发送、财务和隐私任务应当始终进入高优先级验证集，即使候选改动看起来无关。生产事故往往来自“看起来无关”的局部变化。
+
+## 结论
+
+HarnessLens 的工程意义很直接：agent harness 会持续进化，但验证预算不会无限增长。下一代 agent 平台需要把评测从“固定大礼包”变成“行为相关、证据归因、风险哨兵”的系统。
+
+对开发团队来说，最值得今天就做的不是复刻完整算法，而是三件事：给任务打行为标签，保存可分析 rollout 轨迹，把每个 harness diff 绑定到目标行为。做到这三点，agent 调优就会从玄学改 prompt，转向可解释的软件演进。
