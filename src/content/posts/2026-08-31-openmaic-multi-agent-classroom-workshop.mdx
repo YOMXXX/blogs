@@ -1,0 +1,204 @@
+---
+title: "实战工坊：用 OpenMAIC 搭一个多 Agent 互动课堂"
+description: "OpenMAIC 在 GitHub Trending 和教育 AI 社区持续升温。本文用一套本地部署和课程生成工坊，拆解如何把 PDF、教师 Agent、同学 Agent、测验和导出流程组合成可控的学习应用。"
+column: "workshop"
+tags: ["OpenMAIC", "multi-agent", "classroom-agent", "workshop", "education-ai", "LangGraph"]
+pubDate: 2026-08-31
+featured: false
+tldr: "OpenMAIC 的价值不是把课件交给一个聊天机器人总结，而是把课程生成、讲解、同伴讨论、测验、白板和导出组织成多 Agent 状态机。开发者可以借它学习教育 AI 的产品骨架，也可以把同样模式迁移到内部培训、产品文档和技术 onboarding。"
+author: "YOMXXX"
+faq:
+  - q: "OpenMAIC 适合什么场景？"
+    a: "最适合把结构化材料变成互动学习流程，例如课程 PDF、企业培训手册、产品文档、技术 onboarding 和考试复习。它不只是摘要工具，而是课堂流程生成器。"
+  - q: "它和普通 RAG 教学机器人有什么区别？"
+    a: "RAG 机器人通常围绕问答，OpenMAIC 更强调多角色互动、课件生成、测验、模拟、白板和课堂节奏。它把学习体验建成流程，而不是单轮检索回答。"
+  - q: "本地部署时最容易踩什么坑？"
+    a: "主要是模型密钥、语音服务、浏览器权限、Node 版本和资源生成耗时。建议先关闭非必要多媒体能力，只跑文本、幻灯片和测验链路。"
+  - q: "生产环境能直接开放给学生吗？"
+    a: "不建议直接裸奔。需要文件上传限制、内容审核、额度控制、日志脱敏、人工申诉和教师审批，尤其是未成年人、考试和正式教学场景。"
+  - q: "这个工坊的代码能直接复制吗？"
+    a: "示例是工程骨架，真实项目要按 OpenMAIC 当前 README 和环境变量调整。重点是课程流水线、质量门禁和可观测性设计，而不是绑定某个固定版本。"
+---
+
+OpenMAIC 是清华 THU-MAIC 团队开源的 Open Multi-Agent Interactive Classroom。它最近出现在 GitHub Trending 和教育 AI 讨论里，官方介绍强调一键从主题或文档生成互动课堂，包含 AI 教师、AI 同学、幻灯片、测验、交互模拟、白板、TTS 和 PPTX/HTML 导出。参考来源：[OpenMAIC 官网](https://openmaic.chat/)、[OpenMAIC GitHub](https://github.com/THU-MAIC/OpenMAIC)、[AMD 对 MAIC 的介绍](https://www.amd.com/en/blogs/2026/reimagining-ai-native-education-through-multi-agent-interactive-classroom-on-amd-rocm.html)。
+
+这篇工坊不把 OpenMAIC 当成“又一个教育 demo”。更有价值的看法是：它是一个多 Agent 应用模板。很多公司都在做内部培训、代码库 onboarding、合规学习、销售 enablement、产品知识库，但最后往往只做成一个 RAG 聊天框。聊天框能回答问题，却很难稳定地产生学习路径、阶段测验、互动讨论和可复查产物。OpenMAIC 展示了另一种产品形态：让多个角色围绕同一份材料协作，前端呈现为课堂，后端呈现为状态机。
+
+下面我们搭一个“团队内部 API 安全培训课堂”。输入是一份 Markdown 或 PDF，输出是 30 分钟课程：开场目标、五页核心幻灯片、两轮同学提问、三道测验题、一个小实验和导出包。即使你最后不用 OpenMAIC，也可以复用这套工程结构。
+
+## 最小部署路线
+
+先克隆项目并安装依赖。真实命令以仓库 README 为准，下面给出通用流程。
+
+```bash
+git clone https://github.com/THU-MAIC/OpenMAIC.git
+cd OpenMAIC
+pnpm install
+cp .env.example .env.local
+pnpm dev
+```
+
+第一次不要急着接入所有模型、语音和图片服务。教育应用的调试成本很高，最好的顺序是先跑通文本课程生成，再打开测验，再打开白板和语音。`.env.local` 可以先保留一个主力文本模型。
+
+```bash
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=
+GOOGLE_API_KEY=
+DEEPSEEK_API_KEY=
+ACCESS_CODE=team-training
+```
+
+如果你要给内部团队使用，`ACCESS_CODE` 不是安全边界，只是轻量入口。真正的生产环境需要 SSO、课程空间隔离、文件权限和日志脱敏。
+
+## 把课程生成拆成状态机
+
+多 Agent 课堂最怕失控。教师 Agent 开始扩展背景，同学 Agent 不断追问，测验 Agent 又生成一堆偏题题目，最后用户看起来很热闹，但课程目标不清楚。因此要先写课程计划对象。
+
+```ts
+type LessonPlan = {
+  topic: string;
+  audience: "engineer" | "pm" | "sales" | "mixed";
+  durationMinutes: number;
+  objectives: string[];
+  sourceFiles: string[];
+  requiredScenes: Array<"slides" | "quiz" | "discussion" | "lab">;
+};
+
+const plan: LessonPlan = {
+  topic: "API key leakage response",
+  audience: "engineer",
+  durationMinutes: 30,
+  objectives: [
+    "identify common leakage paths",
+    "rotate exposed keys safely",
+    "add automated scanning to CI",
+  ],
+  sourceFiles: ["./materials/api-security.md"],
+  requiredScenes: ["slides", "discussion", "quiz", "lab"],
+};
+```
+
+这个对象要进入每个 Agent 的上下文。教师 Agent 负责讲解目标，同学 Agent 负责提出误区问题，测验 Agent 只检查目标相关知识，实验 Agent 只生成可在沙箱里做的小练习。不要让任何一个角色重新定义课程目标。
+
+## 课程材料预处理
+
+上传 PDF 或 Markdown 后，先做材料切片和章节摘要。这里不要追求最复杂的 RAG，先让每个片段带上页码、标题和证据。
+
+```ts
+type SourceChunk = {
+  id: string;
+  title: string;
+  page?: number;
+  text: string;
+};
+
+function buildEvidence(chunks: SourceChunk[]) {
+  return chunks.map((chunk) => ({
+    id: chunk.id,
+    heading: chunk.title,
+    locator: chunk.page ? `page ${chunk.page}` : "markdown section",
+    preview: chunk.text.slice(0, 240),
+  }));
+}
+```
+
+教育场景尤其需要证据，因为学生会把系统输出当成课程内容。每页幻灯片、每道题和每个答案都应能追到材料片段。无法追溯的发挥可以保留，但要标记为补充解释，而不是原文内容。
+
+## 设计四个 Agent 角色
+
+第一版建议只有四个角色。
+
+```text
+teacher_agent: 生成讲解路径和幻灯片大纲
+peer_agent: 模拟同学提问和常见误解
+quiz_agent: 生成测验并解释选项
+lab_agent: 生成小实验和验证步骤
+```
+
+角色越多，越容易产生表演性复杂度。你真正需要的是职责边界，而不是更多名字。每个 Agent 输出结构化 JSON，再由课程编排器合并。
+
+```ts
+type Slide = {
+  title: string;
+  bullets: string[];
+  evidenceIds: string[];
+};
+
+type QuizItem = {
+  question: string;
+  options: string[];
+  answerIndex: number;
+  explanation: string;
+  evidenceIds: string[];
+};
+```
+
+如果某个输出缺少 `evidenceIds`，直接退回重生成。这样会比事后人工检查省很多时间。
+
+## 课程质量门禁
+
+互动课堂必须有质量门禁，否则多 Agent 会把错误包装得更像课堂。可以先做五个检查。
+
+```ts
+function validateLesson(slides: Slide[], quizzes: QuizItem[]) {
+  if (slides.length < 4) throw new Error("too few slides");
+  if (quizzes.length < 3) throw new Error("too few quizzes");
+  for (const slide of slides) {
+    if (slide.bullets.length > 5) throw new Error(`slide too dense: ${slide.title}`);
+    if (slide.evidenceIds.length === 0) throw new Error(`missing evidence: ${slide.title}`);
+  }
+  for (const item of quizzes) {
+    if (item.options.length !== 4) throw new Error(`bad quiz options: ${item.question}`);
+    if (item.evidenceIds.length === 0) throw new Error(`missing quiz evidence: ${item.question}`);
+  }
+}
+```
+
+这类规则看起来机械，但对教育产品很重要。幻灯片太密、题目没有依据、解释跳步骤，都会直接降低学习效果。把这些规则放进编排层，比反复提醒模型“请高质量生成”更可靠。
+
+## 交互课堂的正确边界
+
+OpenMAIC 最吸引人的功能是 AI 同学和实时讨论。开发者容易把这部分做成“无限聊天”。实际更稳的做法是围绕课程节点开放讨论。
+
+例如每两页幻灯片之后，peer agent 生成两个问题：一个代表初学者误解，一个代表进阶工程追问。教师 Agent 先回答，再让用户选择是否展开。这样既有课堂感，也不会让节奏完全散掉。
+
+```ts
+type DiscussionTurn = {
+  afterSlide: number;
+  persona: "beginner" | "skeptic" | "operator";
+  question: string;
+  expectedAnswerPoints: string[];
+};
+```
+
+企业培训尤其需要这个边界。课堂不是聊天群，用户进入这个系统是为了在有限时间内掌握一个主题。多 Agent 的价值是模拟不同角度，而不是制造噪声。
+
+## 导出和复查
+
+OpenMAIC 支持导出 PPTX 或 HTML，这一点比很多教育 demo 更实用。建议把导出包定义成三层。
+
+```text
+lesson.html: 学生可回看版本
+slides.pptx: 讲师可编辑版本
+trace.json: 生成过程、模型、材料证据和校验结果
+```
+
+`trace.json` 是内部必需品。它让你知道课程来自哪个模型、哪份材料、哪些 chunk、哪次质量门禁。教育和培训内容会被复用，如果没有 trace，后续纠错和版本管理会很痛苦。
+
+## 适合迁移的业务场景
+
+OpenMAIC 的模式可以迁移到至少四类场景。
+
+第一是技术 onboarding。把代码库文档、架构图和 runbook 变成互动课程，让新成员先经历一轮系统讲解和测验，再进入真实仓库。
+
+第二是安全培训。泄露响应、权限申请、数据脱敏、CI 扫描都可以做成带实验的小课程，比年度合规视频有效。
+
+第三是销售和客服培训。让 AI 同学扮演客户、质疑者和采购经理，围绕产品资料训练回答，而不是只背 FAQ。
+
+第四是研究论文学习。把论文转成背景、方法、实验、局限、复现步骤和测验，适合团队 journal club。
+
+## 结论
+
+OpenMAIC 热起来的原因，不只是它把“AI 教师”做得更漂亮，而是它把教育 AI 从单轮问答推向流程化 Agent 产品。开发者最该学习的是三件事：课程目标先行，多角色职责隔离，所有内容可追溯到材料证据。
+
+如果你正在做企业知识库，不要只做聊天入口。把某个高频主题做成 30 分钟互动课程，加入测验、讨论和导出，用户会更容易完成真正的学习闭环。OpenMAIC 是一个值得拆解的参考实现。

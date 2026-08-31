@@ -1,0 +1,140 @@
+---
+title: "工具速评：Archify 把代码库架构图变成 Agent 可交付物"
+description: "Archify 最近在 GitHub 和 AI coding 社区走热。它不是普通画图工具，而是让 Codex、Claude Code、Cursor 和 OpenCode 输出可验证的交互式架构图。本文评估它适合谁、强在哪、风险在哪。"
+column: "tools"
+tags: ["Archify", "architecture-diagram", "tools", "agent-workflow", "devtools", "Codex"]
+pubDate: 2026-08-31
+featured: false
+tldr: "Archify 的关键不是漂亮图，而是把架构图做成 agent 工作流里的结构化产物：先生成 typed JSON IR，再校验，再渲染成自包含 HTML/SVG。它适合代码库 onboarding、架构评审、交接文档和 agent 上下文包，但不能替代人工架构判断。"
+author: "YOMXXX"
+faq:
+  - q: "Archify 和 Mermaid 有什么区别？"
+    a: "Mermaid 更像文本画图 DSL，Archify 更像 agent skill。它强调从代码库或自然语言生成结构化中间表示，再输出交互式架构图和导出物。"
+  - q: "它适合大型代码库吗？"
+    a: "适合做高层地图和评审入口，但不适合一次性吞下所有细节。大型仓库应先限定边界，例如运行时架构、支付链路或数据流。"
+  - q: "生成的图能直接进文档吗？"
+    a: "可以作为初稿，但必须由熟悉系统的人复核。尤其是安全边界、数据流、缓存一致性和异步队列，不能只相信模型推断。"
+  - q: "为什么 typed JSON IR 重要？"
+    a: "因为它让图从视觉结果变成可校验数据。你可以检查节点、边、分组、证据和导出规则，减少纯自然语言画图的不可控性。"
+  - q: "团队引入时应怎么试点？"
+    a: "先选一个服务或一条业务链路，让 agent 生成图和证据列表，再让负责人批注差异。不要一开始就要求自动维护全公司架构图。"
+---
+
+Archify 最近在 GitHub Trending、AI coding 工具社区和架构图讨论里明显升温。项目定位是 agent skill：让 Codex、Claude Code、Cursor、OpenCode 等 AI coding 环境从代码库或系统描述生成可验证、可交互、自包含的架构图。搜索结果和项目说明提到它支持架构、工作流、序列、数据流、生命周期等图类型，使用 typed JSON 作为中间表示，并能导出 HTML、SVG、PNG 等产物。参考来源：[tt-a1i/archify GitHub](https://github.com/tt-a1i/archify)、[Archify SKILL.md](https://github.com/tt-a1i/archify/blob/main/archify/SKILL.md)、[HelloGitHub 项目介绍](https://hellogithub.com/en/repository/tt-a1i/archify)。
+
+我对这类工具的判断标准很简单：它能不能让代码库理解更快，能不能让图保持可复查，能不能融入团队已有文档流程。Archify 的有趣之处不在“AI 能画图”这个表层，而在它把架构图变成了 agent 的正式交付物。
+
+过去架构图有两个极端。一个极端是手写 Mermaid、PlantUML、draw.io，准确但维护成本高，代码变了图不变。另一个极端是让 LLM 直接生成一张漂亮图，速度快但证据弱，错了也很难定位。Archify 试图走中间路线：让 agent 阅读代码和描述，生成结构化 JSON，再由渲染器校验并输出可交互图。
+
+## 它解决的不是画图，而是交接
+
+每个团队都有“没人敢碰的服务”。新同事打开仓库，只看到目录、配置、路由、中间件、队列、数据库和一堆历史命名。文档可能过期，README 只覆盖启动命令，真正的运行时关系藏在代码里。
+
+Archify 适合做第一张地图。不是最精细的图，而是能回答几个问题：
+
+```text
+请求从哪里进入？
+核心模块有哪些？
+数据写入哪里？
+异步任务在哪里分叉？
+外部依赖有哪些？
+权限和信任边界在哪里？
+```
+
+如果 agent 能在半小时内产出一张带证据的高层图，架构评审和 onboarding 的起点就会好很多。
+
+## 推荐试用流程
+
+不要直接说“帮我画整个公司系统”。更好的 prompt 是限定范围、图类型、证据和输出格式。
+
+```text
+Use Archify to map this repository's runtime architecture.
+Show 8-12 core components, one primary request path, storage systems,
+external dependencies, and trust boundaries.
+Attach source evidence for each major node.
+Keep implementation detail in notes instead of adding more edges.
+```
+
+这个 prompt 的关键是限制数量。架构图最常见的问题不是信息太少，而是节点太多、边太乱，最后没人看。高层图应像地图，不应像源代码抽象语法树。
+
+如果是单条业务链路，可以这样问：
+
+```text
+Use Archify to draw the checkout workflow.
+Include browser, API routes, auth middleware, payment provider,
+database writes, event queue, email worker, and failure paths.
+Mark which edges are synchronous and which are asynchronous.
+```
+
+把同步和异步分开很重要。很多事故都发生在“图上看起来是一条线，实际是三个队列和两个重试器”。
+
+## 和 Mermaid、PlantUML、Excalidraw 的对比
+
+Mermaid 的优势是轻、可读、适合文档内联。PlantUML 更适合严格 UML 和企业文档。Excalidraw 适合白板协作和非正式讨论。Archify 的位置不同：它适合 agent 参与的代码理解流程。
+
+可以把它们这样分工：
+
+```text
+Mermaid: 稳定文档里的轻量图
+PlantUML: 需要规范符号的正式图
+Excalidraw: 会议讨论和草图
+Archify: 从代码库生成初稿并保留结构化证据
+```
+
+Archify 不一定替代这些工具。更现实的用法是先用 Archify 生成高层地图，再把稳定结论转成 Mermaid 放进 README，或者导出 SVG 放进设计文档。
+
+## typed JSON IR 的价值
+
+很多 AI 画图工具最大的问题是输出即终点。图看起来漂亮，但你无法系统性检查它有没有遗漏节点、有没有非法边、有没有证据。Archify 强调中间表示，这一点很关键。
+
+一个简化的 IR 可以长这样：
+
+```json
+{
+  "nodes": [
+    { "id": "web", "label": "Web App", "kind": "frontend" },
+    { "id": "api", "label": "API Server", "kind": "service" },
+    { "id": "db", "label": "PostgreSQL", "kind": "database" }
+  ],
+  "edges": [
+    { "from": "web", "to": "api", "label": "HTTPS requests" },
+    { "from": "api", "to": "db", "label": "SQL queries" }
+  ]
+}
+```
+
+有了 IR，就能做 lint：节点数量是否过多，是否存在孤立节点，外部依赖是否标记，安全边界是否缺失，是否每个核心节点都有代码证据。架构图就从“美术产物”变成“可测试产物”。
+
+## 最适合的五个场景
+
+第一，接手陌生仓库。让 agent 先生成高层图，再带着图读代码，会比从目录树硬啃更快。
+
+第二，PR 架构影响说明。大型 PR 可以要求作者附上 before/delta/after 图，让评审者先看运行时变化，再看代码 diff。
+
+第三，事故复盘。把真实请求链路、失败组件、告警系统和补偿任务画出来，帮助团队找到断点。
+
+第四，合规和安全评审。标出用户数据、密钥、外部 API 和跨信任边界调用，给安全团队一个共同语境。
+
+第五，给 agent 准备上下文包。先让 Archify 生成代码库地图，再让 coding agent 基于这张地图做修改，可以减少 agent 误读模块边界的概率。
+
+## 风险和限制
+
+第一，模型会补全不存在的架构。看到 `redis` 依赖就猜缓存，看到 `worker` 目录就猜异步任务，这些都可能错。每个重要节点都应要求证据。
+
+第二，坐标和视觉布局不等于架构正确。图好看容易让人放松警惕，尤其是产品经理和新同事。团队要建立复核习惯。
+
+第三，动态图会过期。架构图如果不能和代码变更绑定，很快会退化成历史纪念品。最好把生成命令、prompt 和版本一起提交。
+
+第四，不要把机密系统结构发给不可信模型。涉及内网、客户数据、密钥路径和安全拓扑时，要使用企业许可模型或本地环境，并清理输入。
+
+## 引入建议
+
+试点时只选一个服务，不选全系统。先让 Archify 画运行时架构，再让服务负责人做三类标注：正确、错误、缺失。错误和缺失反过来就是 prompt 约束和扫描范围的改进项。
+
+评估指标也要务实：新同事理解时间是否缩短，架构评审是否更聚焦，文档是否更容易更新，安全边界是否更早暴露。不要只看图漂不漂亮。
+
+## 结论
+
+Archify 是 AI coding agent 生态里一个很有代表性的方向：agent 不只写代码，也开始生成代码理解产物。架构图、测试计划、迁移清单、运行手册都会成为 agent 的输出对象。
+
+我的建议是把 Archify 当作“架构初稿和上下文包生成器”，而不是自动真理机。让它画第一张图，让人类校正关键边界，再把稳定结论沉淀到文档和评审流程里。这样它会真正提升工程效率，而不是制造一批漂亮但不可维护的图片。
