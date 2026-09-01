@@ -1,0 +1,262 @@
+---
+title: "实战工坊：用 Headless 360 思路搭一个权限感知 MCP 网关"
+description: "Salesforce Headless 360 和 Data 360 MCP Server 把企业数据入口推到 Agent 工作流前台。本文用 TypeScript 写一个权限、审计和字段脱敏都可控的 MCP 网关骨架。"
+column: "workshop"
+tags: ["Headless-360", "MCP", "Agentforce", "enterprise-agent", "data-governance", "workshop"]
+pubDate: 2026-09-01
+featured: false
+tldr: "企业 MCP 不能只是把 CRM、工单和数据湖工具暴露给模型。真正可上线的做法，是在工具调用前放一层权限感知网关：统一身份、字段级脱敏、租户隔离、动作审批和审计轨迹。"
+author: "YOMXXX"
+faq:
+  - q: "Headless 360 适合开发者关注什么？"
+    a: "它提示企业 AI 的接口正在从 UI 组件转向 agent 可调用能力。开发者要关注的不是品牌名，而是如何把数据、权限、审计和动作执行变成稳定工具层。"
+  - q: "为什么 MCP 网关不能直连数据库？"
+    a: "直连数据库会绕过业务权限、字段脱敏和审计流程。企业 agent 应通过带策略的工具入口访问数据，让每次查询和动作都有身份、范围和日志。"
+  - q: "本文代码能直接接 Salesforce 吗？"
+    a: "示例是工程骨架，不绑定某个官方 SDK。真实接入要按 Salesforce 当前 Headless 360、Data 360 MCP Server 和组织权限模型调整适配器。"
+  - q: "字段级脱敏应该放在哪里？"
+    a: "建议放在工具响应返回前的网关层，并结合用户角色、目的、字段分类和审计策略判断。不要只依赖 prompt 要求模型不要展示敏感字段。"
+  - q: "什么时候需要人工审批？"
+    a: "凡是会写入客户数据、触发外部通知、修改订单、变更合同或导出批量数据的动作，都应该至少支持审批模式，并把审批结果写入审计日志。"
+---
+
+Salesforce 在 8 月末围绕 Agentforce 360、Headless 360 和 Data 360 MCP Server 的产品发布，把一个趋势推到台前：企业软件的下一层入口，不再只是按钮、报表和表单，而是能被 agent 调用的业务能力。参考来源：[Salesforce 新闻中心](https://www.salesforce.com/news/)、[Salesforce Agentforce](https://www.salesforce.com/agentforce/)、[Model Context Protocol](https://modelcontextprotocol.io/)。
+
+这篇工坊不复述发布文案，而是把问题落到工程上：如果你的公司要把 CRM、工单、合同、客户画像和运营数据暴露给 agent，MCP server 应该怎么搭？最危险的版本是“给模型一个 SQL 工具”。最稳的版本是“给模型一个权限感知的业务网关”。二者差别巨大。
+
+企业 agent 调用工具时，至少有四个维度必须同时成立：调用者是谁，能看哪些字段，为什么要查这些数据，查完之后能不能执行动作。MCP 只是协议入口，不自动解决治理问题。Headless 360 这类产品真正值得开发者学习的，是把企业能力做成无头、可组合、可审计的工具面。
+
+下面我们用 TypeScript 写一个最小 MCP 网关骨架。目标不是复刻 Salesforce，而是搭出一个可迁移到任何 CRM 或数据平台的边界。
+
+## 先定义工具契约
+
+不要让模型自由拼查询。先把业务能力定义成小工具，每个工具都有输入 schema、权限范围和响应脱敏规则。
+
+```ts
+type Principal = {
+  userId: string;
+  tenantId: string;
+  roles: string[];
+  purpose: "support" | "sales" | "renewal" | "analytics";
+};
+
+type ToolRequest<T> = {
+  principal: Principal;
+  runId: string;
+  toolName: string;
+  input: T;
+};
+
+type CustomerLookupInput = {
+  customerId: string;
+  includeTickets?: boolean;
+  includeRevenue?: boolean;
+};
+```
+
+这里的 `purpose` 很重要。相同用户在不同目的下可见字段可能不同。客服可以看工单和联系记录，续约经理可以看合同到期和用量，分析角色可能只能看聚合数据。没有 purpose，权限系统就很容易退化成“角色足够大就全给”。
+
+## 权限策略不是 prompt
+
+很多团队会在 system prompt 里写“不要泄露敏感信息”。这只能算额外提醒，不能算安全边界。真正的策略要在工具层执行。
+
+```ts
+const rolePolicy = {
+  support: {
+    allowTools: ["customer.lookup", "ticket.search"],
+    fields: ["name", "plan", "tickets", "lastContactedAt"],
+  },
+  sales: {
+    allowTools: ["customer.lookup", "opportunity.search"],
+    fields: ["name", "plan", "arr", "renewalDate", "owner"],
+  },
+  analyst: {
+    allowTools: ["customer.segmentStats"],
+    fields: ["segment", "count", "averageArr"],
+  },
+} as const;
+
+function canCall(principal: Principal, toolName: string) {
+  return principal.roles.some((role) => {
+    const policy = rolePolicy[role as keyof typeof rolePolicy];
+    return policy?.allowTools.includes(toolName as never);
+  });
+}
+```
+
+生产系统里策略会更复杂，可能来自 OPA、Casbin、内部 IAM 或 SaaS 平台自己的权限模型。关键原则是：模型只提出意图，网关负责判断是否允许。
+
+## 字段脱敏放在响应出口
+
+字段脱敏要在工具响应返回给模型之前完成。如果敏感字段已经进入模型上下文，再要求它不要输出，风险就已经发生。
+
+```ts
+type CustomerRecord = {
+  id: string;
+  tenantId: string;
+  name: string;
+  plan: string;
+  arr: number;
+  renewalDate: string;
+  billingEmail: string;
+  tickets: Array<{ id: string; title: string; status: string }>;
+};
+
+function allowedFields(principal: Principal) {
+  const fields = new Set<string>();
+  for (const role of principal.roles) {
+    const policy = rolePolicy[role as keyof typeof rolePolicy];
+    policy?.fields.forEach((field) => fields.add(field));
+  }
+  return fields;
+}
+
+function redactCustomer(record: CustomerRecord, principal: Principal) {
+  const fields = allowedFields(principal);
+  return Object.fromEntries(
+    Object.entries(record).filter(([key]) => {
+      if (key === "id") return true;
+      if (key === "tenantId") return false;
+      return fields.has(key);
+    }),
+  );
+}
+```
+
+这段代码还有一个细节：`tenantId` 默认不返回给模型。租户隔离是系统内部约束，不应该随便进入自然语言上下文。需要调试时可以进审计日志，但不一定要给模型。
+
+## 工具执行包装器
+
+现在写一个统一包装器。所有工具调用都必须经过鉴权、租户过滤、执行、脱敏和审计。
+
+```ts
+async function executeTool<TInput, TOutput>(
+  request: ToolRequest<TInput>,
+  handler: (input: TInput, principal: Principal) => Promise<TOutput>,
+  redact: (output: TOutput, principal: Principal) => unknown,
+) {
+  const startedAt = new Date().toISOString();
+
+  if (!canCall(request.principal, request.toolName)) {
+    await audit({
+      runId: request.runId,
+      toolName: request.toolName,
+      userId: request.principal.userId,
+      decision: "deny",
+      reason: "tool_not_allowed",
+      at: startedAt,
+    });
+    throw new Error("tool_not_allowed");
+  }
+
+  const raw = await handler(request.input, request.principal);
+  const safe = redact(raw, request.principal);
+
+  await audit({
+    runId: request.runId,
+    toolName: request.toolName,
+    userId: request.principal.userId,
+    decision: "allow",
+    reason: "policy_passed",
+    at: startedAt,
+  });
+
+  return safe;
+}
+```
+
+`audit` 不能只写成功日志。被拒绝的工具调用同样重要，因为它们能暴露 prompt 注入、越权探索和 agent 计划偏移。很多安全事件的早期信号，正是不断尝试访问不该访问的数据。
+
+## 租户过滤必须在查询层
+
+脱敏解决字段问题，租户过滤解决行级问题。不要先查全量再过滤，这是常见事故源。查询函数必须强制带上 `tenantId`。
+
+```ts
+async function lookupCustomer(
+  input: CustomerLookupInput,
+  principal: Principal,
+): Promise<CustomerRecord> {
+  const record = await db.customer.findFirst({
+    where: {
+      id: input.customerId,
+      tenantId: principal.tenantId,
+    },
+    include: {
+      tickets: input.includeTickets === true,
+    },
+  });
+
+  if (!record) throw new Error("customer_not_found");
+  return record;
+}
+```
+
+真实数据库层还要加入组织层级、数据拥有者、共享规则和时间窗口。重点是所有过滤条件都来自可信身份上下文，而不是模型传入参数。
+
+## 写操作必须走审批
+
+读取工具已经需要策略，写操作更不能直接开放。例如修改客户状态、发送续约邮件、关闭工单、更新合同字段，都应该支持 dry run 和审批。
+
+```ts
+type ActionPlan = {
+  action: "send_email" | "update_ticket" | "create_opportunity";
+  targetId: string;
+  summary: string;
+  risk: "low" | "medium" | "high";
+  payload: Record<string, unknown>;
+};
+
+function needsApproval(plan: ActionPlan) {
+  if (plan.risk !== "low") return true;
+  if (plan.action === "send_email") return true;
+  return false;
+}
+```
+
+Agent 可以生成行动计划，但网关先返回预览，不立即执行。用户或自动审批器通过后，再由后端服务执行。这样可以保留 agent 的效率，同时不把客户数据操作权完全交给模型。
+
+## 最小 MCP server 形态
+
+如果接 MCP，可以把上面的包装器挂到 server 的 tool handler 上。不同 SDK API 会变化，下面是伪代码骨架。
+
+```ts
+server.tool("customer.lookup", customerLookupSchema, async (input, context) => {
+  const principal = await resolvePrincipal(context.auth);
+  return executeTool(
+    {
+      principal,
+      runId: context.runId,
+      toolName: "customer.lookup",
+      input,
+    },
+    lookupCustomer,
+    redactCustomer,
+  );
+});
+```
+
+这个设计可以接 Salesforce，也可以接 Zendesk、HubSpot、Snowflake、内部订单系统或数据湖。真正稳定的抽象不是供应商名称，而是每次工具调用都遵循同一条治理路径。
+
+## 上线前检查清单
+
+第一，确认每个工具都有明确业务目的。模糊的 `queryData` 工具最容易变成越权入口。
+
+第二，确认所有响应都先脱敏再进入模型上下文。日志可以更完整，但日志也要分级访问。
+
+第三，确认写操作有 dry run、审批和回滚路径。Agent 生成计划，系统执行动作。
+
+第四，确认审计日志包含 runId、userId、tenantId、toolName、输入摘要、输出字段集合、策略决策和审批结果。
+
+第五，确认工具错误不会泄露内部结构。错误信息应告诉 agent 如何修正请求，而不是暴露数据库表、字段或权限系统细节。
+
+## 运行监控怎么做
+
+网关上线后，最该看的不是平均延迟，而是策略分布。每天统计哪些工具最常被拒绝，哪些字段最常被脱敏，哪些用户触发了审批，哪些 agent run 在同一任务里反复改写参数。正常系统会有少量拒绝和重试；如果拒绝率突然上升，通常说明 prompt 注入、权限配置或工具描述出现了问题。
+
+还可以给每个工具设一个行为基线。例如客服 agent 平时每次任务查 1 到 3 个客户，突然开始批量遍历 200 个客户，就算每次调用都符合 schema，也应该进入告警。企业 MCP 的安全不只靠单次鉴权，还要看一串调用组合起来是否仍然合理。
+
+## 结论
+
+Headless 360 这类发布说明了一个方向：企业软件正在把能力拆成 agent 可调用的无头接口。但 MCP server 不是把模型接到数据库的捷径，而是把企业治理前移到工具层的机会。
+
+开发者今天就可以先做一个小网关：只暴露两个读取工具，一个写操作 dry run，接入身份、字段脱敏、审计和审批。等业务证明价值后，再扩展到更多系统。企业 agent 的关键竞争力，不是谁能调用更多工具，而是谁能在可控范围内持续调用正确工具。
