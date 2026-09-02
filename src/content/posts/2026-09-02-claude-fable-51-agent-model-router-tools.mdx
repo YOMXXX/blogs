@@ -1,0 +1,171 @@
+---
+title: "工具速评：Claude Fable 5.1 之后如何设计 Agent 模型路由"
+description: "Claude Fable 5.1 在 HN 和产品发布渠道引发开发者讨论。本文不做榜单复述，而是评估它适合哪些 agent 任务，并给出多模型路由、预算和降级设计。"
+column: "tools"
+tags: ["Claude-Fable-51", "model-router", "agent-tools", "cost-control", "developer-tools", "tools"]
+pubDate: 2026-09-02
+featured: false
+tldr: "Claude Fable 5.1 这类高端模型适合深推理、代码修改、多步工具规划和高价值审查，但不应该接管所有请求。成熟 agent 系统需要模型路由，把任务按风险、成本和延迟拆开。"
+author: "YOMXXX"
+faq:
+  - q: "Claude Fable 5.1 适合所有 agent 任务吗？"
+    a: "不适合。高端模型适合复杂规划和高风险判断，简单分类、摘要、格式转换和低价值闲聊应交给更便宜更快的模型。"
+  - q: "模型路由和普通负载均衡有什么不同？"
+    a: "普通负载均衡按流量和可用性分发请求，模型路由还要理解任务类型、上下文长度、风险级别、预算和质量要求。"
+  - q: "什么时候应该升级到强模型？"
+    a: "当任务涉及多步工具调用、代码修改、关键客户数据、低置信答案或失败重试时，可以升级。升级应有明确规则，而不是让用户随意选择。"
+  - q: "路由会不会降低答案一致性？"
+    a: "会有这个风险，所以要统一系统提示、输出 schema、评估集和回归测试。路由不是随意混用模型，而是有策略地分层。"
+  - q: "小团队如何开始做路由？"
+    a: "先用三档模型就够：快模型处理轻任务，均衡模型处理常规 agent，强模型处理复杂和高风险任务。再逐步加入日志和自动评估。"
+---
+
+Claude Fable 5.1 的讨论再次提醒开发者：前沿模型越强，越不能把它当成所有请求的默认入口。强模型适合解决复杂问题，但如果简单摘要、分类、格式转换、低风险聊天也全部走它，成本和延迟都会被放大。参考来源：[Anthropic News](https://www.anthropic.com/news)、[Hacker News](https://news.ycombinator.com/)、[GitHub Trending](https://github.com/trending)、[OpenAI News](https://openai.com/index/)。
+
+这篇工具速评的重点不是“Fable 5.1 比谁强”。这类横向 benchmark 很快会过期。更值得讨论的是：当你手里有 Fable 5.1、Flash 模型、本地模型、代码专用模型和安全审查模型时，agent 系统应该如何选择。
+
+答案是模型路由。不是让用户在下拉框里选模型，而是让系统根据任务特征自动决定模型、预算和降级路径。
+
+## 为什么 agent 特别需要模型路由
+
+普通聊天应用的一次请求通常对应一次模型调用。Agent 不同。一次用户任务可能拆成规划、检索、工具调用、观察总结、重试、最终回答和安全审查。每一步对模型能力的需求不同。
+
+例如“帮我修复 CI 失败”这个任务，第一步读取错误日志可以用便宜模型总结；第二步定位代码路径可能需要代码能力强的模型；第三步生成补丁需要更强推理；第四步解释变更可以回到均衡模型；最后风险审查可以用规则加小模型。
+
+如果全程使用最强模型，成本高。如果全程使用快模型，成功率低。模型路由就是在这两者之间找工程最优点。
+
+## 任务分层
+
+我建议把 agent 请求分成五层。
+
+第一层是轻任务：分类、关键词提取、短摘要、语言改写、JSON 规范化。优先使用快模型或本地模型。
+
+第二层是常规任务：普通问答、单轮工具调用、简单 RAG。使用均衡模型。
+
+第三层是复杂任务：多步工具调用、代码修改、长文档推理、多源证据合成。使用 Fable 5.1 这类强模型。
+
+第四层是高风险任务：写操作、客户通知、生产变更、权限相关判断。强模型只能给建议，执行前要经过策略或人工审批。
+
+第五层是失败恢复：当低层模型输出不合格、置信度低或工具失败时，升级到强模型诊断。
+
+## 一个最小路由器
+
+下面是一个 TypeScript 路由器骨架。它不是完整平台，但足以把思路放进产品代码。
+
+```ts
+type TaskKind =
+  | "classify"
+  | "summarize"
+  | "rag_answer"
+  | "tool_plan"
+  | "code_patch"
+  | "risk_review";
+
+type RouteInput = {
+  kind: TaskKind;
+  promptTokens: number;
+  userTier: "free" | "pro" | "enterprise";
+  risk: "low" | "medium" | "high";
+  previousFailures: number;
+};
+
+type ModelRoute = {
+  model: "fast" | "balanced" | "fable-5-1" | "local";
+  maxOutputTokens: number;
+  requireApproval: boolean;
+};
+
+function route(input: RouteInput): ModelRoute {
+  if (input.risk === "high") {
+    return { model: "fable-5-1", maxOutputTokens: 1200, requireApproval: true };
+  }
+
+  if (input.previousFailures >= 2) {
+    return { model: "fable-5-1", maxOutputTokens: 1200, requireApproval: false };
+  }
+
+  if (input.kind === "classify" || input.kind === "summarize") {
+    return { model: "fast", maxOutputTokens: 400, requireApproval: false };
+  }
+
+  if (input.kind === "code_patch" || input.kind === "tool_plan") {
+    return { model: "fable-5-1", maxOutputTokens: 1600, requireApproval: false };
+  }
+
+  return { model: "balanced", maxOutputTokens: 800, requireApproval: false };
+}
+```
+
+这里最关键的字段是 `previousFailures`。很多团队路由只看请求类型，却忽略失败恢复。低价模型第一次失败并不可怕，真正浪费成本的是让它连续失败三次还不升级。
+
+## 预算要写进路由
+
+模型路由不只是质量选择，也是成本控制。每个任务都应该带预算。预算可以来自用户套餐、租户限额、功能类型或请求风险。
+
+```ts
+type Budget = {
+  maxUsd: number;
+  spentUsd: number;
+};
+
+function canSpend(budget: Budget, nextCostUsd: number) {
+  return budget.spentUsd + nextCostUsd <= budget.maxUsd;
+}
+```
+
+Agent loop 每次调用模型前都检查预算。如果预算不足，不要继续盲目重试，而是返回当前证据、已完成步骤和建议的下一步。对企业用户来说，这比悄悄烧钱更专业。
+
+## Fable 5.1 适合的具体位置
+
+第一，多工具规划。强模型更擅长判断“先查什么，再查什么，什么时候停止”。尤其当工具返回冲突信息时，弱模型容易机械拼接。
+
+第二，代码补丁。代码任务不只需要生成代码，还要理解测试、约束、依赖和局部最小修改。强模型的价值通常体现在少改错、少绕路。
+
+第三，长上下文证据合成。多文档、多邮件、多日志的综合判断，最怕遗漏关键例外。强模型可以作为最终合成器，而不是检索器。
+
+第四，高价值审查。比如发布前风险分析、客户回复、权限变更建议。这里模型成本相比错误成本很小。
+
+不适合它的位置也很明确：海量短摘要、低风险格式转换、日志粗分类、纯 embedding 前处理。这些任务用强模型只是浪费。
+
+## 降级策略
+
+任何模型都会限流、涨价、退化或临时不可用。工具层必须有降级策略。
+
+降级不等于随便换一个模型继续生成。你要根据任务类型决定降级行为。低风险摘要可以换快模型。代码修改可以降级成“只给诊断，不写补丁”。高风险写操作可以降级成“要求人工处理”。长文档推理可以缩小上下文后重试。
+
+```ts
+function fallback(route: ModelRoute, kind: TaskKind): ModelRoute {
+  if (kind === "risk_review") {
+    return { model: "balanced", maxOutputTokens: 500, requireApproval: true };
+  }
+
+  if (kind === "code_patch") {
+    return { model: "balanced", maxOutputTokens: 800, requireApproval: true };
+  }
+
+  return { model: "fast", maxOutputTokens: 500, requireApproval: false };
+}
+```
+
+## 评估路由是否有效
+
+不要只看平均成本下降。一个好路由器应该同时看五个指标。
+
+成功率：任务最终是否完成。
+
+升级率：低层模型有多少请求升级到强模型。
+
+重试成本：失败重试消耗了多少 token。
+
+延迟分布：P50、P95 和首 token 延迟是否符合体验要求。
+
+人工接管率：高风险任务是否在正确位置停下来。
+
+如果成本下降但成功率大幅下降，路由失败。如果成功率不变但延迟明显变差，也要重新分层。
+
+## 结论
+
+Claude Fable 5.1 这类模型的意义，不是让开发者把所有请求切过去，而是给 agent 系统一个更强的上层能力。它应该出现在复杂规划、代码修改、证据合成和风险审查这些关键节点。
+
+成熟做法是建立模型路由：轻任务走快模型，常规任务走均衡模型，复杂和高风险任务走强模型，失败时按规则升级，预算不足时明确停止。这样才能把前沿模型的能力转化成产品质量，而不是转化成不可预测的账单。
+
