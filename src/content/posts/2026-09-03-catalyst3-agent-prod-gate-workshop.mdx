@@ -1,0 +1,235 @@
+---
+title: "实战工坊：用 Catalyst 3.0 思路给 AI 应用加上线前闸门"
+description: "Catalyst 3.0 把低代码、数据、工作流和 AI 服务发布放到同一平台里。本文用 TypeScript 写一个上线前闸门，检查模型预算、工具权限、数据分类和回滚策略。"
+column: "workshop"
+tags: ["Catalyst3", "agent-gateway", "prod-gate", "LLMOps", "TypeScript", "workshop"]
+pubDate: 2026-09-03
+featured: false
+tldr: "AI 应用从 demo 走向生产，最缺的不是更多 prompt，而是一道可执行的上线闸门。把模型预算、工具权限、敏感数据、评测结果和回滚预案做成机器可检查的 manifest，能显著降低 agent 上线后的失控风险。"
+author: "YOMXXX"
+faq:
+  - q: "Catalyst 3.0 这类平台适合什么团队？"
+    a: "适合已经有业务系统、数据源和审批流程，希望把 AI 功能更快嵌入现有应用的团队。它的价值不只是生成应用，而是把部署、权限和工作流放到同一条链路里。"
+  - q: "为什么 AI 应用需要单独的上线闸门？"
+    a: "因为 AI 应用会消耗动态成本、访问外部工具、处理敏感数据，并且输出不完全确定。传统 CI 只能检查代码，无法覆盖模型行为和工具权限。"
+  - q: "本文示例能替代完整 LLMOps 平台吗？"
+    a: "不能。它是一个轻量闸门骨架，适合接入现有 CI。生产环境还需要 tracing、评测集管理、人工审批、密钥管理和审计日志。"
+  - q: "小团队是否值得做 manifest？"
+    a: "值得。即使只有一个应用，manifest 也能逼迫团队明确模型、预算、数据、工具和回滚边界，避免上线时靠口头约定。"
+  - q: "上线闸门会不会拖慢迭代？"
+    a: "初期会多写一些配置，但长期会减少返工。AI 功能一旦接入客户数据和写操作，没有机器检查的快速上线反而会带来更高维护成本。"
+---
+
+近期产品发布和 Hacker News 讨论里，一个清晰信号是：AI 应用平台正在从“帮你做 demo”转向“帮你把 demo 推进生产”。Zoho Catalyst 3.0、各类 agent platform、模型网关和低代码 AI 工作流都在强调同一件事：业务团队不想只要一个聊天框，而是要数据、权限、部署、监控和回滚都能进入应用生命周期。参考来源：[Zoho Catalyst](https://www.zoho.com/catalyst/)、[Hacker News](https://news.ycombinator.com/)、[GitHub Trending](https://github.com/trending)、[Hugging Face Daily Papers](https://huggingface.co/papers)。
+
+这篇工坊不复刻某个商业平台，而是抽出最值得开发者立刻落地的一层：上线前闸门。它回答一个非常现实的问题：当一个 AI 功能准备发布时，CI 应该检查什么，才能避免 agent 在生产里乱花钱、乱调工具、乱读数据、无法回滚？
+
+传统 Web 应用的上线检查通常包括类型、单测、lint、构建、镜像扫描。AI 应用还要额外检查五类东西：模型预算、工具权限、数据分类、评测结果、降级路径。没有这些检查，应用上线时看起来没报错，真正的故障会在用户任务里出现。
+
+## 目标
+
+我们写一个很小的 TypeScript 检查器。它读取一个 `ai-release.yaml`，在 CI 中验证：
+
+1. 每个功能都声明模型和预算
+2. 所有工具都有风险等级
+3. 敏感数据不能进入外部模型
+4. 写操作必须有人审或策略审
+5. 最近一次 eval 必须达标
+6. 每个高风险功能都有回滚开关
+
+目录结构如下：
+
+```text
+agent-prod-gate/
+  ai-release.yaml
+  src/
+    policy.ts
+    check.ts
+    types.ts
+  package.json
+```
+
+## 第一步：写 release manifest
+
+先把 AI 功能的关键边界显式写出来。这里不要追求完整云平台，只要覆盖上线风险。
+
+```yaml
+app: customer-risk-agent
+owner: growth-platform
+release: 2026-09-03
+
+features:
+  - id: renewal-risk-summary
+    model: balanced-agent-model
+    max_cost_usd_per_task: 0.18
+    data_class: confidential
+    external_model_allowed: false
+    eval_score: 0.87
+    eval_threshold: 0.82
+    rollback_flag: ai.renewal_risk.enabled
+    tools:
+      - name: crm.search_accounts
+        risk: read
+      - name: billing.get_contracts
+        risk: read
+      - name: slack.send_message
+        risk: write
+        approval: required
+```
+
+这份 manifest 的价值不是格式本身，而是强制团队把隐性假设变成可检查字段。很多 AI 事故不是模型突然失控，而是团队根本没定义“这个功能是否允许外部模型”“这个写操作是否需要审批”。
+
+## 第二步：定义类型
+
+我们用最少依赖实现检查器。真实项目可以用 `zod`、`valibot` 或平台自带 schema，这里只展示核心逻辑。
+
+```ts
+export type ToolRisk = "read" | "write" | "external";
+export type DataClass = "public" | "internal" | "confidential" | "restricted";
+
+export type ToolConfig = {
+  name: string;
+  risk: ToolRisk;
+  approval?: "required" | "optional";
+};
+
+export type FeatureConfig = {
+  id: string;
+  model: string;
+  max_cost_usd_per_task: number;
+  data_class: DataClass;
+  external_model_allowed: boolean;
+  eval_score: number;
+  eval_threshold: number;
+  rollback_flag?: string;
+  tools: ToolConfig[];
+};
+
+export type ReleaseConfig = {
+  app: string;
+  owner: string;
+  release: string;
+  features: FeatureConfig[];
+};
+```
+
+## 第三步：写策略检查
+
+上线闸门的策略要保守。宁愿让开发者显式补字段，也不要默认放行。
+
+```ts
+import type { FeatureConfig } from "./types";
+
+export type GateResult = {
+  ok: boolean;
+  errors: string[];
+};
+
+export function checkFeature(feature: FeatureConfig): GateResult {
+  const errors: string[] = [];
+
+  if (!feature.model) errors.push(`${feature.id}: missing model`);
+  if (feature.max_cost_usd_per_task <= 0) errors.push(`${feature.id}: invalid cost budget`);
+  if (feature.eval_score < feature.eval_threshold) errors.push(`${feature.id}: eval below threshold`);
+
+  const isSensitive =
+    feature.data_class === "confidential" || feature.data_class === "restricted";
+
+  if (isSensitive && feature.external_model_allowed) {
+    errors.push(`${feature.id}: sensitive data cannot use external model`);
+  }
+
+  for (const tool of feature.tools) {
+    if (tool.risk === "write" && tool.approval !== "required") {
+      errors.push(`${feature.id}: write tool ${tool.name} requires approval`);
+    }
+    if (tool.risk === "external" && isSensitive) {
+      errors.push(`${feature.id}: external tool ${tool.name} cannot receive sensitive context`);
+    }
+  }
+
+  if ((isSensitive || feature.tools.some((tool) => tool.risk === "write")) && !feature.rollback_flag) {
+    errors.push(`${feature.id}: high risk feature requires rollback flag`);
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+```
+
+这段代码看起来普通，但它改变了 AI 应用发布的默认路径。过去很多团队是在 PR 描述里写“已确认安全”。现在检查器直接告诉你：敏感数据不能走外部模型，写工具必须有审批，高风险功能必须能回滚。
+
+## 第四步：接入 CI
+
+最小入口可以这样写：
+
+```ts
+import fs from "node:fs";
+import yaml from "yaml";
+import { checkFeature } from "./policy";
+import type { ReleaseConfig } from "./types";
+
+const file = process.argv[2] ?? "ai-release.yaml";
+const config = yaml.parse(fs.readFileSync(file, "utf8")) as ReleaseConfig;
+
+const errors = config.features.flatMap((feature) => checkFeature(feature).errors);
+
+if (errors.length > 0) {
+  console.error("AI release gate failed:");
+  for (const error of errors) console.error(`- ${error}`);
+  process.exit(1);
+}
+
+console.log(`AI release gate passed for ${config.app}`);
+```
+
+在 GitHub Actions 里可以放到构建前：
+
+```yaml
+name: ai-release-gate
+on: [pull_request]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install
+      - run: pnpm tsx src/check.ts ai-release.yaml
+```
+
+## 第五步：把 eval 变成发布条件
+
+很多团队做过 eval，但没有把 eval 接进发布流程。结果是评测报告在文档里，发布动作在 CI 里，两者互相不知道。更合理的方式是让 eval 输出一个 JSON，再由 release gate 读取。
+
+```json
+{
+  "feature": "renewal-risk-summary",
+  "dataset": "customer-risk-v4",
+  "score": 0.87,
+  "threshold": 0.82,
+  "failed_cases": 9,
+  "generated_at": "2026-09-03T08:00:00Z"
+}
+```
+
+上线闸门不需要理解每个评测样本，只需要确认本次发布引用的是最新 eval，且结果达标。更细的错误分析留给 eval 平台。
+
+## 第六步：处理平台化边界
+
+Catalyst 3.0 这类平台的吸引力，是把应用、数据库、工作流和 AI 服务放到一个部署平面里。开发者自建闸门时要注意，不要和平台能力重复。平台负责运行和部署，你的闸门负责业务风险。
+
+我建议把检查分三层：
+
+第一层是代码层，运行类型检查、lint、单测。
+
+第二层是 AI 层，检查模型、预算、eval、工具和数据。
+
+第三层是组织层，检查审批人、变更窗口、回滚开关和事故联系人。
+
+三层都通过，才允许发布。这样 AI 功能不会因为“只是一个 prompt 改动”绕开生产纪律。
+
+## 结论
+
+AI 应用平台会越来越强，但每个团队仍然需要自己的上线闸门。平台能帮你更快构建和部署，不能替你定义客户数据能不能离开租户、写工具需不需要审批、每次任务最多能花多少钱。
+
+从今天开始做一件小事：给每个 AI 功能加一份 manifest，并让 CI 拒绝不合规发布。它不复杂，却能把 AI 工程从“凭感觉上线”推向“可检查上线”。这正是从 demo 到生产最关键的一步。
