@@ -1,0 +1,304 @@
+---
+title: "实战工坊：用 PAIR 思路搭一个本地 AI 路由器"
+description: "Nvidia PAIR 把家中闲置 GPU、Mac 和小主机组织成个人 AI 计算池。本文用 TypeScript 实现一个轻量路由器，按能力、成本、隐私和负载选择本地或云端模型。"
+column: "workshop"
+tags: ["Nvidia-PAIR", "local-LLM", "model-router", "edge-AI", "TypeScript", "workshop"]
+pubDate: 2026-09-04
+featured: false
+tldr: "个人 AI 路由器的关键不是把所有请求都塞进最快 GPU，而是把设备能力、数据敏感度、上下文长度、队列延迟和失败回退变成可执行策略。本文给出一个能直接嵌入本地 agent 的路由骨架。"
+author: "YOMXXX"
+faq:
+  - q: "PAIR 这类个人 AI 路由器解决什么问题？"
+    a: "它解决的是本地设备碎片化问题。桌面 RTX、笔记本 NPU、Mac、NAS 和云端 API 各有能力边界，路由器负责按任务把请求送到合适后端。"
+  - q: "本文代码能直接替代 Nvidia PAIR 吗？"
+    a: "不能。本文实现的是工程策略骨架，用来理解调度、隐私和回退设计。真实 PAIR 还会包含设备发现、传输优化、驱动集成和模型分发。"
+  - q: "本地模型路由最容易踩什么坑？"
+    a: "最常见的问题是只看模型分数，不看延迟、上下文长度、显存、数据分类和队列状态。结果是某个设备很快被打满，用户体验反而不稳定。"
+  - q: "敏感数据一定要留在本地吗？"
+    a: "生产系统应默认把机密数据留在受控环境内。只有完成脱敏、审批和日志隔离后，才应该把相关任务路由到外部模型。"
+  - q: "小团队值得做模型路由吗？"
+    a: "值得，但要从小做起。先把隐私、本地可用性和云端回退做清楚，再逐步加入复杂的成本优化和多设备调度。"
+---
+
+Hacker News 和产品发布渠道最近都在讨论一种很务实的方向：个人和小团队手里的 AI 算力正在碎片化。桌面显卡能跑大模型，Mac 能跑中等模型，笔记本 NPU 适合低功耗任务，云端 API 适合峰值和长上下文。Nvidia PAIR 的公开报道把这个问题包装成“Personal AI Router”，参考来源包括 [The Verge 关于 PAIR 的报道](https://www.theverge.com/ai-artificial-intelligence/989435/nvidia-pair-personal-ai-router-home-local-llm-compute-tool-rtx-macbook)、[Hacker News](https://news.ycombinator.com/) 和 [GitHub Trending](https://github.com/trending)。
+
+这篇工坊不复刻某个专有实现，而是写一个可嵌入 agent 的本地 AI 路由器。目标很具体：当一个请求进来，系统应该判断它能否留在本地，应该发给哪台设备，失败后是否允许切云端。这个问题看起来像“选模型”，实际更像“做调度”。
+
+## 为什么需要个人 AI 路由
+
+过去的 LLM 应用通常只有一个后端：某个云端模型 API。现在情况变复杂了。开发者可能同时拥有一台 24GB 显存的桌面机、一台 48GB 统一内存的 Mac、一台低功耗小主机，以及一个付费云端模型账号。每个后端的优点不同：桌面 GPU 吞吐好，Mac 安静且随身，小主机适合常驻任务，云端模型能力强但有隐私和成本问题。
+
+如果没有路由层，应用会把这些差异泄露给每个业务模块。RAG 模块要关心显存，代码助手要关心上下文长度，摘要任务要关心云端费用。最后系统变成一堆硬编码分支。
+
+更好的做法是把后端能力抽象成 manifest，把请求需求抽象成 policy。业务只声明“这是机密文档摘要”“这是公开代码解释”“这是长上下文规划”，路由器负责选择执行位置。
+
+## 项目结构
+
+我们用 TypeScript 写一个最小版本：
+
+```text
+pair-router/
+  devices.yaml
+  src/
+    types.ts
+    router.ts
+    demo.ts
+  package.json
+```
+
+安装依赖：
+
+```bash
+pnpm add yaml
+pnpm add -D tsx typescript
+```
+
+## 设备 manifest
+
+先描述可用后端。真实系统可以从局域网服务发现、Ollama、vLLM、LM Studio 或自家 agent runtime 自动注册，这里先用 YAML。
+
+```yaml
+devices:
+  - id: rtx4090-desktop
+    kind: local
+    endpoint: http://192.168.1.20:8000/v1/chat/completions
+    models:
+      - name: qwen-local-32b
+        max_context: 32768
+        quality: 0.78
+        tokens_per_second: 92
+        cost_per_1k_tokens: 0
+    privacy: restricted
+    current_queue: 2
+
+  - id: macbook-m4
+    kind: local
+    endpoint: http://127.0.0.1:11434/v1/chat/completions
+    models:
+      - name: small-coder-14b
+        max_context: 16384
+        quality: 0.66
+        tokens_per_second: 38
+        cost_per_1k_tokens: 0
+    privacy: confidential
+    current_queue: 0
+
+  - id: cloud-frontier
+    kind: cloud
+    endpoint: https://openrouter.ai/api/v1/chat/completions
+    models:
+      - name: frontier-agent
+        max_context: 262144
+        quality: 0.93
+        tokens_per_second: 120
+        cost_per_1k_tokens: 0.006
+    privacy: public
+    current_queue: 0
+```
+
+这里的 `privacy` 不是设备“有多安全”的绝对结论，而是路由器愿意把哪类数据发到它那里。`restricted` 可以处理最高敏感级别，`confidential` 可以处理公司内部数据，`public` 只处理公开或已脱敏内容。
+
+## 类型定义
+
+```ts
+export type DataClass = "public" | "internal" | "confidential" | "restricted";
+export type DeviceKind = "local" | "cloud";
+
+export type ModelProfile = {
+  name: string;
+  max_context: number;
+  quality: number;
+  tokens_per_second: number;
+  cost_per_1k_tokens: number;
+};
+
+export type DeviceProfile = {
+  id: string;
+  kind: DeviceKind;
+  endpoint: string;
+  models: ModelProfile[];
+  privacy: DataClass;
+  current_queue: number;
+};
+
+export type TaskRequest = {
+  id: string;
+  dataClass: DataClass;
+  inputTokens: number;
+  outputTokens: number;
+  minQuality: number;
+  allowCloudFallback: boolean;
+  latencyBudgetMs: number;
+};
+
+export type RouteDecision = {
+  deviceId: string;
+  model: string;
+  expectedLatencyMs: number;
+  expectedCostUsd: number;
+  reason: string;
+};
+```
+
+## 路由策略
+
+核心策略分三步：先做硬过滤，再计算得分，最后选择可解释的候选。
+
+硬过滤包括上下文长度、质量门槛、隐私边界和云端回退许可。打分则综合延迟、成本、质量和队列。这个顺序很重要：隐私和上下文长度是发布边界，不应该被“便宜一点”覆盖。
+
+```ts
+import type { DataClass, DeviceProfile, RouteDecision, TaskRequest } from "./types";
+
+const rank: Record<DataClass, number> = {
+  public: 0,
+  internal: 1,
+  confidential: 2,
+  restricted: 3,
+};
+
+function canHandlePrivacy(device: DeviceProfile, task: TaskRequest) {
+  return rank[device.privacy] >= rank[task.dataClass];
+}
+
+export function routeTask(devices: DeviceProfile[], task: TaskRequest): RouteDecision {
+  const candidates = devices.flatMap((device) =>
+    device.models.map((model) => {
+      const totalTokens = task.inputTokens + task.outputTokens;
+      const latencyMs = Math.round((totalTokens / model.tokens_per_second) * 1000);
+      const queuePenaltyMs = device.current_queue * 2500;
+      const expectedLatencyMs = latencyMs + queuePenaltyMs;
+      const expectedCostUsd = (totalTokens / 1000) * model.cost_per_1k_tokens;
+
+      return { device, model, expectedLatencyMs, expectedCostUsd };
+    }),
+  );
+
+  const valid = candidates.filter(({ device, model, expectedLatencyMs }) => {
+    if (model.max_context < task.inputTokens) return false;
+    if (model.quality < task.minQuality) return false;
+    if (!canHandlePrivacy(device, task)) return false;
+    if (device.kind === "cloud" && !task.allowCloudFallback) return false;
+    if (expectedLatencyMs > task.latencyBudgetMs) return false;
+    return true;
+  });
+
+  if (valid.length === 0) {
+    throw new Error(`No route found for task ${task.id}`);
+  }
+
+  valid.sort((a, b) => {
+    const scoreA = a.model.quality * 100 - a.expectedCostUsd * 80 - a.expectedLatencyMs / 1000;
+    const scoreB = b.model.quality * 100 - b.expectedCostUsd * 80 - b.expectedLatencyMs / 1000;
+    return scoreB - scoreA;
+  });
+
+  const best = valid[0];
+  return {
+    deviceId: best.device.id,
+    model: best.model.name,
+    expectedLatencyMs: best.expectedLatencyMs,
+    expectedCostUsd: Number(best.expectedCostUsd.toFixed(4)),
+    reason: `${best.device.kind} route selected by privacy, quality, latency and cost policy`,
+  };
+}
+```
+
+这个打分函数不追求学术最优，它追求可审查。生产系统里，路由策略会被用户投诉、成本账单和事故复盘反复追问。你必须能解释为什么某个请求去了云端，为什么另一个请求宁愿慢一点也要留在本地。
+
+## 运行 demo
+
+```ts
+import fs from "node:fs";
+import yaml from "yaml";
+import { routeTask } from "./router";
+import type { DeviceProfile, TaskRequest } from "./types";
+
+const config = yaml.parse(fs.readFileSync("devices.yaml", "utf8")) as {
+  devices: DeviceProfile[];
+};
+
+const tasks: TaskRequest[] = [
+  {
+    id: "private-contract-summary",
+    dataClass: "confidential",
+    inputTokens: 12000,
+    outputTokens: 1200,
+    minQuality: 0.65,
+    allowCloudFallback: false,
+    latencyBudgetMs: 600000,
+  },
+  {
+    id: "public-code-review",
+    dataClass: "public",
+    inputTokens: 50000,
+    outputTokens: 2000,
+    minQuality: 0.9,
+    allowCloudFallback: true,
+    latencyBudgetMs: 900000,
+  },
+];
+
+for (const task of tasks) {
+  console.log(task.id, routeTask(config.devices, task));
+}
+```
+
+预期结果是：机密合同摘要不会走云端，公开代码审查可以选择能力更强的云端模型。这个结果本身并不复杂，但它把业务风险写进了机器可执行策略，而不是写在团队聊天记录里。
+
+## 加入失败回退
+
+路由器必须把失败当成常态。家庭网络会抖动，Mac 会睡眠，桌面 GPU 会被训练任务占满，云端 API 会限流。回退策略不能简单地“失败就换更强模型”，因为隐私约束仍然存在。
+
+一个实用规则是：回退只允许在同等或更高隐私等级的设备之间发生。`restricted` 任务可以从桌面机回退到另一台本地服务器，但不能因为超时就发到云端。`public` 任务则可以更激进地追求可用性。
+
+```ts
+export function fallbackAllowed(
+  failedDevice: DeviceProfile,
+  nextDevice: DeviceProfile,
+  task: TaskRequest,
+) {
+  if (!canHandlePrivacy(nextDevice, task)) return false;
+  if (nextDevice.kind === "cloud" && !task.allowCloudFallback) return false;
+  return nextDevice.id !== failedDevice.id;
+}
+```
+
+## 接入 agent
+
+在 agent 系统里，路由器应该位于模型客户端之前，而不是业务 prompt 里面。一个典型调用链如下：
+
+```text
+user request
+  -> task classifier
+  -> data classifier
+  -> model router
+  -> selected backend
+  -> response validator
+  -> audit log
+```
+
+这条链路让每层职责清楚。分类器判断任务和数据，路由器负责后端选择，验证器检查输出，审计日志记录决策。不要让 prompt 自己决定“是否能把机密数据发给云端”，这类规则必须在模型外部执行。
+
+## 可观测性
+
+PAIR 这类系统最需要的不是漂亮 UI，而是每次路由的可解释日志：
+
+```json
+{
+  "task": "private-contract-summary",
+  "selected_device": "macbook-m4",
+  "selected_model": "small-coder-14b",
+  "data_class": "confidential",
+  "cloud_blocked": true,
+  "expected_latency_ms": 347368,
+  "queue": 0
+}
+```
+
+当用户问“为什么这次慢”，你可以看到是上下文太长、队列太深，还是隐私策略阻止了云端回退。当财务问“为什么云端账单上升”，你可以按任务类型统计。没有这些日志，模型路由会变成另一个不可调黑盒。
+
+## 结论
+
+个人 AI 路由器会成为本地 AI 应用的重要基础设施。它的价值不只是榨干闲置 GPU，而是把设备能力、隐私边界、延迟预算和成本控制统一成一个策略层。Nvidia PAIR 把方向说得更清楚：未来的 AI 应用不一定只连接一个模型 API，而会连接一组分布式计算资源。
+
+开发者现在就可以先做一个小版本。不要从复杂的多机调度开始，从 manifest、硬过滤、可解释打分和审计日志开始。只要这四件事稳定，本地模型、云端模型和边缘设备就能以可控方式进入同一个 agent 系统。
