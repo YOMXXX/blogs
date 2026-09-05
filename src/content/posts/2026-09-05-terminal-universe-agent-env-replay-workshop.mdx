@@ -1,0 +1,249 @@
+---
+title: "实战工坊：用 Terminal-Universe 思路重放 Agent 轨迹"
+description: "Terminal-Universe 把终端 agent 的历史轨迹还原成可复用训练环境。本文用 TypeScript 搭一个最小环境重放器，演示如何从命令日志恢复文件、生成任务并做可验证评测。"
+column: "workshop"
+tags: ["Terminal-Universe", "terminal-agent", "agent-training", "eval-harness", "TypeScript", "workshop"]
+pubDate: 2026-09-05
+featured: false
+tldr: "终端 agent 训练缺的不是更多聊天记录，而是可执行、可重复、可打分的环境。Terminal-Universe 的核心启发是从历史轨迹反推出工作区，再把一次演示变成多个可验证任务。"
+author: "YOMXXX"
+faq:
+  - q: "Terminal-Universe 解决的核心问题是什么？"
+    a: "它解决的是终端 agent 可训练环境稀缺问题。单条轨迹只能看一次，而恢复后的环境可以反复生成任务、执行命令、收集反馈，用于训练和评测。"
+  - q: "本文实现的是论文完整系统吗？"
+    a: "不是。本文实现的是一个最小工程骨架，用来理解轨迹回放、文件恢复、任务生成和验证接口，真实系统还需要依赖补全、多轮用户模拟和大规模清洗。"
+  - q: "为什么不直接用 agent 的最终答案训练？"
+    a: "最终答案缺少环境反馈。终端任务是否成功通常取决于文件修改、测试结果和命令输出，只有可执行环境才能提供稳定的训练信号。"
+  - q: "轨迹回放最容易失败在哪里？"
+    a: "最容易失败在缺少原始文件、依赖版本漂移、命令副作用不可逆和隐私信息泄露。生产流水线必须做依赖锁定、脱敏和沙箱隔离。"
+  - q: "小团队有必要做这种环境库吗？"
+    a: "有必要，但规模可以很小。先从真实失败案例沉淀几十个可复现环境，比堆更多 prompt 更能改善 coding agent 的稳定性。"
+---
+
+[Hugging Face Daily Papers](https://huggingface.co/papers) 在 2026 年 9 月 4 日把 [Terminal-Universe: Turning Agent Trajectories into Scalable Terminal Environments](https://arxiv.org/abs/2609.04148) 放到高位，arXiv cs.AI 同日也把它列在近期新论文中。论文的关键点很适合开发者：终端 agent 训练真正稀缺的不是“模型看过多少示范”，而是“有多少可执行环境可以反复练习”。Hacker News 上关于 TerminalBench 和 coding agent harness 的讨论也在强调同一件事：评测结果测到的不只是模型，还包括提示词、工具接口、超时、重试和恢复策略。
+
+这篇工坊不复刻论文的大规模系统，而是做一个能跑通思想的最小版本。输入是一段 agent 终端轨迹，输出是一个恢复后的工作区、一组可执行任务和一个验证器。你可以把它嵌进自己的 coding agent 评测流水线，把线上失败案例逐步沉淀成训练资产。
+
+## 从轨迹到环境
+
+很多团队已经保存了 agent 日志：用户请求、命令、stdout、stderr、文件 diff、测试结果。问题是这些日志经常只被用来排查一次事故，之后就躺在对象存储里。Terminal-Universe 的启发是反过来问：既然轨迹里包含了文件读写、命令执行和错误反馈，是否可以从这些记录恢复出当时的工作区？
+
+如果能恢复工作区，一条轨迹就不再只是 frozen demo。它可以派生出更多任务：修同一个 bug、加相邻功能、解释失败原因、迁移依赖、补测试、做代码审查。环境能被重复执行，训练信号也能被验证器确认。
+
+一个最小轨迹可以这样表示：
+
+```json
+{
+  "id": "trace-001",
+  "goal": "fix user total calculation",
+  "events": [
+    { "kind": "read", "path": "src/billing.ts", "content": "export function total(items) { return 0 }" },
+    { "kind": "write", "path": "src/billing.ts", "content": "export function total(items) { return items.reduce((s, x) => s + x.price, 0) }" },
+    { "kind": "run", "cmd": "pnpm test", "exitCode": 0, "stdout": "1 passed" }
+  ]
+}
+```
+
+真实日志会更乱。它可能没有完整 content，只有 patch；可能记录了多次写入；也可能包含环境变量和临时文件。最小系统先处理完整 read/write，再逐步扩展。
+
+## 项目结构
+
+新建一个实验目录：
+
+```text
+env-replay/
+  traces/
+    trace-001.json
+  src/
+    types.ts
+    restore.ts
+    synthesize.ts
+    verify.ts
+    demo.ts
+  package.json
+```
+
+安装依赖：
+
+```bash
+pnpm add zod
+pnpm add -D tsx typescript
+```
+
+类型定义：
+
+```ts
+export type TraceEvent =
+  | { kind: "read"; path: string; content: string }
+  | { kind: "write"; path: string; content: string }
+  | { kind: "run"; cmd: string; exitCode: number; stdout: string; stderr?: string };
+
+export type AgentTrace = {
+  id: string;
+  goal: string;
+  events: TraceEvent[];
+};
+
+export type RestoredFile = {
+  path: string;
+  before?: string;
+  after?: string;
+};
+
+export type SyntheticTask = {
+  id: string;
+  instruction: string;
+  files: string[];
+  verifyCommand: string;
+};
+```
+
+## 恢复文件快照
+
+轨迹恢复的第一步，是找出每个文件在 agent 修改前后的状态。这里用一个保守规则：第一次 read 视为 before，最后一次 write 视为 after。如果只有 write 没有 read，就把它标记为缺失 before，后续交给补全器或人工确认。
+
+```ts
+import type { AgentTrace, RestoredFile } from "./types";
+
+export function restoreFiles(trace: AgentTrace): RestoredFile[] {
+  const files = new Map<string, RestoredFile>();
+
+  for (const event of trace.events) {
+    if (event.kind !== "read" && event.kind !== "write") continue;
+
+    const current = files.get(event.path) ?? { path: event.path };
+
+    if (event.kind === "read" && current.before === undefined) {
+      current.before = event.content;
+    }
+
+    if (event.kind === "write") {
+      current.after = event.content;
+    }
+
+    files.set(event.path, current);
+  }
+
+  return [...files.values()];
+}
+```
+
+这个函数故意简单，因为它体现了环境恢复的第一条工程原则：先把可确定的信息恢复出来，不要过早猜测缺失部分。Terminal-Universe 论文里会用 completion agent 补齐文件和依赖，但生产系统最好把“确定恢复”和“模型补全”分开记录，避免把猜出来的文件当事实。
+
+## 写入沙箱工作区
+
+恢复后，我们把 before 状态写入临时目录，供 agent 重新操作。注意不要在原仓库里直接回放轨迹，尤其是轨迹来自线上项目时。
+
+```ts
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import type { RestoredFile } from "./types";
+
+export async function materializeWorkspace(root: string, files: RestoredFile[]) {
+  for (const file of files) {
+    if (!file.before) continue;
+    const target = join(root, file.path);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, file.before, "utf8");
+  }
+}
+```
+
+这里还有一个隐含要求：工作区必须可销毁。每次评测都应该从干净目录开始，执行结束后保留日志和 diff，再删除临时文件。这样 agent 失败不会污染下一次运行。
+
+## 生成可验证任务
+
+有了文件快照，还需要任务。最朴素的任务就是重构原始 goal，但更有价值的是派生任务。比如原始任务是修复 `total`，派生任务可以是支持折扣、支持税率、补充空数组测试。我们先写一个规则版任务生成器：
+
+```ts
+import type { AgentTrace, RestoredFile, SyntheticTask } from "./types";
+
+export function synthesizeTasks(trace: AgentTrace, files: RestoredFile[]): SyntheticTask[] {
+  const touched = files.map((file) => file.path);
+
+  return [
+    {
+      id: `${trace.id}-replay`,
+      instruction: `Reproduce the original fix: ${trace.goal}`,
+      files: touched,
+      verifyCommand: "pnpm test",
+    },
+    {
+      id: `${trace.id}-tests`,
+      instruction: `Add a regression test that would fail before the fix for: ${trace.goal}`,
+      files: touched,
+      verifyCommand: "pnpm test",
+    },
+  ];
+}
+```
+
+真实系统可以让 LLM 参与任务生成，但必须让验证器说了算。一个没有自动验证命令的任务，只适合人工 review，不适合大规模训练。
+
+## 验证接口
+
+验证器负责把 agent 的输出变成结构化结果。它不需要知道模型是谁，只关心工作区最终是否满足任务。
+
+```ts
+import { spawn } from "node:child_process";
+
+export function runVerify(cwd: string, command: string): Promise<{ ok: boolean; output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, { cwd, shell: true });
+    let output = "";
+
+    child.stdout.on("data", (chunk) => (output += chunk.toString()));
+    child.stderr.on("data", (chunk) => (output += chunk.toString()));
+    child.on("close", (code) => resolve({ ok: code === 0, output }));
+  });
+}
+```
+
+这个接口可以扩展出更细的 rubric：测试是否新增、覆盖率是否提升、lint 是否通过、diff 是否过大、是否改了无关文件。对 coding agent 来说，验证器越具体，训练信号越干净。
+
+## Demo 串起来
+
+```ts
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import trace from "../traces/trace-001.json" assert { type: "json" };
+import { materializeWorkspace } from "./restore";
+import { restoreFiles } from "./restore";
+import { synthesizeTasks } from "./synthesize";
+
+const files = restoreFiles(trace);
+const tasks = synthesizeTasks(trace, files);
+const workspace = await mkdtemp(join(tmpdir(), "agent-env-"));
+
+await materializeWorkspace(workspace, files);
+
+console.log({
+  trace: trace.id,
+  workspace,
+  restoredFiles: files.length,
+  tasks,
+});
+```
+
+这一步还没有接真实 agent，但已经完成了环境资产化的核心链路：轨迹进入，工作区和任务出来。你可以把 `tasks[0]` 发给 Claude Code、Codex CLI、Gemini CLI、Aider 或自己的 agent runner，再把最终工作区交给验证器。
+
+## 生产化清单
+
+第一，轨迹必须脱敏。终端日志很容易包含 token、私有仓库名、客户数据和内部路径。进入环境库前要做 secret 扫描和路径泛化。
+
+第二，依赖必须锁定。很多回放失败并不是 agent 错，而是 registry、系统包和 Node/Python 版本漂移。每个环境至少要记录 lockfile、运行时版本和基础镜像。
+
+第三，恢复置信度要显式保存。完全来自日志的文件、由模型补齐的文件、由人工修正的文件，应该有不同 provenance。训练时可以给低置信度环境更低权重。
+
+第四，验证命令要短。长时间集成测试会把训练成本拉爆。更好的策略是先用单元测试和静态检查做第一层，再抽样跑完整测试。
+
+第五，任务要分层。原始任务用于回放，派生任务用于泛化，多轮任务用于模拟真实用户反馈。不要把所有任务混成一个分数，否则很难定位 agent 到底差在哪里。
+
+## 工程结论
+
+Terminal-Universe 的价值不只是“又一个终端 agent benchmark”。它提醒我们，agent 时代的数据资产单位正在从 prompt/answer 变成 environment/task/verifier。聊天记录可以教模型模仿，环境才能教模型修正。
+
+对开发团队来说，最值得马上做的不是训练新模型，而是把失败轨迹保存成可重放环境。每次 agent 搞坏一个迁移、误解一个测试、漏改一个依赖，都应该变成下一轮评测任务。这样你的 harness 会随着真实失败增长，而不是停留在通用榜单上。
+
+如果只留下日志，你得到的是事故档案；如果能恢复环境，你得到的是训练燃料。

@@ -1,0 +1,155 @@
+---
+title: "论文速读：Compile by Training 把自然语言规格编译成小模型函数"
+description: "Compile by Training 提出用教师模型生成样本，再训练紧凑适配器，把反复调用的大模型任务变成可版本化、可组合、可本地运行的 neural function。"
+column: "paper"
+tags: ["Compile-by-Training", "neural-functions", "small-models", "LLM-compiler", "paper", "local-AI"]
+pubDate: 2026-09-05
+featured: false
+tldr: "Compile by Training 的核心不是让大模型每次回答，而是在编译期花一次成本，把自然语言规格蒸馏成可复用的小模型函数。它把 prompt 工程的一部分推向软件工程。"
+author: "YOMXXX"
+faq:
+  - q: "Compile by Training 和普通微调有什么区别？"
+    a: "它更像函数级编译。用户给出自然语言规格，系统用教师模型生成任务样本，再训练一个小适配器，目标是复用同一个窄任务，而不是做通用模型微调。"
+  - q: "这会替代所有 LLM API 调用吗？"
+    a: "不会。它适合高频、稳定、边界清楚的文本函数。开放式问答、复杂推理和低频任务仍然更适合直接调用强模型。"
+  - q: "为什么说它像软件工程？"
+    a: "因为编译后的函数可以命名、存储、版本化、组合和回归测试。开发者管理的不再只是 prompt，而是带评测和发布流程的能力单元。"
+  - q: "小团队现在能怎么借鉴？"
+    a: "可以先识别高频 prompt，把输入输出 schema 固定下来，用强模型生成样本，再训练或缓存一个本地分类器、抽取器或格式转换器。"
+  - q: "最大的风险是什么？"
+    a: "最大风险是规格漂移和评测不足。任务边界一变，旧函数可能静默失效，所以必须有版本、回归集和失败回退。"
+---
+
+2026 年 9 月 4 日的 [Hugging Face Daily Papers](https://huggingface.co/papers) 把 [Compile by Training: Turning Natural-Language Specifications into Local Neural Functions](https://arxiv.org/abs/2609.04199) 放在榜首附近，arXiv cs.CL 也把它列为当天新论文。论文摘要给出的设定很清楚：许多重复性文本函数很容易用自然语言描述，却很难用规则写稳；如果每次都调用远程大模型，又会带来成本、延迟和供应商依赖。Compile by Training 的答案是，把规格“编译”为本地 neural function。
+
+这篇论文值得读，不是因为它发明了“用大模型生成数据再训练小模型”这个大方向，而是因为它把这件事放进了编译视角。编译意味着一次成本、多次执行；意味着函数有名字、有版本、有测试；也意味着开发者可以把自然语言能力当成软件工件来管理。
+
+## 问题：高频 prompt 不是应用代码
+
+很多 AI 应用上线后都会积累一堆高频 prompt：把客服消息归类、把自然语言日期转成结构化字段、把产品反馈拆成标签、把松散文本改写成内部格式、把用户口吻翻译成品牌语气。这些任务通常不需要最强模型，但它们每天会被调用成千上万次。
+
+直接调用大模型有三个问题。第一是延迟，高频中间步骤会放大端到端响应时间。第二是成本，看似便宜的调用会在 workflow 里重复出现。第三是稳定性，同一个模型名背后的服务更新、采样差异和格式波动会影响业务结果。
+
+传统规则系统也不理想。规则适合清晰语法，不适合模糊语义。比如“把用户抱怨归到退款、物流、质量、账号、安全五类”，规则会很快变成一堆脆弱关键词。自然语言规格更容易写，但 prompt 不是可靠软件单元。
+
+## 核心方法：编译期用教师，运行期用小函数
+
+Compile by Training 的流程可以抽象成四步：
+
+```text
+natural-language spec
+  -> teacher-generated examples
+  -> train compact adapter
+  -> local reusable neural function
+```
+
+编译期，系统让教师模型围绕规格生成输入输出样本，覆盖边界情况和常见变体。然后用这些样本训练一个紧凑 interpreter 的小适配器。运行期，应用不再调用教师模型，而是调用这个小函数。
+
+论文摘要提到，在 FuzzyBench-Hard 上，Compile by Training 在 Program-as-Weights fast compiler 没有 exact match 的子集上达到 83.6% semantic accuracy；代价是编译时间从秒级变成约一分钟。这是一个典型工程交换：用更高的一次性编译成本，换更便宜、更独立的多次运行。
+
+## 这和 prompt caching 不一样
+
+很多人看到这里会想到 prompt caching。两者目标相似，都是减少重复成本，但层级不同。Prompt caching 缓存的是上下文前缀，仍然依赖同一个大模型执行。Compile by Training 缓存的是任务能力，把能力转移到小模型适配器里。
+
+如果任务每天变化，prompt caching 更合适。如果任务长期稳定，编译成 neural function 更有吸引力。一个订单意图分类器、一个内部标签归一化器、一个日志错误摘要器，都可能属于后者。
+
+可以把它理解为三层成本模型：
+
+```text
+direct LLM call: 每次付推理成本
+prompt cache: 每次付较低推理成本
+compiled neural function: 先付编译成本，再付本地小模型成本
+```
+
+选择哪一层，不取决于技术新不新，而取决于任务频率、规格稳定性和错误成本。
+
+## 工程架构
+
+一个可落地的系统需要把 neural function 当成有生命周期的工件：
+
+```ts
+type NeuralFunctionSpec = {
+  name: string;
+  version: string;
+  instruction: string;
+  inputSchema: Record<string, string>;
+  outputSchema: Record<string, string>;
+  examples: Array<{ input: unknown; output: unknown }>;
+  fallbackModel: string;
+};
+
+type CompileResult = {
+  functionId: string;
+  artifactUri: string;
+  evalScore: number;
+  createdAt: string;
+};
+```
+
+注意这里有 `fallbackModel`。编译函数不是永不失败的魔法。生产系统必须允许低置信度样本回退到强模型，也必须记录哪些输入触发了回退，供下一轮编译使用。
+
+函数发布流程可以像这样：
+
+```text
+draft spec
+  -> generate synthetic examples
+  -> train adapter
+  -> run held-out eval
+  -> canary traffic
+  -> promote version
+  -> monitor drift
+```
+
+这套流程看起来像 MLOps，但它更贴近日常软件工程：每个函数有版本号，每次规格更新都有 diff，每次发布都有回归集。
+
+## 适合的任务
+
+第一类是分类。客服路由、工单优先级、反馈标签、内容风险等级，都属于短输入、有限输出、可评测任务。
+
+第二类是抽取。发票字段、时间范围、联系人、产品型号、日志错误码，只要 schema 稳定，就适合编译。
+
+第三类是格式转换。把自由文本改成内部 DSL，把自然语言筛选条件变成查询对象，把用户命令转成工具参数。这类任务对稳定性要求高，本地函数比远程聊天更容易做回归测试。
+
+第四类是风格约束很窄的改写。比如把英文 commit message 归一成团队规范，把错误报告转成固定模板。开放式写作不适合，但窄域转换适合。
+
+## 不适合的任务
+
+复杂推理不适合。需要多步搜索、外部工具、长上下文综合和不确定性判断的任务，编译成小函数会过度压缩能力。
+
+低频任务不适合。一个月只跑几十次的任务，编译成本和维护成本可能比直接调用强模型更高。
+
+高风险任务也要谨慎。比如医疗、法律、金融决策，即使输入输出看似固定，也需要更强审计、解释和人工复核。小函数可以做预处理，但不应该单独做最终判断。
+
+## 和 agent 系统的关系
+
+Agent 应用里最耗费调用的，往往不是最终回答，而是中间层：路由、记忆检索、工具参数、状态摘要、失败分类。Compile by Training 对这些中间层很有价值。
+
+想象一个客服 agent，每次对话都要做：
+
+```text
+intent classify
+data sensitivity classify
+retrieve query rewrite
+tool args extraction
+resolution summary
+```
+
+如果每一步都调用大模型，成本和延迟会快速上升。把其中稳定的步骤编译成 neural function，强模型就能留给真正需要推理和沟通的部分。
+
+这也会改变 prompt 工程的工作方式。过去 prompt 是散落在代码里的字符串；未来高频 prompt 应该变成 spec、eval、artifact 和版本发布记录。开发者需要问的不是“这个 prompt 今天能不能跑”，而是“这个能力单元有没有足够覆盖边界情况”。
+
+## 评测要怎么做
+
+评测不能只看 teacher 生成样本。否则系统会学会 teacher 的偏好，却不一定适应真实输入。至少需要三组数据：合成训练集、合成保留集、真实日志抽样集。
+
+真实日志抽样集尤其关键。用户会写错别字、混合语言、缺字段、表达讽刺、给出互相矛盾的约束。只有这些输入才能暴露 neural function 是否真的能替代线上调用。
+
+还要监控漂移。产品名变了、政策变了、业务分类变了，旧函数可能继续给出格式正确但语义过时的输出。每个函数都应该有过期机制和重新编译触发条件。
+
+## 结论
+
+Compile by Training 把一个重要趋势说清楚了：LLM 应用不会永远停留在“每个请求都问大模型”。成熟系统会把高频、稳定、可评测的语言能力下沉成本地函数，把昂贵模型用于开放式推理、异常处理和最终沟通。
+
+它对开发者的真正启发是管理粒度变化了。我们不只管理模型，也不只管理 prompt，而是管理由自然语言规格编译出来的能力工件。这个工件能测试、能版本化、能组合，也能在失败时回退。
+
+如果你的系统里有一个 prompt 每天跑几千次，并且输出 schema 半年没变，它就已经是 neural function 的候选了。
