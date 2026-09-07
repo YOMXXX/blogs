@@ -1,0 +1,127 @@
+---
+import TldrBlock from '../../components/astro/TldrBlock.astro';
+import TocSidebar from '../../components/astro/TocSidebar.astro';
+import AdSlot from '../../components/astro/AdSlot.astro';
+import FaqSchema from '../../components/astro/FaqSchema.astro';
+import type { ArticleTemplateProps } from './types';
+
+const { frontmatter: fm, headings, slug, tagColor, columnLabel, dateStr, readingTimeStr } =
+  Astro.props as ArticleTemplateProps;
+---
+
+<div class="container">
+  <div class="win">
+    <div class="win-bar">
+      <span class="light r"></span><span class="light y"></span><span class="light g"></span>
+      <span class="win-title">~/yomxxx/posts/{slug}.mdx</span>
+    </div>
+    <div class="win-body">
+      <div class="breadcrumb">
+        <span>yomxxx</span> / posts / <span class="cur">{slug}</span>
+      </div>
+      <span class="tag" style={`color: ${tagColor}; --tag-color: ${tagColor}`}>{columnLabel}</span>
+      <h1><span class="prompt">$ cat</span> {fm.title}</h1>
+      <div class="meta">
+        <span>-- {readingTimeStr}</span>
+        <span class="dot">·</span>
+        <time datetime={fm.pubDate.toISOString()}>{dateStr}</time>
+        {fm.updatedDate && (<>
+          <span class="dot">·</span>
+          <span>updated {fm.updatedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+        </>)}
+      </div>
+    </div>
+  </div>
+
+  <TldrBlock text={fm.tldr} />
+
+  <AdSlot position="above-toc" slot="5766577003" format="horizontal" />
+
+  <TocSidebar headings={headings} />
+
+  <AdSlot position="in-article-1" slot="2412443907" format="auto" />
+
+  <article class="prose">
+    <slot />
+  </article>
+
+  <AdSlot position="in-article-2" slot="2214196418" format="auto" />
+
+  {fm.faq && fm.faq.length > 0 && <FaqSchema faqs={fm.faq} />}
+</div>
+
+<style>
+  .container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 28px 24px 40px;
+  }
+  .breadcrumb {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-faint);
+    margin-bottom: 8px;
+  }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  .tag {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 3px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    background: color-mix(in srgb, var(--tag-color) 12%, transparent);
+  }
+  .meta {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-faint);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 4px;
+  }
+  .dot { color: var(--color-border-strong); }
+  .prose { margin: 24px 0; }
+  .win {
+    border: 1px solid var(--color-border-strong);
+    border-radius: 8px;
+    background: var(--color-bg-surface);
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  .win-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--color-border-subtle);
+  }
+  .light { width: 10px; height: 10px; border-radius: 50%; }
+  .light.r { background: var(--color-accent-red); }
+  .light.y { background: var(--color-accent-yellow); }
+  .light.g { background: var(--color-accent-green); }
+  .win-title {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text-faint);
+    margin-left: 8px;
+  }
+  .win-body { padding: 20px 20px 14px; }
+  h1 {
+    font-family: var(--font-mono);
+    font-size: 30px;
+    line-height: 1.25;
+    color: var(--color-text-primary);
+    margin: 0 0 12px;
+    font-weight: 700;
+  }
+  .prompt { color: var(--color-accent-green); margin-right: 6px; }
+  @media (max-width: 720px) {
+    h1 { font-size: 28px; }
+  }
+</style>
