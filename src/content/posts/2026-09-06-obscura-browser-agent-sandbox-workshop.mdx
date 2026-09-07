@@ -1,0 +1,253 @@
+---
+title: "实战工坊：用 Obscura 给 Web Agent 做隔离浏览器沙箱"
+description: "Obscura 最近在 GitHub Trending 和 Reddit 讨论中升温。本文用 CDP、Playwright 和任务级浏览器会话做一个最小 Web Agent 沙箱，重点是隔离、证据和失败恢复。"
+column: "workshop"
+tags: ["Obscura", "browser-agent", "CDP", "Playwright", "MCP", "sandbox", "workshop"]
+pubDate: 2026-09-06
+featured: false
+tldr: "Web Agent 不应该直接复用人的浏览器。Obscura 代表的新一代轻量浏览器基础设施，把会话隔离、CDP 兼容、截图证据和 MCP 接口组合起来，适合做任务级沙箱。"
+author: "YOMXXX"
+faq:
+  - q: "Obscura 和普通 Headless Chrome 有什么区别？"
+    a: "Obscura 是 Rust 写的轻量 headless browser，强调不依赖 Chromium、支持 V8、CDP、截图、PDF 和 agent 自动化；普通 Headless Chrome 更成熟，但实例更重。"
+  - q: "本文代码必须真的安装 Obscura 才能跑吗？"
+    a: "核心控制层只依赖 Playwright over CDP。只要浏览器提供 CDP endpoint，就可以换成 Obscura、Chrome、Browser Run 或其他远程浏览器。"
+  - q: "为什么每个任务都要独立浏览器会话？"
+    a: "任务级隔离能减少 cookie、localStorage、下载文件和页面状态串扰，也方便把截图、网络日志和控制台错误归档到同一个审计包。"
+  - q: "浏览器沙箱能防住网页提示注入吗？"
+    a: "不能完全防住。沙箱负责限制动作面和保存证据，提示注入还需要系统提示隔离、工具权限、输出校验和高风险动作审批。"
+  - q: "什么时候仍然应该用 Playwright 原生脚本？"
+    a: "当流程稳定、选择器可靠、业务风险高时，应优先使用确定性 Playwright 脚本，把 LLM 只放在观察、抽取和异常恢复环节。"
+---
+
+[Obscura GitHub 仓库](https://github.com/h4ckf0r0day/obscura) 这两天在 GitHub Trending、Reddit 和独立博客里被反复提到。项目把自己定位为面向 AI agents 和 web scraping 的开源 headless browser：Rust 实现、V8 执行 JavaScript、Chrome DevTools Protocol 兼容，并且已经支持截图、PDF 和原生渲染。[Obscura 官网](https://obscura.sh/) 的口号也很直接：给每个 agent 一个自己的浏览器。
+
+这篇工坊不做性能宣传，也不讨论绕过网站风控。我们要解决的是更基础的工程问题：当 Web Agent 需要读页面、点按钮、填表单、截图留证时，怎样给它一个任务级浏览器沙箱，而不是让它复用人的主浏览器或共享一个长期污染的自动化环境。
+
+## 为什么 Web Agent 需要独立浏览器
+
+传统爬虫只需要抓数据，浏览器自动化只需要执行脚本。Web Agent 则更麻烦：它会阅读网页文本，理解页面意图，决定下一步动作，并把网页里的内容和开发者给它的任务混在同一个上下文里。网页对 agent 来说既是数据源，也是潜在攻击面。
+
+如果多个任务共用同一个浏览器实例，会出现几类问题。第一是状态串扰：上一个任务留下的登录态、cookie、localStorage、下载文件和弹窗会影响下一个任务。第二是审计困难：任务失败后，你不知道哪一步页面状态来自本次任务，哪一步来自历史残留。第三是权限扩大：一个本来只该访问公开页面的任务，可能意外继承了用户登录态。第四是成本不可控：Headless Chrome 实例较重，大规模并发时内存和启动时间会成为瓶颈。
+
+Obscura 这类轻量浏览器的意义，是把“每个 agent 一个浏览器”从口号变得更接近可部署。它提供 CDP endpoint，意味着我们仍然可以用 Playwright 或 Puppeteer 连接；它提供 MCP 思路，意味着浏览器动作可以变成 agent 工具；它强调快速启动和较低内存，意味着任务级隔离的成本更低。
+
+## 工坊目标
+
+我们做一个最小控制层，具备四个能力：
+
+1. 为每个任务创建独立 session id。
+2. 通过 CDP 连接浏览器 endpoint。
+3. 执行受限动作：导航、抽取标题、截图、读取可见文本。
+4. 生成审计包：metadata、截图、控制台错误和结果 JSON。
+
+这个控制层不绑定 Obscura。你可以把 `BROWSER_CDP_URL` 指向本机 Obscura，也可以指向 Chrome、Cloudflare Browser Run、Browserbase 或任何兼容 CDP 的远程浏览器。这样写的好处是浏览器供应商可以换，agent 的工具契约不变。
+
+## 初始化项目
+
+```bash
+mkdir web-agent-sandbox
+cd web-agent-sandbox
+pnpm init
+pnpm add playwright zod
+pnpm add -D tsx typescript @types/node
+```
+
+创建 `src/config.ts`：
+
+```ts
+import { z } from "zod";
+
+const Env = z.object({
+  BROWSER_CDP_URL: z.string().url(),
+  ARTIFACT_DIR: z.string().default("./artifacts"),
+});
+
+export const config = Env.parse(process.env);
+```
+
+如果你本地使用 Obscura，可以按项目 README 的方式启动 CDP 服务，再把 endpoint 写入环境变量。不同版本命令可能调整，本文只假设最终能拿到类似 `ws://127.0.0.1:9222/devtools/browser/...` 的地址。
+
+## 任务模型
+
+创建 `src/types.ts`：
+
+```ts
+export type BrowserTask = {
+  id: string;
+  url: string;
+  goal: string;
+  maxVisibleTextChars: number;
+};
+
+export type BrowserTaskResult = {
+  taskId: string;
+  url: string;
+  title: string;
+  visibleText: string;
+  screenshotPath: string;
+  consoleErrors: string[];
+};
+```
+
+这里故意没有加入“点击任意按钮”“输入任意文本”。第一版沙箱最好从只读任务开始。只有当你能稳定保存证据、归档状态、限制域名之后，再开放写操作。
+
+## 连接 CDP 并创建隔离上下文
+
+创建 `src/browser.ts`：
+
+```ts
+import { chromium, type BrowserContext } from "playwright";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { config } from "./config";
+
+export async function createTaskContext(taskId: string): Promise<{
+  context: BrowserContext;
+  artifactRoot: string;
+}> {
+  const artifactRoot = join(config.ARTIFACT_DIR, taskId);
+  await mkdir(artifactRoot, { recursive: true });
+
+  const browser = await chromium.connectOverCDP(config.BROWSER_CDP_URL);
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
+    acceptDownloads: false,
+    ignoreHTTPSErrors: false,
+  });
+
+  context.setDefaultTimeout(12_000);
+  return { context, artifactRoot };
+}
+```
+
+关键点是 `newContext`。即使底层 browser process 复用，context 也应该按任务隔离。不要把 agent 任务直接扔进默认 context，更不要复用人的浏览器 profile。
+
+## 执行只读浏览任务
+
+创建 `src/run-task.ts`：
+
+```ts
+import { join } from "node:path";
+import type { BrowserTask, BrowserTaskResult } from "./types";
+import { createTaskContext } from "./browser";
+
+export async function runReadOnlyTask(task: BrowserTask): Promise<BrowserTaskResult> {
+  const { context, artifactRoot } = await createTaskContext(task.id);
+  const page = await context.newPage();
+  const consoleErrors: string[] = [];
+
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+
+  await page.goto(task.url, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+
+  const title = await page.title();
+  const visibleText = await page.locator("body").innerText({ timeout: 5_000 });
+  const screenshotPath = join(artifactRoot, "page.png");
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+
+  await context.close();
+
+  return {
+    taskId: task.id,
+    url: task.url,
+    title,
+    visibleText: visibleText.slice(0, task.maxVisibleTextChars),
+    screenshotPath,
+    consoleErrors,
+  };
+}
+```
+
+真实 agent 会基于页面状态做多步计划。这里先把页面观察做成稳定工具，是为了建立一个原则：agent 的“看见”必须可复现。截图、标题、可见文本、控制台错误都进入审计包，后续模型为什么点击某个按钮，至少有证据可追。
+
+## 加一层域名策略
+
+很多团队做 Web Agent 的第一个错误，是把 `goto` 当成自由工具。只要模型能访问任意 URL，网页提示注入、跳转链和开放重定向就会把任务边界打穿。我们加一个极小 allowlist。
+
+```ts
+const allowedHosts = new Set(["github.com", "huggingface.co", "arxiv.org"]);
+
+export function assertAllowedUrl(rawUrl: string) {
+  const url = new URL(rawUrl);
+  if (!allowedHosts.has(url.hostname)) {
+    throw new Error(`host not allowed: ${url.hostname}`);
+  }
+}
+```
+
+在 `runReadOnlyTask` 开头调用：
+
+```ts
+assertAllowedUrl(task.url);
+```
+
+这不是完整安全系统，但它能立刻挡住一批无意跳转。生产环境还应该限制协议、下载、文件上传、剪贴板、弹窗、新标签、跨域跳转和网络出口。
+
+## 给 Agent 暴露的工具契约
+
+如果要把这个沙箱接到 agent，不要直接让模型拿到 Playwright page 对象。更稳妥的方式是给它几个小工具：
+
+```ts
+type Tool =
+  | { name: "browser_read"; input: { url: string } }
+  | { name: "browser_screenshot"; input: { taskId: string } }
+  | { name: "browser_extract_text"; input: { taskId: string; query: string } };
+```
+
+工具要窄，返回要结构化，动作要可审计。比如 `browser_read` 返回标题、正文摘要和截图路径；`browser_extract_text` 只从已经打开的页面里抽取；高风险工具如点击、输入、提交表单必须单独开权限。
+
+## 失败恢复
+
+浏览器任务失败很常见：页面慢、cookie 弹窗、网络抖动、DOM 变化、验证码、脚本错误。不要让 agent 在失败时无限尝试。控制层应该区分三类失败：
+
+```ts
+export type FailureKind = "transient" | "policy_blocked" | "needs_human";
+```
+
+网络超时可以重试一次；域名不在 allowlist 属于策略阻断；登录、验证码、付款、删除、外发消息都应该转人工。把这些分类写进工具返回，模型才不会把所有失败都当成“再点一次”。
+
+## 如何验证这套沙箱
+
+先用三个只读任务压测：
+
+```ts
+import { runReadOnlyTask } from "./run-task";
+
+const tasks = [
+  { id: "arxiv-vict", url: "https://arxiv.org/abs/2608.28128", goal: "read paper metadata", maxVisibleTextChars: 4000 },
+  { id: "hf-papers", url: "https://huggingface.co/papers", goal: "read daily papers", maxVisibleTextChars: 4000 },
+  { id: "obscura", url: "https://github.com/h4ckf0r0day/obscura", goal: "read repository summary", maxVisibleTextChars: 4000 },
+];
+
+for (const task of tasks) {
+  const result = await runReadOnlyTask(task);
+  console.log(JSON.stringify(result, null, 2));
+}
+```
+
+检查三件事：每个任务是否有独立 artifact 目录；截图是否对应正确页面；失败时是否有结构化错误。只有这些都稳定后，才继续加点击和表单动作。
+
+## 生产化清单
+
+把 Web Agent 接入浏览器前，至少补上这些工程控制：
+
+- 每个任务一个 context，每个敏感任务一个 browser process。
+- 域名 allowlist 和网络出口策略。
+- 截图、可见文本、控制台错误、网络摘要和最终 diff 入库。
+- 高风险动作审批，包括提交表单、发送消息、下载文件、上传文件、付款和删除。
+- 最大步数、最大页面数、最大执行时间和最大 token 成本。
+- cookie 和 storage 默认清空，只在受控任务里注入临时凭证。
+- 对网页文本做提示注入标记，不把页面内容当成系统指令。
+
+## 结论
+
+Obscura 的热度说明浏览器正在从“测试工具”变成“agent runtime”。但真正重要的不是某个浏览器快多少，而是我们终于可以按任务分配浏览器、按动作记录证据、按策略限制权限。
+
+Web Agent 的可靠性来自两层：底层浏览器要轻、快、可隔离；上层工具契约要窄、可审计、可恢复。Obscura、Playwright MCP、Cloudflare Browser Run、Browserbase 这些方案可以替换，但这个结构不应该替换。先把浏览器当成受控沙箱，再让 agent 进入网页世界。
+
