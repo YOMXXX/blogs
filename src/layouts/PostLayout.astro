@@ -13,6 +13,10 @@ import AdSlot from '../components/astro/AdSlot.astro';
 import JsonLd from '../components/astro/JsonLd.astro';
 import { buildArticleSchema, buildBreadcrumbSchema } from '../lib/seo';
 import Classic from './templates/Classic.astro';
+import Terminal from './templates/Terminal.astro';
+import Editorial from './templates/Editorial.astro';
+import Dossier from './templates/Dossier.astro';
+import Digest from './templates/Digest.astro';
 import { resolveTemplate } from '../lib/templates';
 import type { TemplateKey } from '../lib/templates';
 
@@ -68,9 +72,8 @@ const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month:
 const readingTimeStr = readingTime(body);
 const columnLabel = COLUMN_LABELS[fm.column];
 
-// 其余模板（terminal/editorial/dossier/digest）由后续任务补充注册
-const TEMPLATE_COMPONENTS: Partial<Record<TemplateKey, typeof Classic>> = { classic: Classic };
-const Template = TEMPLATE_COMPONENTS[resolveTemplate(fm.template)] ?? Classic;
+const TEMPLATE_COMPONENTS = { classic: Classic, terminal: Terminal, editorial: Editorial, dossier: Dossier, digest: Digest } as const;
+const Template = TEMPLATE_COMPONENTS[resolveTemplate(fm.template)];
 const templateProps = { frontmatter: fm, headings, slug, tagColor, columnLabel, dateStr, readingTimeStr };
 ---
 

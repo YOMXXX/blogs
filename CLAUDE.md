@@ -20,6 +20,7 @@ description: "描述"              # 80-160 字符
 column: "workshop"               # workshop | long-form | paper | tools | weekly
 tags: ["tag1", "tag2"]           # 1-8 个标签，禁止包含 / 等特殊字符
 pubDate: YYYY-MM-DD              # 实际发布日期
+template: "classic"    # 可选，缺省 classic；可选值 classic|terminal|editorial|dossier|digest，与栏目正交，每日任务随机抽
 featured: false                  # 慎用，精选文章才设为 true
 tldr: "摘要"                     # 50-300 字符
 author: "YOMXXX"                 # 固定值
