@@ -1,0 +1,74 @@
+---
+import TldrBlock from '../../components/astro/TldrBlock.astro';
+import AdSlot from '../../components/astro/AdSlot.astro';
+import FaqSchema from '../../components/astro/FaqSchema.astro';
+import type { ArticleTemplateProps } from './types';
+
+const { frontmatter: fm, headings, slug, tagColor, columnLabel, dateStr, readingTimeStr } =
+  Astro.props as ArticleTemplateProps;
+const tocItems = headings.filter((h) => h.depth === 2);
+---
+
+<div class="container">
+  <div class="breadcrumb"><span>yomxxx</span> / posts / <span class="cur">{slug}</span></div>
+  <span class="tag" style={`color: ${tagColor}; --tag-color: ${tagColor}`}>{columnLabel}</span>
+  <h1>{fm.title}</h1>
+  <div class="meta">
+    <span>{readingTimeStr}</span>
+    <span class="dot">·</span>
+    <time datetime={fm.pubDate.toISOString()}>{dateStr}</time>
+    {fm.updatedDate && (<>
+      <span class="dot">·</span>
+      <span>updated {fm.updatedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+    </>)}
+  </div>
+
+  <TldrBlock text={fm.tldr} />
+
+  {tocItems.length > 0 && (
+    <nav class="chips" aria-label="目录">
+      {tocItems.map((h) => <a class="chip" href={`#${h.slug}`}>{h.text}</a>)}
+    </nav>
+  )}
+
+  <AdSlot position="above-toc" slot="5766577003" format="horizontal" />
+  <AdSlot position="in-article-1" slot="2412443907" format="auto" />
+  <article class="prose"><slot /></article>
+  <AdSlot position="in-article-2" slot="2214196418" format="auto" />
+  {fm.faq && fm.faq.length > 0 && <FaqSchema faqs={fm.faq} />}
+</div>
+
+<style>
+  .container { max-width: 680px; margin: 0 auto; padding: 28px 24px 40px; }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 8px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  .tag { display: inline-block; font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 3px; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 10px; background: color-mix(in srgb, var(--tag-color) 12%, transparent); }
+  h1 { font-family: var(--font-sans); font-size: 32px; line-height: 1.2; color: var(--color-text-primary); margin: 0 0 10px; font-weight: 700; letter-spacing: -0.5px; }
+  .meta { font-family: var(--font-mono); font-size: 12px; color: var(--color-text-faint); display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+  .dot { color: var(--color-border-strong); }
+  .prose { margin: 24px 0; }
+  .chips { display: flex; gap: 8px; overflow-x: auto; padding: 8px 0 4px; margin-bottom: 12px; }
+  .chip {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 4px 10px;
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 999px;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+    text-decoration: none;
+  }
+  .chip:hover { border-color: var(--color-accent-cyan); color: var(--color-accent-cyan); }
+  .container :global(.prose h2)::before {
+    content: '';
+    display: block;
+    width: 32px;
+    height: 2px;
+    background: var(--color-accent-cyan);
+    margin-bottom: 10px;
+  }
+  @media (max-width: 720px) {
+    h1 { font-size: 26px; }
+  }
+</style>
