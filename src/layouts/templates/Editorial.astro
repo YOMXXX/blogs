@@ -1,0 +1,83 @@
+---
+import TldrBlock from '../../components/astro/TldrBlock.astro';
+import TocSidebar from '../../components/astro/TocSidebar.astro';
+import AdSlot from '../../components/astro/AdSlot.astro';
+import FaqSchema from '../../components/astro/FaqSchema.astro';
+import type { ArticleTemplateProps } from './types';
+
+const { frontmatter: fm, headings, slug, tagColor, columnLabel, dateStr, readingTimeStr } =
+  Astro.props as ArticleTemplateProps;
+---
+
+<div class="container editorial">
+  <div class="kicker">{columnLabel} — {dateStr}</div>
+  <h1>{fm.title}</h1>
+  <div class="meta">
+    <span class="tag" style={`color: ${tagColor}; --tag-color: ${tagColor}`}>{columnLabel}</span>
+    <span>{readingTimeStr}</span>
+    <span class="dot">·</span>
+    <time datetime={fm.pubDate.toISOString()}>{dateStr}</time>
+    {fm.updatedDate && (<>
+      <span class="dot">·</span>
+      <span>updated {fm.updatedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+    </>)}
+  </div>
+  <div class="rule"></div>
+  <TldrBlock text={fm.tldr} />
+
+  <AdSlot position="above-toc" slot="5766577003" format="horizontal" />
+
+  <TocSidebar headings={headings} />
+
+  <AdSlot position="in-article-1" slot="2412443907" format="auto" />
+
+  <article class="prose">
+    <slot />
+  </article>
+
+  <AdSlot position="in-article-2" slot="2214196418" format="auto" />
+
+  {fm.faq && fm.faq.length > 0 && <FaqSchema faqs={fm.faq} />}
+</div>
+
+<style>
+  .container { max-width: 760px; margin: 0 auto; padding: 28px 24px 40px; }
+  .kicker {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--color-accent-amber);
+    margin-bottom: 14px;
+  }
+  h1 {
+    font-family: var(--font-sans);
+    font-size: 44px;
+    line-height: 1.1;
+    font-weight: 800;
+    letter-spacing: -0.8px;
+    color: var(--color-text-primary);
+    margin: 0 0 14px;
+  }
+  .meta { font-family: var(--font-mono); font-size: 12px; color: var(--color-text-faint); display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .meta .tag { margin-bottom: 0; }
+  .dot { color: var(--color-border-strong); }
+  .rule { height: 1px; background: var(--color-border-subtle); margin-bottom: 4px; }
+  .tag { display: inline-block; font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 3px; letter-spacing: 0.5px; text-transform: uppercase; background: color-mix(in srgb, var(--tag-color) 12%, transparent); }
+  .prose { margin: 24px 0; }
+  .editorial :global(.prose > p:first-of-type)::first-letter {
+    float: left;
+    font-size: 56px;
+    line-height: 0.9;
+    padding: 4px 10px 0 0;
+    font-weight: 700;
+    color: var(--color-text-primary);
+  }
+  .editorial :global(.prose blockquote) {
+    border-left: 3px solid var(--color-accent-purple);
+    font-size: 20px;
+  }
+  @media (max-width: 720px) {
+    h1 { font-size: 32px; }
+  }
+</style>
