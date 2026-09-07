@@ -1,0 +1,67 @@
+---
+title: "工具速评：GPT-6 Astra 上线，要从 Claude Fable 5.1 切走吗"
+description: "GPT-6 Astra 9 月 3 日上线：FrontierMath Tier 4 97.6%、OSWorld 2.0 72.6%、编码 Agent Index 追平 Fable 5 且省约 3 倍 token。但榜单背后有 harness 争议，本文给出选型矩阵。"
+column: "tools"
+tags: ["GPT-6-Astra", "Claude-Fable-51", "model-selection", "coding-agent", "benchmarks", "tools"]
+pubDate: 2026-09-07
+featured: false
+tldr: "GPT-6 Astra 的真实卖点不是饱和的榜单分数，而是 token 效率：同样编码效果下成本更低、计算机使用更强。Fable 5.1 仍握有综合智能领先。正确姿势是把 Astra 接进路由做编码和 UI 自动化层，而不是整体切换。"
+author: "YOMXXX"
+faq:
+  - q: "GPT-6 Astra 的获取渠道有哪些？"
+    a: "9 月 3 日起向部分组织限量预览，随后几天内逐步开放给 ChatGPT Plus、Pro、Business 和 Enterprise 用户，并可通过 OpenAI API 和 AWS 调用。"
+  - q: "ARC-AGI-3 的 99.9% 和 17% 为什么差这么多？"
+    a: "99.9% 是 OpenAI 用 Provider Adapter 有状态 harness 跑出的结果，它跨请求保留推理状态；换成标准无状态 API 调用，分数掉到 17% 到 63% 区间。选模型要看无状态口径。"
+  - q: "编码任务该从 Fable 5.1 切到 Astra 吗？"
+    a: "看任务形态。Astra 在编码 Agent Index 上追平 Fable 5 且成本更低，长任务收益明显；但需要深度推理的架构设计和复杂调试，独立评测里 Fable 系仍领先，建议先灰度再切换。"
+  - q: "token 效率的提升意味着什么？"
+    a: "在 max effort 设置下 Astra 相比上一代 GPT-5.6 Sol 少用约 3 倍 token 达到相近效果。对 agent 长任务，这直接决定了单位任务成本能不能进生产预算。"
+  - q: "什么时候不该急着用 Astra？"
+    a: "无状态 API 口径的独立评测还不充分、成本模型未稳定、或你的任务高度依赖综合智能指数时。先在低风险任务上跑两周影子流量再定。"
+---
+
+[GPT-6 Astra](https://openai.com/) 在 9 月 3 日上线：先向部分组织限量预览，随后几天逐步开放给 ChatGPT Plus、Pro、Business 和 Enterprise 用户，同时提供 OpenAI API 和 AWS 接入。距离 Anthropic 9 月 1 日发布 Claude Fable 5.1 只隔了两天，前沿模型的新一轮对位竞争正式开始。
+
+这篇速评不写新闻复述，只回答开发者这两天最实际的问题：已经在用 Fable 5.1 的团队，要不要把工作负载切到 Astra？结论先行：不要整体切换，把 Astra 作为编码 agent 和计算机使用层的路由目标接入，是当下更划算的姿势。
+
+## 榜单数字：亮点和水分要分开看
+
+先看官方口径的亮点。FrontierMath Tier 4 达到 97.6%，属于饱和区；ExploitBench 100%；OSWorld 2.0 计算机使用 72.6%，同时每个任务耗时比上一代少约 47%；DeepSWE 约 73% 到 74%；Terminal Bench Science 64.6%。单看这份清单，Astra 像是全面碾压。
+
+但独立评测的口径讲了另一个故事。Artificial Analysis 的 Intelligence Index 给 Astra 打了 61.2，基本和上一代 GPT-5.6 Sol 打平，仍落后于 Claude Fable 系。差距主要在非编码的通用推理上。
+
+最有信息量的是 ARC-AGI-3。官方宣传的 99.9% 来自 OpenAI 自家的 Provider Adapter harness——一个跨请求保留推理状态的有状态环境。ARC Prize 官方在半私有评测集上的数据是：标准 harness 下 62.7%（花费约 2.6 万美元），Provider Adapter 下 99.9%（约 1.9 万美元）。而开发者通过标准无状态 API 直接调用时，分数落在 17% 到 63% 之间。
+
+这不是造假，但它是重要的选购信息：如果你的架构是标准的无状态请求（多数生产系统正是如此），你买到的能力和那张 99.9% 的海报不是同一个东西。有状态 harness 适合长程任务的内部状态复用，前提是你愿意把会话黏在单一厂商的适配器上。
+
+## 真正的卖点：token 效率
+
+剥离饱和榜单后，Astra 的结构性优势浮出来：同样效果的 token 消耗大幅下降。
+
+Artificial Analysis 的编码 Agent Index 显示，Astra 在 max effort 设置下比 GPT-5.6 Sol（max）少用约 3 倍 token 达到相近效果，成本与 GPT-5.6 Sol（max）接近，却在「编码 Agent Index 对比单位任务成本」上落在 Pareto 前沿——追平 Fable 5 的编码水平，价格更低。
+
+对 agent 长任务，这个数字比任何单项 benchmark 都重要。编码 agent 一次任务动辄消耗数十万 token，token 效率翻三倍意味着原来跑不起的任务进入了预算区。这也是 Astra 最值得你今天就接入的理由。
+
+## 选型矩阵：Astra 和 Fable 5.1 各守哪层
+
+把两个模型的已知信息放进任务矩阵，路由就清晰了。
+
+适合路由到 Astra 的负载：多轮编码 agent 任务（token 成本敏感，效果追平 Fable 5）；计算机使用和浏览器自动化（OSWorld 2.0 领先且单任务时间更短）；需要长上下文持续作业的终端任务。此外如果你的基础设施在 AWS 上，Astra 的接入摩擦更小。
+
+适合留在 Fable 5.1 的负载：深度推理任务——架构设计评审、复杂调试、跨系统权衡类分析（Intelligence Index 独立评测领先）；对无状态 API 一致性要求高的场景（Fable 的榜单数字不依赖有状态适配器）；以及已经稳定的 Claude 生态工具链。
+
+两者的成本结构还要观察。Astra 的按 token 计价在低 effort 档位便宜，但 max effort 的单位任务成本和上一代接近；Fable 5.1 的 API 定价已公开稳定。真正的比较应该在你的任务分布上算，而不是看价目表。
+
+## 落地建议：影子流量先行
+
+如果你已经在跑多模型路由（我们之前讨论过 Fable 5.1 之后的路由设计），接入 Astra 的正确方式是影子流量：把 10% 到 20% 的编码任务复制一份发给 Astra，对比完成率、token 消耗、回滚率和人工修正时间，跑一到两周再调权重。
+
+三个具体检查点：第一，对比无状态口径的实际表现，别用厂商 harness 的数字做决策依据。第二，盯单位任务成本而不是单价——Astra 的 token 效率优势要换算成你的任务分布才有意义。第三，注意生态绑定：有状态适配器带来的分数提升是真实的，但它会把你的 agent 架构和单一厂商的会话机制锁得更深，退出成本要提前算。
+
+另外给观望者一个提醒：Astra 目前还是限量预览阶段，API 配额和定价可能调整，DeepSWE、Terminal Bench Science 之外的独立评测也在陆续补齐。不着急的团队等两周，看第三方无状态口径的完整数据再做决定，不会有实质损失。
+
+## 结论
+
+GPT-6 Astra 是一次典型的「效率跃迁」而非「智能跃迁」：饱和的榜单数字是营销素材，token 效率和计算机使用才是工程价值。Fable 5.1 仍然是综合推理的最强选项之一，而 Astra 用更低成本拿到了同档的编码 agent 表现。
+
+我的选型结论：编码层和 UI 自动化层路由到 Astra，深度推理层留在 Fable 5.1，其余负载交给高性价比小模型。整体切换是懒惰的架构，分层路由才是 2026 年的正确姿势——尤其是在榜单口径还会变的这两周。
