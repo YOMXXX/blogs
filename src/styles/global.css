@@ -147,3 +147,6 @@ body { min-height: 100vh; }
   padding: 0 4px;
   border-radius: 3px;
 }
+
+/* 锚点跳转补偿：粘性 Header 高约 52px（padding 14px×2 + 行盒 22.4px + 边框 1px），留 12px 余量取整为 64px */
+[id] { scroll-margin-top: 64px; }
