@@ -1,4 +1,5 @@
 import { defineCollection, z } from 'astro:content';
+import { TEMPLATE_KEYS } from '../lib/templates';
 
 const COLUMNS = ['workshop', 'long-form', 'paper', 'tools', 'weekly'] as const;
 
@@ -15,6 +16,7 @@ const posts = defineCollection({
     coverAlt: z.string().optional(),
     draft: z.boolean().default(false),
     featured: z.boolean().default(false),
+    template: z.enum(TEMPLATE_KEYS).optional(),
     tldr: z.string().min(50).max(300),
     faq: z
       .array(
