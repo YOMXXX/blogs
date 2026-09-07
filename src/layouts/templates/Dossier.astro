@@ -1,0 +1,68 @@
+---
+import TldrBlock from '../../components/astro/TldrBlock.astro';
+import TocSidebar from '../../components/astro/TocSidebar.astro';
+import AdSlot from '../../components/astro/AdSlot.astro';
+import FaqSchema from '../../components/astro/FaqSchema.astro';
+import { dossierNumber } from '../../lib/templates';
+import type { ArticleTemplateProps } from './types';
+
+const { frontmatter: fm, headings, slug, tagColor, columnLabel, dateStr, readingTimeStr } =
+  Astro.props as ArticleTemplateProps;
+const docNo = String(dossierNumber(slug)).padStart(3, '0');
+---
+
+<div class="container">
+  <div class="panel">
+    <div class="panel-main">
+      <span class="tag" style={`color: ${tagColor}; --tag-color: ${tagColor}`}>{columnLabel}</span>
+      <h1>{fm.title}</h1>
+    </div>
+    <dl class="panel-meta">
+      <div><dt>DOC</dt><dd>N°{docNo}</dd></div>
+      <div><dt>DATE</dt><dd>{dateStr}</dd></div>
+      <div><dt>READ</dt><dd>{readingTimeStr}</dd></div>
+      <div><dt>TAGS</dt><dd>{fm.tags.join(', ')}</dd></div>
+    </dl>
+  </div>
+  <div class="breadcrumb"><span>yomxxx</span> / posts / <span class="cur">{slug}</span></div>
+
+  <TldrBlock text={fm.tldr} />
+  <AdSlot position="above-toc" slot="5766577003" format="horizontal" />
+  <TocSidebar headings={headings} />
+  <AdSlot position="in-article-1" slot="2412443907" format="auto" />
+  <article class="prose"><slot /></article>
+  <AdSlot position="in-article-2" slot="2214196418" format="auto" />
+  {fm.faq && fm.faq.length > 0 && <FaqSchema faqs={fm.faq} />}
+</div>
+
+<style>
+  .container { max-width: 720px; margin: 0 auto; padding: 28px 24px 40px; }
+  .panel {
+    display: grid;
+    grid-template-columns: 1fr 200px;
+    gap: 24px;
+    border: 1px solid var(--color-border-strong);
+    background: var(--color-bg-surface);
+    padding: 24px;
+    margin-bottom: 10px;
+  }
+  .panel-main .tag { display: inline-block; font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 3px; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 12px; background: color-mix(in srgb, var(--tag-color) 12%, transparent); }
+  h1 { font-family: var(--font-sans); font-size: 34px; line-height: 1.15; color: var(--color-text-primary); margin: 0; font-weight: 700; letter-spacing: -0.6px; }
+  .panel-meta { margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-content: start; font-family: var(--font-mono); }
+  .panel-meta dt { font-size: 9px; letter-spacing: 1px; color: var(--color-text-faint); }
+  .panel-meta dd { margin: 2px 0 0; font-size: 12px; color: var(--color-text-secondary); }
+  .breadcrumb { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-faint); margin-bottom: 12px; }
+  .breadcrumb span { color: var(--color-accent-green); }
+  .breadcrumb .cur { color: var(--color-accent-amber); }
+  .prose { margin: 24px 0; }
+  .container :global(.prose) { counter-reset: sec; }
+  .container :global(.prose h2)::before {
+    counter-increment: sec;
+    content: counter(sec, decimal-leading-zero) '. ';
+    color: var(--color-accent-cyan);
+  }
+  @media (max-width: 720px) {
+    .panel { grid-template-columns: 1fr; }
+    h1 { font-size: 28px; }
+  }
+</style>
