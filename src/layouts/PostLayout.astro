@@ -2,11 +2,8 @@
 import BaseLayout from './BaseLayout.astro';
 import Header from '../components/astro/Header.astro';
 import Footer from '../components/astro/Footer.astro';
-import TldrBlock from '../components/astro/TldrBlock.astro';
-import TocSidebar from '../components/astro/TocSidebar.astro';
 import AuthorCard from '../components/astro/AuthorCard.astro';
 import ArticleCTA from '../components/astro/ArticleCTA.astro';
-import FaqSchema from '../components/astro/FaqSchema.astro';
 import ArticleCard from '../components/astro/ArticleCard.astro';
 import ProgressBar from '../components/react/ProgressBar.tsx';
 import GiscusComments from '../components/react/GiscusComments.tsx';
@@ -15,6 +12,9 @@ import { readingTime } from '../lib/readingTime';
 import AdSlot from '../components/astro/AdSlot.astro';
 import JsonLd from '../components/astro/JsonLd.astro';
 import { buildArticleSchema, buildBreadcrumbSchema } from '../lib/seo';
+import Classic from './templates/Classic.astro';
+import { resolveTemplate } from '../lib/templates';
+import type { TemplateKey } from '../lib/templates';
 
 interface Props {
   frontmatter: {
@@ -27,6 +27,7 @@ interface Props {
     faq?: Array<{ q: string; a: string }>;
     author: string;
     tags: string[];
+    template?: TemplateKey;
   };
   body: string;
   headings: Array<{ depth: number; slug: string; text: string }>;
@@ -64,74 +65,48 @@ const breadcrumbSchema = buildBreadcrumbSchema([
 
 const tagColor = COLUMN_TAG_COLOR[fm.column];
 const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+const readingTimeStr = readingTime(body);
+const columnLabel = COLUMN_LABELS[fm.column];
+
+// 其余模板（terminal/editorial/dossier/digest）由后续任务补充注册
+const TEMPLATE_COMPONENTS: Partial<Record<TemplateKey, typeof Classic>> = { classic: Classic };
+const Template = TEMPLATE_COMPONENTS[resolveTemplate(fm.template)] ?? Classic;
+const templateProps = { frontmatter: fm, headings, slug, tagColor, columnLabel, dateStr, readingTimeStr };
 ---
 
 <BaseLayout title={fm.title} description={fm.description} ogImage={`/og/${slug}.png`} ogType="article">
   <JsonLd schema={[articleSchema, breadcrumbSchema]} />
   <ProgressBar client:idle />
   <Header />
-  <main class="container">
-    <div class="breadcrumb">
-      <span>yomxxx</span> / posts / <span class="cur">{slug}</span>
+  <main>
+    <Template {...templateProps}><slot /></Template>
+    <div class="container tail">
+      <AuthorCard name={fm.author} pubDate={fm.pubDate} updatedDate={fm.updatedDate} />
+
+      <ArticleCTA />
+
+      <AdSlot position="end-of-article" slot="9901114747" format="rectangle" />
+
+      {
+        related.length > 0 && (
+          <section class="related">
+            <div class="related-h">// related.json ›</div>
+            <div class="related-grid">
+              {related.map((r) => (
+                <ArticleCard
+                  slug={r.slug}
+                  title={r.data.title}
+                  description={r.data.description}
+                  column={r.data.column}
+                  readingTimeStr={readingTime(r.body)}
+                />
+              ))}
+            </div>
+          </section>
+        )
+      }
+      <GiscusComments slug={slug} client:visible />
     </div>
-
-    <span class="tag" style={`color: ${tagColor}; --tag-color: ${tagColor}`}>
-      {COLUMN_LABELS[fm.column]}
-    </span>
-
-    <h1>{fm.title}</h1>
-
-    <div class="meta">
-      <span>{readingTime(body)}</span>
-      <span class="dot">·</span>
-      <time datetime={fm.pubDate.toISOString()}>{dateStr}</time>
-      {fm.updatedDate && (<>
-        <span class="dot">·</span>
-        <span>updated {fm.updatedDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
-      </>)}
-    </div>
-
-    <TldrBlock text={fm.tldr} />
-
-    <AdSlot position="above-toc" slot="5766577003" format="horizontal" />
-
-    <TocSidebar headings={headings} />
-
-    <AdSlot position="in-article-1" slot="2412443907" format="auto" />
-
-    <article class="prose">
-      <slot />
-    </article>
-
-    <AdSlot position="in-article-2" slot="2214196418" format="auto" />
-
-    {fm.faq && fm.faq.length > 0 && <FaqSchema faqs={fm.faq} />}
-
-    <AuthorCard name={fm.author} pubDate={fm.pubDate} updatedDate={fm.updatedDate} />
-
-    <ArticleCTA />
-
-    <AdSlot position="end-of-article" slot="9901114747" format="rectangle" />
-
-    {
-      related.length > 0 && (
-        <section class="related">
-          <div class="related-h">// related.json ›</div>
-          <div class="related-grid">
-            {related.map((r) => (
-              <ArticleCard
-                slug={r.slug}
-                title={r.data.title}
-                description={r.data.description}
-                column={r.data.column}
-                readingTimeStr={readingTime(r.body)}
-              />
-            ))}
-          </div>
-        </section>
-      )
-    }
-    <GiscusComments slug={slug} client:visible />
   </main>
   <Footer />
 </BaseLayout>
@@ -142,46 +117,7 @@ const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month:
     margin: 0 auto;
     padding: 28px 24px 40px;
   }
-  .breadcrumb {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--color-text-faint);
-    margin-bottom: 8px;
-  }
-  .breadcrumb span { color: var(--color-accent-green); }
-  .breadcrumb .cur { color: var(--color-accent-amber); }
-  .tag {
-    display: inline-block;
-    font-family: var(--font-mono);
-    font-size: 10px;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 3px;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-    margin-bottom: 10px;
-    background: color-mix(in srgb, var(--tag-color) 12%, transparent);
-  }
-  h1 {
-    font-family: var(--font-sans);
-    font-size: 36px;
-    line-height: 1.15;
-    color: var(--color-text-primary);
-    margin: 0 0 12px;
-    font-weight: 700;
-    letter-spacing: -0.6px;
-  }
-  .meta {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--color-text-faint);
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    margin-bottom: 4px;
-  }
-  .dot { color: var(--color-border-strong); }
-  .prose { margin: 24px 0; }
+  .tail { padding-top: 0; }
   .related { margin-top: 48px; }
   .related-h {
     font-family: var(--font-mono);
@@ -196,6 +132,5 @@ const dateStr = fm.pubDate.toLocaleDateString('en-US', { year: 'numeric', month:
   }
   @media (max-width: 720px) {
     .related-grid { grid-template-columns: 1fr; }
-    h1 { font-size: 28px; }
   }
 </style>
