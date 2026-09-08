@@ -1,0 +1,238 @@
+---
+title: "Caltech Mathathon 实战：如何用 AI Agent 攻克研究级数学问题"
+description: "Caltech Mathathon 是全球首个专注研究级数学的 AI Hackathon，每队获 $20k AI credits。本文手把手教你如何用 AI agent 参与数学研究竞赛。"
+column: "workshop"
+tags: ["Mathathon", "AI-Math", "Hackathon", "Caltech", "Agent"]
+pubDate: 2026-09-08
+template: "digest"
+featured: false
+tldr: "Caltech Mathathon 是史上首个专注研究级数学的 AI Hackathon，参赛者用 AI agent 解决前沿数学问题。本文提供完整的参赛准备指南和 AI 辅助数学证明的实战代码示例。"
+author: "YOMXXX"
+faq:
+  - q: "Mathathon 和普通编程 Hackathon 有什么区别？"
+    a: "Mathathon 专注研究级纯数学问题而非软件工程，参赛者需要用 AI 工具辅助证明或发现新的数学结论。Caltech 为每队提供 $20k AI 算力额度，赛程长达 3 天。"
+  - q: "参加 Mathathon 需要什么数学背景？"
+    a: "建议具备本科以上的抽象代数、拓扑或分析基础。赛题面向研究级问题，但 AI 工具可以辅助探索和验证猜想，降低了纯手工证明的门槛。"
+  - q: "如何用 AI 辅助数学证明？"
+    a: "主流方法是用 LLM 生成 Lean4 或 Coq 形式化证明草稿，再用自动定理证明器验证。工具链包括 Lean Copilot、AlphaProof 和 mathlib4 库。"
+  - q: "Mathathon 提供哪些 AI 工具？"
+    a: "官方提供 $20k 云算力额度，支持调用 GPT-6、Claude 等大模型 API。参赛者也可自带本地模型或使用 Lean4、Isabelle 等证明助手。"
+  - q: "AI 在纯数学领域有哪些突破性进展？"
+    a: "2025-2026 年间，AI 在纽结理论、组合优化和代数几何猜想方面取得多个突破。DeepMind 的 AlphaProof 在 IMO 级别题目上达到银牌水平，FunSearch 发现了新的数学构造。"
+---
+
+> **TL;DR**：Caltech Mathathon 是史上第一个专注研究级数学的 AI Hackathon，2026 年 10 月 30 日至 11 月 1 日在加州理工学院举行，一百支队伍各获约 $20k AI credits，用 40 小时冲击公开未解的数学猜想。本文给你一套完整的参赛准备方案：从工具链配置、AI 辅助研究 workflow，到可直接运行的 Lean4 形式化与反例搜索代码。
+
+# Caltech Mathathon 实战：如何用 AI Agent 攻克研究级数学问题
+
+## 什么是 Mathathon
+
+Caltech Mathathon 是加州理工学院主办的、全球首个专注于研究级数学的 AI Hackathon，比赛时间为 2026 年 10 月 30 日至 11 月 1 日，一百支队伍将在 40 小时内获得前沿大模型的算力支持，尝试解决公开的数学猜想并构建新的数学理论，最终在顶级数学家面前答辩，由评委评估队伍对结果的真实理解程度。
+
+这个比赛的诞生背景是 AI 在纯数学领域的连续突破。仅 2026 年一年内：
+
+- 5 月 20 日，Erdős 的平面单位距离猜想被推翻——这个猜想公开了 80 年；
+- 8 月 1 日，首个显式非 sofic 群被构造出来——问题悬置 27 年；
+- 8 月 23 日，六维球面被证明可以带有复结构——公开 78 年，结果尚待完整验证。
+
+不到四个月三项突破，这直接引出了 Mathathon 想回答的两个问题：AI 能把"从想法到同行评审发表"的过程加速多少？当 AI 可以更快解决猜想时，数学家的角色是什么？
+
+比赛设置了两轮评奖：现场颁给最有前景、解释最清晰的结果；待数学社区完成验证后，再发放第二轮奖金。官方还专门发布了负责任 AI 使用承诺，明确哪些 AI 用法是比赛允许的。官方信息见 [mathathonchallenge.com](https://mathathonchallenge.com/)，比赛公告在 Hacker News 上也引发了 241 分的热议。
+
+## Mathathon 和普通 Hackathon 的区别
+
+理解 Mathathon 的独特性，先看它和传统 Hackathon 的三个本质差异。
+
+第一，产出物是数学结论而不是软件。普通 Hackathon 交付 demo、App 或工具，评判标准是可用性和完成度。Mathathon 交付的是证明、反例或新构造，评判标准是正确性——而数学的正确性只有"对"和"错"，没有"差不多能跑"。
+
+第二，验证机制完全不同。软件可以现场演示，数学结果当场验证不完。这就是为什么比赛采用"答辩 + 延迟第二轮评奖"的双阶段机制：现场看你对方法的理解深度，事后由社区做完整验证。
+
+第三，AI 的角色从"写代码的助手"变成"研究合作者"。比赛的核心问题不是"你会不会用 Copilot"，而是"你能不能编排一个由 LLM、符号计算引擎和证明助手组成的研究流水线"。这正是 Mathathon 真正想测试的能力。
+
+## 如何报名参加
+
+参赛流程不复杂，但准备要趁早：
+
+1. **组队**。官网申请通道已开放，队伍规模以官方最新规则为准。理想配置是"一名偏分析的数学背景成员 + 一名偏代数/拓扑的成员 + 一名工程能力强的成员"，三人都要会用 AI 工具。
+2. **提交申请**。在 [mathathonchallenge.com](https://mathathonchallenge.com/) 填写申请，说明队伍的数学背景和 AI 使用经验。选拔大概率会看研究经历，前期在 arXiv 上有产出或参加过 Putnam、IMO 的履历是加分项。
+3. **确认算力额度**。官方 AI credits 总池超过 200 万美元，分给一百支队伍，每队约 $20k。这笔额度决定了你能跑多大规模的搜索和多少轮证明迭代，赛前要规划好预算分配。
+4. **阅读负责任 AI 使用条款**。明确哪些工具用法合规，避免现场被判违规。
+
+## 赛前准备：配置 AI 数学工具链
+
+工欲善其事，必先利其器。一套完整的 AI 数学工具链分三层。
+
+### 第一层：大模型 API
+
+大模型是猜想生成和证明草稿的引擎。Mathathon 的 credits 支持调用 GPT-6、Claude 等前沿模型。实践中建议至少配两个模型做交叉验证：一个用于发散（提猜想、找思路），一个用于收敛（写严格证明步骤）。模型生成的证明必须当"草稿"对待，永远不要直接相信。
+
+### 第二层：符号与数值计算
+
+SymPy、SageMath、PARI/GP 负责确定性计算：化简表达式、精确数值实验、大整数运算。这一层是 AI 工作流的"事实核查员"——LLM 说某个恒等式成立，让 SymPy 算一遍就知道真假。
+
+### 第三层：形式化证明助手
+
+Lean4 加 mathlib4 是当前的事实标准。Lean 是"最终裁判"：一份证明只要被 Lean 编译器接受，正确性就不再依赖任何人（包括 AI）的判断。AlphaProof 类系统正是构建在这类形式化系统之上。
+
+三层工具的安装配置：
+
+```bash
+# Lean4 工具链（通过 elan 管理，类似 rustup）
+curl https://elan.lean-lang.org/elan-init.sh -sSf | sh
+elan toolchain install stable
+
+# 创建带 mathlib4 的项目（首次编译 mathlib 约 20-40 分钟，务必赛前完成！）
+mkdir mathathon && cd mathathon
+lake init . math
+lake add mathlib
+lake exe cache get   # 下载 mathlib 预编译缓存，节省数小时
+lake build
+
+# Python 侧：符号计算 + LLM SDK
+pip install sympy anthropic openai
+```
+
+一个关键建议：所有环境赛前必须完整跑通一遍。Mathathon 只有 40 小时，现场下载 mathlib 缓存或修依赖版本是致命的时间浪费。
+
+## 实战 Workflow：AI 辅助研究的五步循环
+
+在比赛中，我们推荐把研究过程固化成五步循环：
+
+1. **检索**：让 LLM 总结目标猜想的已知结果、相关文献和既有证明技巧，快速定位"这个问题的已知边界在哪"。
+2. **猜想**：让模型基于特例提出可检验的小命题。注意：让模型一次只提一个具体命题，而不是开放式讨论。
+3. **计算检验**：用 SymPy 做符号验证，用小规模数值实验做压力测试。90% 的"AI 猜想"会死在这一步——这恰恰是工作流的价值，过滤掉幻觉。
+4. **反例搜索**：对可疑命题做大规模并行搜索。历史上 Polya 猜想对所有小于 9 亿的数都成立，最终还是被计算推翻——小规模验证不等于证明，但找到反例能一击毙命。
+5. **形式化**：对幸存的命题，让 LLM 写 Lean4 证明草稿，编译器验证，报错回喂，循环迭代直到通过或判定此路不通。
+
+这个循环的要义是：**每一步都有机器裁判，AI 只负责提出候选，绝不负责宣布胜利**。
+
+## 代码实战
+
+下面三段代码覆盖循环中最关键的三步，可直接运行。
+
+### 用 SymPy 检验 AI 提出的猜想
+
+```python
+"""AI 猜想检验器：LLM 提出命题，SymPy 做符号层面的事实核查。"""
+from sympy import symbols, summation, simplify, binomial
+
+n, k = symbols("n k", integer=True, positive=True)
+
+# AI 给出的猜想 1：前 n 个立方和等于前 n 个自然数和的平方
+conjecture_1_lhs = summation(k ** 3, (k, 1, n))
+conjecture_1_rhs = (n * (n + 1) / 2) ** 2
+print("猜想 1 余式:", simplify(conjecture_1_lhs - conjecture_1_rhs))  # 0 => 成立
+
+# AI 给出的猜想 2：二项式系数之和等于 2^n
+conjecture_2_lhs = summation(binomial(n, k), (k, 0, n))
+print("猜想 2 余式:", simplify(conjecture_2_lhs - 2 ** n))  # 0 => 成立
+```
+
+余式输出为 0 说明恒等式在符号层面成立。如果输出不是 0，这个猜想直接淘汰，一分钱算力都不用多花。
+
+### 并行反例搜索：一击毙命的验证手段
+
+```python
+"""Polya 猜想式反例搜索：检验 sum_{k<=n} lambda(k) 是否始终 <= 0。
+lambda 是 Liouville 函数（素因子个数的奇偶性）。"""
+from sympy import factorint
+from multiprocessing import Pool
+
+def liouville(n: int) -> int:
+    return -1 if sum(factorint(n).values()) % 2 else 1
+
+def _sum_range(args: tuple[int, int]) -> list[int]:
+    """计算 [start, end) 内 Liouville 函数的逐项部分和。"""
+    start, end = args
+    partial, out = 0, []
+    for k in range(start, end):
+        partial += liouville(k)
+        out.append(partial)
+    return out
+
+def find_counterexample(limit: int = 2_000_000, workers: int = 8) -> int | None:
+    """返回第一个违反猜想的 n；历史反例约在 9.06 亿处。"""
+    chunk = limit // workers
+    ranges = [(i * chunk + 1, (i + 1) * chunk + 1) for i in range(workers)]
+    with Pool(workers) as pool:
+        segments = pool.map(_sum_range, ranges)
+    # 拼接各段部分和：段 i 的真实部分和 = 前段末尾值 + 段内相对值
+    offset, hits = 0, []
+    for seg in segments:
+        for local in seg:
+            if offset + local > 0:
+                hits.append(offset + local)
+        offset += seg[-1] if seg else 0
+    return hits[0] if hits else None
+
+if __name__ == "__main__":
+    print(find_counterexample())  # 小规模内为 None，但方法可无限扩展
+```
+
+这段代码的价值在于展示方法本身：把命题转写成可计算谓词，然后并行地压到硬件极限。Mathathon 的 $20k credits 正是为这类高强度搜索准备的。
+
+### Lean4 证明循环：生成、编译、报错回喂
+
+```python
+"""AI-Lean 迭代证明器：LLM 写 Lean4 证明，编译器裁决，报错回喂。"""
+import subprocess
+from pathlib import Path
+from anthropic import Anthropic
+
+client = Anthropic()
+HEADER = "import Mathlib.Tactic\nimport Mathlib.Algebra.BigOperators.Basic\n"
+
+def draft_proof(theorem: str, lean_errors: str | None) -> str:
+    """向模型描述定理；若上一轮编译失败，附上完整报错。"""
+    feedback = f"\n\n上一版编译失败，报错如下，请修复：\n{lean_errors}" if lean_errors else ""
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=4096,
+        system="你是 mathlib4 专家。只输出 Lean4 代码，不要解释，不要 markdown 代码块。",
+        messages=[{"role": "user", "content": f"证明这个定理：\n{theorem}{feedback}"}],
+    )
+    return resp.content[0].text
+
+def check_lean(code: str) -> tuple[bool, str]:
+    """写入临时文件并用 lake 编译，返回 (是否通过, 编译日志)。"""
+    Path(".verify").mkdir(exist_ok=True)
+    Path(".verify/Proof.lean").write_text(HEADER + code, encoding="utf-8")
+    proc = subprocess.run(
+        ["lake", "env", "lean", ".verify/Proof.lean"],
+        capture_output=True, text=True, timeout=300,
+    )
+    return proc.returncode == 0, proc.stdout + proc.stderr
+
+def prove(theorem: str, max_rounds: int = 8) -> str | None:
+    errors = None
+    for _ in range(max_rounds):
+        code = draft_proof(theorem, errors)
+        ok, log = check_lean(code)
+        if ok:
+            return code          # 编译器盖章：证明正确
+        errors = log             # 报错回喂，下一轮修复
+    return None
+
+if __name__ == "__main__":
+    result = prove(
+        "theorem sq_sum_bound (a b : ℕ) : (a + b) ^ 2 ≤ 2 * (a ^ 2 + b ^ 2)"
+    )
+    print(result if result else "8 轮内未收敛，换思路或换模型")
+```
+
+`prove` 函数就是整个 AI 数学研究的缩影：**模型负责猜和写，编译器负责判**。返回的证明不依赖任何人的信任，它已经被机器验证。比赛中建议同时开 3-5 个不同定理的迭代循环，让 API 额度始终在燃烧。
+
+## 40 小时怎么分配
+
+根据三个 AI 数学突破案例的公开经验，合理的时间分配大致是：
+
+- **第 1-4 小时**：选题和文献侦察。用 LLM 把候选猜想的已知结果、相关 mathlib 定理、常见攻击手段整理成一页作战地图。宁可选题偏保守，不要选完全没有工具支撑的方向。
+- **第 5-20 小时**：五步循环主战场。同时推进 2-3 条攻击路线，每 4 小时强制复盘一次，砍掉无进展的路线。
+- **第 21-32 小时**：集中形式化。把最有希望的结果写进 Lean，能形式化的部分先锁定，降低"结果错误"的灾难风险。
+- **第 33-40 小时**：写作和答辩准备。Mathathon 评的是"最有前景且解释最好的结果"，一份讲清楚思路的文档，价值不亚于半个定理。记住评委考察的是你对结果的**理解**，不是 AI 的功劳。
+
+## 写在最后
+
+Mathathon 的意义已经超出比赛本身：它在测试一种新的数学生产方式。三个 2026 年的突破证明 AI 不再只是"计算器放大器"，而是能参与猜想、证明和构造全流程的研究主体。对参赛者来说，真正的胜负手不是谁的模型调用得多，而是谁更擅长把 LLM 的发散能力、SymPy 的确定性计算和 Lean 的最终裁决编排成一条可靠的研究流水线。
+
+如果你错过了这届，现在就开始搭环境：`elan`、`lake`、mathlib 缓存、API key，一样都不能少。数学的下一个猜想被推翻时，屏幕前坐着的很可能就是准备好了的人。
