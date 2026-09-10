@@ -1,4 +1,13 @@
 #!/bin/bash
+# DISABLED: 已改由 Grok Bot（lgc）定时触发每日写作/发布。
+# launchd 任务 com.yomxxx.daily-write 已卸载；plist 备份为
+# ~/Library/LaunchAgents/com.yomxxx.daily-write.plist.disabled-by-grokbot
+# 本脚本保留作历史参考，请勿再手动挂回 launchd。
+# 若需立刻跑一轮，在 Grok Bot 聊天里说「开始今天的博客」。
+echo "daily-write.sh 已停用：请用 Grok Bot 触发，而不是本脚本/Qoder。" >&2
+exit 0
+
+# ===== 以下为原 Qoder 触发逻辑（已停用）=====
 # 每日自动写 5 篇 AI 博客文章
 # 由 launchd 在 08:00 触发，通过 qoder chat 执行
 # 日志写入 ~/Desktop/blogs/logs/
