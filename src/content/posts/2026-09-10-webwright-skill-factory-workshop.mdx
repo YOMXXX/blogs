@@ -1,0 +1,125 @@
+---
+title: "Webwright Skill Factory：把浏览器任务蒸馏成可复用代码技能"
+description: "Microsoft 开源的 Webwright 用 Playwright 代码动作替代点坐标猜测，Skill Factory 把每次成功解题沉淀为可独立复跑的参数化技能。本文带你从零跑通安装、解题与技能复用。"
+column: "workshop"
+tags: ["Webwright", "Browser-Agent", "Playwright", "Skill-Factory", "Coding-Agent"]
+pubDate: 2026-09-10
+template: "terminal"
+featured: false
+tldr: "Webwright 用 code-as-action 在 Online-Mind2Web 与 Odysseys 上刷新开源 harness 成绩；Skill Factory 把成功轨迹蒸馏成约 40 秒、零 token 的可复用技能。本文给出安装、解题循环、技能入库与回归门禁的可执行路径。"
+author: "YOMXXX"
+faq:
+  - q: "Webwright 和传统截图点坐标 browser agent 有什么区别？"
+    a: "传统方案让模型在截图上猜点击坐标；Webwright 让模型生成 Playwright 脚本，用选择器与断言操作页面。代码动作可复现、可版本化，也更容易蒸馏成可复用技能。"
+  - q: "Skill Factory 蒸馏出的技能还需要大模型吗？"
+    a: "正式入库并通过回归门禁后，技能可在约 40 秒内独立复跑，不再消耗模型 token。模型只在首次解题或技能失效时介入。"
+  - q: "本地最小可运行环境需要什么？"
+    a: "Node 或 Python 运行时、Playwright 浏览器依赖，以及 OpenAI、Anthropic 或 OpenRouter 之一的 API Key。官方 README 给出 Codex 与 Claude Code 插件清单。"
+  - q: "Skill Factory 如何防止技能库腐化？"
+    a: "update 与 learn 流水线会聚类相似解题脚本、参数化模板，并跑回归门禁。失败技能不会直接覆盖线上库，需人工或策略确认。"
+  - q: "适合什么生产场景？"
+    a: "长流程表单、后台运营、跨站数据采集、内部工具自动化。尤其适合「同一类任务反复出现」的团队——第一次付模型成本，后面付脚本成本。"
+---
+
+2026 年 5 月微软开源 [Webwright](https://github.com/microsoft/Webwright) 时，社区最刺眼的数字不是星标，而是基准：Online-Mind2Web 上 GPT-5.4 跑出 86.7%，Odysseys 长程任务 60.1%，相对此前视觉坐标基线拉开两位数百分点。7 月合并的 Skill Factory 把这套 harness 从「会解题」推到「会沉淀」——每一次成功求解都会留下可参数化、可回归验证的代码技能。
+
+这篇文章按工程顺序走一遍：为什么 code-as-action 赢了点坐标，怎么在本机跑通第一条任务，Skill Factory 如何入库，以及生产落地时最容易踩的三个坑。
+
+## 为什么还要再做一个 browser agent
+
+过去两年 browser agent 的默认姿态是：截一张图，让模型输出 `(x, y)`，再点一下。短任务能跑，长任务必崩——DOM 一变，坐标全废；失败轨迹也很难复用。
+
+Webwright 换了动作空间：模型写 Playwright。选择器、等待、断言都是一等公民。微软在 README 里把它概括成 SWE 风格的浏览器 agent——把网页任务当成「可提交的补丁」，而不是「连续盲点」。
+
+> **💡 提示** 如果你团队已经有 Playwright 测试基建，Webwright 的学习曲线几乎为零：agent 产出的就是你会 review 的那种脚本。
+
+## 安装与第一条任务
+
+官方仓库默认分支 `main`，核心体积约 1.5k LoC 量级，后端可接 OpenAI、Anthropic、OpenRouter。也提供 Codex / Claude Code 插件清单，以及 OpenClaw、Hermes Agent 的 skills 目录复用。
+
+```bash
+git clone https://github.com/microsoft/Webwright.git
+cd Webwright
+# 按 README 安装依赖并拉取 Chromium
+python -m pip install -e .
+playwright install chromium
+export OPENAI_API_KEY=sk-...
+```
+
+一条最小任务可以是「打开内部仪表盘并导出 CSV」。agent 会迭代写脚本、执行、读失败日志，直到断言通过。成功后磁盘上会留下完整 Playwright 脚本——这是 Skill Factory 的原料。
+
+```python
+# 概念示例：用 skill_use 复用已入库技能
+# python -m webwright.tools.skill_use \
+#   --task "导出昨日订单 CSV" --library "./library"
+```
+
+## Skill Factory：从一次成功到一类能力
+
+Skill Factory 的核心主张很务实：模型昂贵、脚本便宜。流程大致是：
+
+1. **Solve**：agent 在真实站点上解出任务，产出带断言的脚本。
+2. **Distill**：流水线把硬编码常量抽成参数（日期、店铺 ID、筛选条件）。
+3. **Gate**：在一组 held-out 变体上回归；通过才入库。
+4. **Reuse**：同类任务直接跑技能，官方数据称约 40 秒、零 token。
+
+在 WebArena 相关实验里，复用技能把 held-out 准确率从约 55% 拉到 70%（+15pp）。这不是「提示词更聪明」，而是把不稳定的生成式执行换成了稳定的程序执行。
+
+> **⚠️ 警告** 技能不是永久真理。站点改版、登录态策略变化、验证码升级都会让脚本失效。生产环境要保留「技能失败 → 回退模型重解 → 再蒸馏」的闭环。
+
+## 和坐标基线比，差在哪
+
+微软复现了 GPT-5.4 截图 + xy 坐标基线，Webwright 在各难度分层全面领先。原因可以拆成三条工程直觉：
+
+- **可观测失败**：选择器找不到元素时，错误信息是结构化的；坐标点偏了只有「页面没变化」。
+- **可组合**：已有技能可以嵌进更大脚本，像函数一样调用。
+- **可审计**：安全与合规团队 review 的是代码，不是一串像素热力图。
+
+对开发者这意味着：browser agent 终于能接入你们已有的 code review、CI、feature flag 流程。
+
+## 生产落地的三个坑
+
+**登录与反爬。** 官方 demo 多在可控环境。真实后台常有 SSO、设备指纹、人机验证。先把认证交给你们自己的 session 注入层，再让 agent 操作业务页。
+
+**权限边界。** code-as-action 能力更强，破坏面也更大。给 Playwright 上下文加域名 allowlist、禁止任意 `page.evaluate` 外联，比事后追责便宜。
+
+**技能库治理。** 没有命名规范与所有者，库会迅速变成「能跑但不能信」的垃圾场。建议按业务域分目录，每个技能附最小复现用例与最后验证日期。
+
+## 什么时候不该用 Webwright
+
+一次性探索、强视觉理解（验证码、复杂 Canvas）、或页面几乎没有稳定 DOM 时，坐标或纯视觉方案仍有价值。Webwright 的甜点区是：**DOM 结构化、任务可模板化、重复率高**。
+
+## 小结与下一步
+
+Webwright 证明了一件事：browser agent 的上限不在「更大的多模态模型」，而在「更像软件工程的动作空间」。Skill Factory 则把单次成功折算成可复利的资产。
+
+建议你本周做的最小实验：选一个每周至少做三次的后台操作，用 Webwright 解一次，强制过回归门禁后再让技能接管。若技能连续两周零失败，再扩到下一条流程。
+
+
+## 实战：把「每周导出」变成技能
+
+假设你的运营同学每周一要从同一后台导出三张表。用 Webwright 的推荐路径不是让模型每周重新摸索，而是：
+
+1. 第一次在 staging 环境解题，打开详细日志；
+2. 把成功脚本里的日期、店铺 ID、邮箱抽成参数；
+3. 用上周、上月两套参数跑回归；
+4. 只有回归全绿才允许调度器调用技能。
+
+这样，模型成本集中在「站点改版后的再学习」，而不是「每周重复付费」。团队还可以把技能 diff 送进普通代码评审——这是坐标式 agent 几乎做不到的治理方式。
+
+若回归失败，不要立刻删技能。先对比 DOM 快照与选择器，很多时候只是 class 名哈希变了。保留旧技能为 `skill@v1`，新蒸馏结果为 `skill@v2`，用流量或时间窗切换，避免一夜回滚到纯模型模式。
+
+对安全团队，额外要求两条：技能不得包含明文密码；所有 `page.goto` 目标必须落在公司域名 allowlist。把这两条写进 CI，比写在 wiki 更有效。
+
+
+## 与现有 Playwright 测试仓库共存
+
+很多团队已经有庞大的 Playwright 测试。Webwright 不该另起炉灶，而应把 agent 产出的脚本送进同一套 fixture、同一套报告、同一套 flake 重试策略。技能库目录可以和 `e2e/` 并列，CI 里加一个 job 专跑「技能回归」，与产品功能测试隔离失败原因。
+
+当业务测试挂了，你查产品回归；当技能回归挂了，你查站点改版或选择器漂移。分工清晰后，agent 自动化才不会污染原本稳定的质量信号。对新人 onboarding，也可以先读技能脚本，再读 agent 轨迹——脚本往往更短、更真。
+
+参考：
+
+- [microsoft/Webwright](https://github.com/microsoft/Webwright)
+- [Webwright 文档站](https://microsoft.github.io/Webwright/)
+- Skill Factory PR：[Add Web Skill Factory](https://github.com/microsoft/Webwright/pull/62)
