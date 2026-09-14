@@ -174,3 +174,11 @@ FAQ 中的 `<` 不需要转义（YAML frontmatter 由 YAML 解析器处理，不
 - commit 信息使用中文或英文均可，**禁止**带 AI 标识（如 Co-Authored-By）
 - 写完文章后必须运行 `pnpm run check` 确保类型检查通过
 - `.superpowers/` 和 `docs/superpowers/` 不得提交到 git
+
+## 定时任务
+
+每日 5 篇的写作与发布由 **WorkBuddy 自动化**在每天 **08:00** 自动触发，不再使用 launchd/Qoder/Codex/Grok Bot。
+- 迁移说明与历史沿革见 `scripts/DAILY-TRIGGER.md`
+- `scripts/daily-write.sh` 已停用，**不要**重新挂回 launchd
+- 运行环境：`pnpm` 与 `tvly` 位于 `/usr/local/bin`，执行前需 `export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"`
+- 执行日志写入 `logs/YYYY-MM-DD.log`，完成后生成 `logs/YYYY-MM-DD.done`

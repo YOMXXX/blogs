@@ -23,6 +23,7 @@ logs/
 .idea/
 .DS_Store
 .claude/
+.qoder/
 
 # superpowers (specs / plans / brainstorm — local only, not tracked)
 .superpowers/
