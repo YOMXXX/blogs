@@ -1,0 +1,246 @@
+---
+title: "Herdr 实战：把 Claude Code 与 Codex 塞进同一个可恢复的终端运行时"
+description: "Herdr 是 DHH 做的 agent 终端运行时：持久会话、Agent 状态可见、Agent 之间能互相下发任务。本文给出安装、workspace/pane/agent 原语用法，以及让 Claude 调度 Codex 做 review 的可运行脚本与已知坑。"
+column: "workshop"
+tags: ["Herdr", "Coding-Agent", "Terminal", "Multi-Agent", "Developer-Tools"]
+pubDate: 2026-09-14
+template: "dossier"
+featured: false
+tldr: "Herdr 把 tmux 换成「知道 Agent 是什么的运行时」：后台 Server 持有真实终端，自动识别 working、blocked、done、idle 状态，并通过 CLI 与 socket API 让脚本或另一个 Agent 创建 pane、下发 prompt、读取输出。适合同时跑多个 coding agent 的人，但它不负责跨模型的上下文同步。"
+author: "YOMXXX"
+faq:
+  - q: "Herdr 和 tmux 的本质区别是什么？"
+    a: "tmux 管理的是终端进程，所有 pane 一视同仁；Herdr 知道 pane 里跑的是哪个 Agent，能识别并显示 working、blocked、done、idle 状态，还提供 CLI 与 socket API，让脚本或另一个 Agent 直接操作其他 pane。"
+  - q: "合上笔记本之后正在跑的 Agent 会中断吗？"
+    a: "不会。Herdr 是客户端与后台 Server 分离的架构，终端 UI 只是 Viewer。用 Ctrl+B 再按 Q 做 detach 后 Agent 继续在 Server 里运行，重新执行 herdr 即可恢复全部 pane 输出与状态。"
+  - q: "Herdr 支持哪些 coding agent？"
+    a: "官方示例覆盖 Claude Code、Codex、Cursor、OpenCode、Grok、Hermes、OpenClaw 等。因为 Herdr 管理的是终端本身，只要某个 Agent 能以 CLI 形式在终端里运行，就基本可以接进来。"
+  - q: "可以用脚本或另一个 Agent 来指挥 Herdr 吗？"
+    a: "可以。Herdr 暴露 agent start、agent prompt、agent read、agent wait、agent send-keys 等命令，另有 socket API。一个 Agent 能创建 pane、启动另一个 Agent、下发任务、按状态等待并读回结果，从而组成编码到审查的自动编排。"
+  - q: "Herdr 能解决跨模型的上下文共享问题吗？"
+    a: "不能。官方明确定位为终端与生命周期管理，不包装也不替代任何 Agent。当你在 Codex 与 Claude 之间切换时，各自上下文窗口的碎片化仍然存在，语义层面的状态一致性需要上层工具或你自己解决。"
+---
+
+2026 年 9 月上旬，DHH 在 Lex Fridman 的播客里说了一句很不像客套话的话：他同时跑大约 16 个 coding agent，已经到了自己注意力的上限。而让这件事勉强可控的工具之一，正是他自己参与做的 Herdr。
+
+Herdr 在今年 3 月开源，到 9 月中旬已经积累约 3.3 万 star，Rust 写的单文件二进制，没有 Electron。它不是又一个 AI 编程 Agent，也不是 Claude Code 或 Codex 的替代品。它的定位更朴素也更关键：**它是这些 Agent 所运行的那个终端运行时**。官方把它叫作「知道 Agent 是什么的 tmux」。
+
+这篇文章按实战顺序走一遍：先看清它解决的真实痛点，再装起来，然后用 workspace、pane、agent 三层原语搭出一个可恢复的多 Agent 工作区，最后写一个让 Claude 指挥 Codex 做 code review 的脚本，并说清楚它的边界在哪里。
+
+## 一、痛点不是「窗口太多」，而是「不知道谁卡住了」
+
+同时开五个终端跑 Agent 的人，大概都经历过同一套流程：终端 1 跑 Claude Code 重构 API，终端 2 跑 Codex 写测试，终端 3 跑 Cursor 改前端，终端 4 跑测试命令，终端 5 挂着日志。看上去很高效，实际一天下来你并不是在写代码，而是在玩「打地鼠」——五个 Agent 轮流举手，你挨个切过去处理。
+
+真正麻烦的不是开多少窗口，而是三个具体问题：
+
+1. **状态不可见**：你不知道哪个 Agent 在跑、哪个卡在权限确认、哪个早就完成了但输出被日志淹了。
+2. **会话不可恢复**：合上盖子去吃个饭，SSH 断了，终端断开，Agent 全停，上下文丢了，只能从头再来。
+3. **Agent 之间无法协作**：想让 Codex 给 Claude 写的代码做 review，你得手动复制 diff、手动切 pane、手动粘过去。
+
+tmux 能解决第二点的一半（进程不杀），但解决不了第一点和第三点。因为在 tmux 眼里，所有 pane 都只是一个终端进程——它不知道哪个 pane 跑的是 Claude Code，也没法回答「哪个 Agent 卡住了」。Herdr 的产品假设就是：**Agent 需要的不只是终端复用器，而是一个知道 Agent 语义的运行时**。
+
+## 二、架构：Client 是 Viewer，Server 才是本体
+
+理解 Herdr 的关键在一句话：它是客户端与后台 Server 分离的。
+
+```text
+你的终端 UI（Client / Viewer）
+        │  连上
+        ▼
+Herdr Server（后台常驻，持有真实终端进程）
+        │  管理
+        ▼
+workspace → tab → pane → agent
+```
+
+这个分层直接决定了使用体验：你输入的 `herdr` 只是一个 Viewer，真正保存 Agent 会话的是 Server。所以——
+
+- 关闭终端、断网、合盖、重启机器，Agent 可以继续跑或原样恢复；
+- 重连之后，所有 pane 的输出和状态原样回来；
+- 可以从笔记本连过去看一眼，再从台式机连上去操作；
+- 远程服务器上的 coding agent 终于不用靠 tmux 或 nohup 硬扛。
+
+这点在实践里比看上去重要得多：**它把「Agent Session」从你眼前那个终端窗口里剥离出来了**。
+
+## 三、安装
+
+官方给了几条常见路径，选一条即可。
+
+```bash
+# 通用一键安装（Linux / macOS）
+curl -fsSL https://herdr.dev/install.sh | sh
+
+# macOS 走 Homebrew
+brew install herdr
+
+# mise 用户
+mise use -g herdr
+
+# Windows（PowerShell，官方标注 beta）
+# powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
+```
+
+装完直接在你项目所在目录启动：
+
+```bash
+cd ~/projects/my-api
+herdr
+```
+
+官方建议在「工作真正所在的目录」启动 Herdr，因为启动位置会成为 Workspace 的根。之后在 pane 里直接敲 `claude`、`codex`、`opencode` 就行，Herdr 会自动识别。
+
+## 四、四层原语：workspace、tab、pane、agent
+
+Herdr 的控制面是分层的，理解这四层，后面所有命令都能猜到：
+
+| 层级 | 职责 | 典型命令 |
+|------|------|----------|
+| workspace | 一个项目一个顶层容器 | `herdr workspace list` / `herdr workspace create` |
+| tab | 同一项目内的布局视图 | `herdr tab create`（切换 `Ctrl+B` 然后 `N` / `P`） |
+| pane | 一个真实终端进程 | `herdr pane split --current --direction right` |
+| agent | 被识别的 coding agent | `herdr agent list` / `herdr agent get claude-code` |
+
+session 层级则在 workspace 之上，用于多项目隔离：
+
+```bash
+herdr session list              # 列出所有 session
+herdr session attach work       # 连到名为 work 的 session
+herdr session attach side-project
+herdr server stop               # 结束 session，停止其中所有 Agent
+```
+
+一个典型的工作区可以这样排：
+
+```text
+┌──────────────────────────────┬──────────────────┐
+│ Claude Code  主功能开发       │ Codex  Code Review│
+│ working                      │ blocked           │
+├──────────────────────────────┼──────────────────┤
+│ pytest  自动测试              │ tail -f app.log  │
+│ running                      │ 日志              │
+└──────────────────────────────┴──────────────────┘
+```
+
+## 五、Agent 状态：一眼看出谁卡住了
+
+这是 Herdr 最核心的创新，也是它区别于 tmux 的地方。Herdr 给每个被识别的 Agent 维护一个状态：
+
+| 状态 | 含义 |
+|------|------|
+| working | Agent 正在运行（写代码、搜索、执行命令） |
+| blocked | Agent 停下了，等你确认权限、回答问题或做选择 |
+| done | 完成了，但你还没看过 |
+| idle | 空闲，等待指令 |
+| unknown | 无法确定（注意：unknown 不代表成功） |
+
+它的检测不是简单的「有没有输出」，而是**屏幕内容分析**：先看前台进程是什么（claude、codex、cursor…），再匹配该 Agent 已知的 UI 模式（Manifest），据此推断状态。比如 Claude Code 在等权限确认时屏幕上会出现类似 "Allow? (y/n)" 的提示，Herdr 的 manifest 识别到这个模式，就把状态标成 blocked。
+
+```bash
+herdr agent list                                      # 列出所有 Agent 及状态
+herdr agent get claude-code                           # 某个 Agent 的详情
+herdr agent read claude-code --source recent-unwrapped --lines 120
+```
+
+blocked 状态还可以外接通知（Slack、飞书、钉钉等），这样 Agent 等你确认时你会收到消息，不必一直盯着终端。
+
+## 六、detach：最重要的一个快捷键
+
+很多人第一次用会犯同一个错误：Claude Code 正在跑一个 30 分钟的重构，你想关掉终端，于是 `Ctrl+C`。这在 Herdr 里是错的。
+
+正确做法是 `Ctrl+B`，再按 `Q`——**detach**。相当于告诉 Herdr：我退出 UI，但别动里面的 Agent。
+
+```bash
+# 1) 启动
+herdr
+
+# 2) 在 Claude Code 跑长任务时，按 Ctrl+B 然后 Q 离开
+# 3) Agent 继续在 Server 里工作
+# 4) 稍后重新连接
+herdr
+```
+
+这个语义和 tmux 的 detach 一致，但 Herdr 更进一步：重连之后你立刻能看到所有 Agent 的状态，而不是面对一堆终端输出一个个翻。
+
+## 七、让 Agent 指挥 Agent：一个 Claude → Codex review 环
+
+Herdr 真正把它从「更好看的 tmux」推到「多 Agent 运行时」的，是 CLI 与 socket API。Agent 可以创建 pane、启动另一个 Agent、下发 prompt、按状态等待、读回输出。
+
+```bash
+# 在另一个 pane 启动一个 Agent
+herdr agent start reviewer --kind codex --pane w1:p2
+
+# 给它下发任务，并等到它完成
+herdr agent prompt reviewer "Review the git diff and report actionable findings." --wait --timeout 120000
+
+# 按生命周期状态等待
+herdr agent wait reviewer --until idle --timeout 120000
+
+# 读回输出
+herdr agent read reviewer --source recent-unwrapped --lines 120
+
+# 需要时给它发按键（例如取消）
+herdr agent send-keys reviewer esc
+```
+
+把这些串起来，就是一个不需要人肉复制粘贴的编码 → 审查 → 修复环：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 前提：Claude Code 正在当前 pane 里工作，且刚改完代码
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
+herdr agent start reviewer --kind codex --pane w1:p2
+
+herdr agent prompt reviewer \
+  "Review the current git diff. Report blocking issues first, then nits. Be concise." \
+  --wait --timeout 300000
+
+herdr agent read reviewer --source recent-unwrapped --lines 200 > /tmp/review.txt
+
+# 把 review 结果交回给 Claude 继续修
+herdr agent prompt claude-code \
+  "Read /tmp/review.txt and fix all blocking issues. Do not touch unrelated files." \
+  --wait --timeout 600000
+
+echo "review loop done"
+```
+
+注意几个官方文档明确提醒的细节：
+
+- **`agent_prompt_stalled` 或超时不等于输入没有发出**。重试前先 `herdr agent read` 看状态，否则很容易重复下发。
+- **要区分「按语义等待生命周期状态」和「匹配原始输出」**，前者更稳。
+- 分页器（比如 `git log`）会把 Agent 的 pane 卡住，直到有输入送入——脚本里最好给这类命令加上 `--no-pager` 或 `| cat`。
+
+社区里已经有人在这套能力上叠了自己的层。Samuel Lawrentz 说他每天用 Herdr，并在上面做了 grove：grove 负责跨仓库的 git worktree 与任务，Herdr 负责 pane 与 Agent 状态，二者分工，他因此不必自己写 PTY 处理。Ian Nuttall 则描述了另一种用法：在一台 Mac Mini 上让不同模型并行分工，由 Fable 5.1 担任主编排，Astra high 负责研究与数据，Astra low 负责后端实现，约 12 小时把一个站点从规划推到上线。
+
+## 八、已知坑与能力边界
+
+Herdr 不是银弹，用之前最好知道几件事。
+
+**一、还在早期软件阶段。** Lawrentz 记录过 CLI 在 0.7 到 0.9 之间的变化破坏或吸收了他封装的一部分能力；远端 pane 的输出是异步的；pager 会阻塞 pane。
+
+**二、不解决跨模型的语义一致性。** 这是最根本的边界。一位评论者追问过：用一个 CLI 管理四个不同模型对工作流很好，但当你在 Codex 和 Claude 之间切换时，上下文窗口的碎片化并没有被解决，各模型架构之间的状态一致性怎么办？官方的公开资料只确认它持有终端、不包装也不替代 Agent，并没有提供跨模型语义上下文同步的证据。也就是说——**共享上下文、合议、任务质量，仍然由上层工具或你自己负责**。
+
+**三、状态检测依赖屏幕模式匹配。** 这不是协议级的集成，Agent 换了 UI、改了提示文案，识别就可能失准，落到 unknown。unknown 不代表成功，需要人工确认。
+
+## 九、什么时候该用，什么时候别用
+
+适合用 Herdr 的场景：
+
+- 你同时跑两个以上 coding agent，并且经常忘记谁在等你；
+- 你在远程服务器上跑 Agent，受够了 SSH 断线杀进程；
+- 你想把「编码 → 审查 → 测试 → 修复」做成不靠人肉中转的流程；
+- 你团队里多人各自跑 Agent，希望有一个可 attach 的共享视图。
+
+不适合的场景：
+
+- 你只跑一个 Agent，tmux 或 IDE 内置终端就够了，多一层抽象是负担；
+- 你真正想要的是跨模型上下文共享与多 Agent 协商——那是另一个问题，Herdr 明确不解决；
+- 你的团队依赖 GUI 化的 Agent 面板而没有终端 CLI，那 Herdr 也接不进来。
+
+## 十、一句话总结
+
+Herdr 的价值不在于「更好看的 tmux」，而在于它把三件过去靠人扛的事变成了接口：**终端拓扑、Agent 身份、生命周期状态**。一旦这三样变成稳定接口，第三方工具和 Agent 本身就能在其上编排任务，你也不必再为「哪个 Agent 卡住了」这件事消耗注意力。
+
+先从一个 Workspace、两个 pane 开始：左边 Claude Code，右边 Codex。把上面那段 review 脚本跑通一次，你就知道它和 tmux 的差别在哪了。

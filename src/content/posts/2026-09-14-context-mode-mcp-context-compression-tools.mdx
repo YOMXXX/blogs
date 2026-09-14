@@ -1,0 +1,125 @@
+---
+title: "Context Mode 速评：把 MCP 工具输出赶出上下文窗口"
+description: "Context Mode 用沙箱把工具输出挡在上下文窗口之外，官方口径是 315KB 压到 5.4KB。本文说清它的机制、11 个 MCP 工具、支持平台，以及与 RTK、Headroom、stacklit 的分工和 ELv2 许可带来的风险。"
+column: "tools"
+tags: ["Context-Mode", "MCP", "Coding-Agent", "Context-Engineering", "Developer-Tools"]
+pubDate: 2026-09-14
+template: "digest"
+featured: false
+tldr: "Context Mode 是一个 MCP 服务器加编辑器钩子：让工具在沙箱子进程里跑，只把 stdout 放回对话，完整输出索引进本地 SQLite FTS5 供后续检索。收益是约 98% 的上下文节省和更长的会话寿命；代价是引入一个源可用、且计划商业化的核心中间层。"
+author: "YOMXXX"
+faq:
+  - q: "Context Mode 解决的是哪一半上下文问题？"
+    a: "它解决输出侧。工具定义的体积（输入侧）会占满窗口，Cloudflare 的 Code Mode 那类方案打的是这一头。Context Mode 打的是另一头：每次工具调用的原始输出被逐轮带进对话，Playwright 快照、日志、issue 列表很快就吃掉大量窗口。"
+  - q: "它怎么做到 98% 的压缩？"
+    a: "不压缩内容，而是改变数据去向。ctx_execute 会启动隔离子进程跑脚本，只把 stdout 放回对话，完整输出被索引进本地 SQLite 并可用 FTS5 与 BM25 检索。官方例子是 47 次文件读取约 700KB，换成一次沙箱执行后只剩 3.6KB。"
+  - q: "会话被 compact 之后历史会丢吗？"
+    a: "这是它的第二个卖点。每次文件编辑、git 操作、任务、错误与用户决策都被记进 SQLite；对话压缩丢弃原始历史后，索引仍在，后续用 BM25 只捞回相关片段，而不是把整段历史重新塞回上下文。"
+  - q: "它和 RTK、Headroom、stacklit 是什么关系？"
+    a: "互补而非竞争。RTK 作用在 shell 命令输出层，Headroom 作用在结构化数据与 API 响应层，Context Mode 作用在 MCP 工具边界并额外提供会话持久化，stacklit 则在会话开始前用仓库结构索引替代探索式读取。"
+  - q: "有什么需要留意的风险？"
+    a: "许可是首要问题：项目以 ELv2 源可用许可发布，官方也说明有商业化 SaaS 计划，早期还从 MIT 换过许可。对许可敏感的企业需要先确认合规。此外它要求 Node 22.5 以上，并需要适配器才能覆盖各平台的自动路由。"
+---
+
+Context Mode 是最近一周 GitHub 上最活跃的编码 Agent 工具之一：截至 2026 年 9 月 13 日，仓库约 **22,477 star**，本周新增近 **1,936**，最后一次提交就在 9 月 13 日。它今年 2 月 23 日才创建，2 月曾冲到 Hacker News 第一（约 570 分）。
+
+它自称是「上下文问题的另一半」。这句话值得拆开看，因为它精准地定义了产品边界。
+
+## 上下文窗口的两个漏斗
+
+MCP 生态消耗上下文有两条路径。
+
+**入口侧：工具定义。** 你把 81 个以上的工具挂上去，光工具定义的 schema 就可能占掉约 **143K token**——在 200K 窗口里已经是 72%。你还没说第一句话，窗口就没了七成。Cloudflare 的 Code Mode 这类方案打的是这一头。
+
+**出口侧：工具输出。** 每一次 `gh issue list`、每一个日志文件、每一张浏览器快照，都会原样落进对话，并且从此**逐轮被带着走**。一个 Playwright 快照约 56KB，二十个 GitHub issue 约 59KB。半小时下来，四成窗口就没了。
+
+Context Mode 的定位很明确：**它只打出口侧**。产品假设是——LLM 应该去「编程」分析过程，而不是亲自读原始数据。
+
+## 机制：Think in Code 与沙箱
+
+核心动作只有一句：**原始数据不进上下文，只进 stdout。**
+
+```javascript
+// 反面：47 次 Read()，约 700KB 进入上下文
+// 正面：1 次 ctx_execute()，只有 3.6KB 回来
+ctx_execute("javascript", `
+  const files = fs.readdirSync('src').filter(f => f.endsWith('.ts'));
+  files.forEach(f => console.log(
+    f + ': ' + fs.readFileSync('src/'+f,'utf8').split('\\n').length + ' lines'
+  ));
+`);
+```
+
+每个 `ctx_execute` 调用会拉起一个隔离子进程：脚本在沙箱里跑，stdout 被捕获，**只有 stdout 进入对话**，完整输出被索引进本地 SQLite 数据库，模型之后可以用关键词检索回来。
+
+几个工程细节值得单独记：
+
+- **认证类 CLI 能正常用。** `gh`、`aws`、`gcloud`、`kubectl`、`docker` 会继承环境变量与配置路径，所以 token 不出现在对话里也能执行。
+- **超过 5KB 且带了 intent 时，只回传匹配片段**，并附带一组可继续检索的词表。没有信息被丢弃，只是换了个地方放。
+- **无 LLM 调用、无遥测。** 检索是纯本地的 BM25 加 Porter 词干与三元组搜索，不额外烧 token。
+- **沙箱运行时支持 12 种**：JavaScript、TypeScript、Python、Shell、Ruby、Go、Rust、PHP、Perl、R、Elixir、C#。JS/TS 会自动检测 Bun（快 3 到 5 倍），否则要求 Node 22.5 以上。
+
+官方给出的综合口径是：一个会话里 315KB 原始输出变成 5.4KB，约 **98% 的上下文缩减**；过去大约 30 分钟就要压缩一次的会话，可以跑到约 3 小时。
+
+## 第二个卖点：compact 之后还记得住
+
+这点比压缩更重要，也更容易被忽略。
+
+`/compact` 会把原始对话历史丢掉。丢完之后，模型就忘了它在改哪些文件、当前任务是什么、你最后让它做什么。Context Mode 的解法是**持久化索引**：每一次文件编辑、git 操作、任务、错误、用户决策都记进 SQLite（FTS5 全文索引）。对话压缩之后索引还在，后续用 BM25 排序只捞回相关片段，而不是把整段历史重新灌回去。
+
+顺带一个细节：如果不带 `--continue`，上一次会话的数据会立即删除。这算是个合理但需要留意的行为。
+
+## 一个刻意的克制：不教模型怎么说话
+
+Context Mode 有一个设计决定值得单独说，因为它和很多同类工具相反：**它不强制文风。**
+
+很多上下文工具会顺手加上「回答要简短」这类系统提示。Context Mode 明确不做，并引用 Moonshot AI 的一项发现作为理由：激进的简洁提示会损害编程与推理基准表现（在 kimi-k2.5 上观察到）。它的路由只管数据去哪儿，不管模型怎么写最终答案——文风交给你的 `CLAUDE.md` 或 `AGENTS.md`。
+
+## 支持平台与安装
+
+官方覆盖约 **17 个平台**。分两类处理：
+
+- **有钩子能力的平台**（Claude Code 最佳）：安装插件市场条目后自动注册钩子，接入 `SessionStart`、`PreToolUse`、`PostToolUse`、`UserPromptSubmit`、`PreCompact`、`Stop` 六个时机，自动路由基本无需配置。
+- **无钩子平台**：需要拷贝一次路由文件。
+
+```bash
+# Claude Code：插件方式（体验最完整，11 个 MCP 工具自动注册）
+# /plugin marketplace add mksglu/context-mode
+# /plugin install context-mode@context-mode
+# 重启后用 /context-mode:ctx-doctor 验证
+
+# 只想先试一下：MCP-only 安装（有 11 个工具，但没有自动路由）
+claude mcp add context-mode -- npx -y context-mode
+```
+
+其余平台包括 Cursor、Codex CLI、Gemini CLI、VS Code 与 JetBrains 的 Copilot、GitHub Copilot CLI、OpenCode、Kiro、Zed、Pi、OpenClaw 等。Gemini CLI 走单配置文件并自带钩子。
+
+工具集是 11 个：6 个沙箱类（`ctx_execute`、`ctx_batch_execute`、`ctx_execute_file`、`ctx_index`、`ctx_search`、`ctx_fetch_and_index`），5 个元操作类（`ctx_stats`、`ctx_doctor`、`ctx_upgrade`、`ctx_purge`、`ctx_insight`）。`ctx_stats` 可以看上下文节省统计，Claude Code 下还能加一个状态栏，实时显示本次与跨会话省下的费用。
+
+## 横向定位：它站在会话生命周期的哪个位置
+
+把它和同类工具放在一条时间线上，边界立刻清楚：
+
+| 工具 | 拦截位置 | 解决什么 |
+|------|---------|---------|
+| stacklit | 会话开始前 | 用仓库结构索引（约 250 token）替代探索式读取（5 万 token 以上） |
+| Cloudflare Code Mode | MCP 工具定义层 | 输入侧的 schema 体积 |
+| RTK | shell 命令输出层 | CLI 输出 |
+| Headroom | 结构化数据与 API 响应层 | 大块结构化返回 |
+| **Context Mode** | **MCP 工具边界 + 会话索引** | 输出侧 + compact 后的记忆 |
+
+还有一类思路不同的方案：Caveman 压缩的是模型自己的输出风格，codebase-memory-mcp 用代码图谱替代文件读取。**这些不是互相替代的关系**——一个人完全可以同时用 stacklit 减少探索开销、用 Context Mode 挡住工具输出。
+
+## 需要留意的三点
+
+**一、许可。** 这是最该先确认的事。项目当前以 **ELv2（Elastic License 2.0）** 发布，属于源可用而非开源；官方也说明有商业化 SaaS 计划，并且早期从 MIT 换成了现在的许可。对许可敏感的企业，建议先走合规流程再决定是否把核心中间层交给它。
+
+**二、版本状态。** 最新带 tag 的 npm 版本是 `context-mode` v1.0.169（2026 年 6 月 29 日），而 main 分支已经领先不少。也就是说，你要么用较旧的 tag，要么跟着 main 走——后者意味着承担未发布变更的风险。
+
+**三、采用度数据属自述。** 官方口径提到已有 18 家大公司团队在用（含微软、谷歌、Meta、亚马逊、英伟达）。这类数字来自项目方，值得当作参考而非审计结论。
+
+## 一句话结论
+
+Context Mode 值得试，但你要清楚自己买的是什么：**它不提升模型能力，它改变数据流向**。如果你的编码 Agent 经常在半小时后开始「失忆」，或者 MCP 工具输出天天把窗口吃干，那它带来的收益是实打实的；如果官方许可条款与你的合规要求冲突，那它再省 token 也不该进生产。
+
+建议的试用路径很小：先做一次 MCP-only 安装，拿 `ctx-stats` 看你自己的真实节省比例，再决定是否上完整插件。
