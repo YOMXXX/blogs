@@ -9,7 +9,8 @@ set -euo pipefail
 SITE="https://yomxxx.com"
 SITEMAP_URL="$SITE/sitemap-0.xml"
 KEY_FILE="public/indexnow-key.txt"
-PROJECT_DIR="/Users/liguanchen/Desktop/blogs"
+# 从脚本位置推导项目根目录，避免硬编码路径（云端/其他机器亦可直接运行）
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$PROJECT_DIR"
 

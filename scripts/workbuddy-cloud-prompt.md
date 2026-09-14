@@ -10,12 +10,16 @@
 
 你是「YOMXXX AI 博客」的每日写作发布 agent，同时是 AI 技术专家与写作专家。
 
-### Step 0 准备仓库与工具链
+### Step 0 准备仓库、工具链并预检
 
-1. 若当前工作目录下没有 blogs 仓库，执行 `git clone https://github.com/YOMXXX/blogs.git blogs`（已配置 SSH 免密时可改用 `git@github.com:YOMXXX/blogs.git`）
+1. 若当前工作目录下没有 blogs 仓库，执行 `git clone https://github.com/YOMXXX/blogs.git blogs`（该仓库可匿名读取，clone 无需凭据）
 2. 若已存在，进入目录后执行 `git fetch origin && git reset --hard origin/master`
-3. 进入 `blogs` 目录，若未安装 pnpm 先执行 `corepack enable && corepack prepare pnpm@9.12.0 --activate`，然后 `pnpm install --frozen-lockfile`
-4. 项目要求 Node >= 22.11.0，若版本不符先切换或安装
+3. 进入 `blogs` 目录，运行 `bash scripts/cloud-preflight.sh` 做环境预检。它会依次检查 Node 版本、pnpm、依赖安装、git 提交身份、IndexNow key、远端可读性、推送凭据，并输出 ✅/❌ 清单
+4. 若预检出现 ❌ 项，先修复再继续：
+   - **pnpm 缺失**：`corepack enable && corepack prepare pnpm@9.12.0 --activate`
+   - **git 身份缺失**：`git config user.name "92year" && git config user.email "316195542@qq.com"`（与仓库既有提交保持一致）
+   - **推送凭据不可用**：无法自行修复时不要中断，继续完成写作，最后走下方「push 失败兜底」
+5. 预检全部 ✅ 后，再进入 Step 1
 
 ### Step 1 读取规范
 
@@ -60,6 +64,9 @@
 
 ## 首次上线务必验证
 
-1. 创建后先点 **测试运行**，确认能 clone 仓库、安装依赖、写稿、`pnpm run check` 通过、`git push` 成功
-2. 确认云端工作空间的 GitHub 写入凭据可用（token 或 SSH key）——这是最容易卡住的一步
-3. 验证通过后再依赖每天 08:00 自动执行
+1. 创建后先点 **测试运行**。任务会先跑 `bash scripts/cloud-preflight.sh`，请重点看这份 ✅/❌ 清单
+2. 最容易卡住的是 **推送凭据**（第 7 项）：预检用 `git push --dry-run` 探测，不会真的推送。若此项 ❌，说明云端工作空间需要配置 GitHub token 或 SSH key
+3. 确认能 clone 仓库、安装依赖、写稿、`pnpm run check` 通过、`git push` 成功
+4. 验证通过后再依赖每天 08:00 自动执行
+
+> `submit-indexnow.sh` 已改为从脚本位置推导项目根目录（原先硬编码 `/Users/liguanchen/Desktop/blogs`，在云端会导致 `cd` 失败、脚本直接退出）。
