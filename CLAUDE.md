@@ -177,8 +177,10 @@ FAQ 中的 `<` 不需要转义（YAML frontmatter 由 YAML 解析器处理，不
 
 ## 定时任务
 
-每日 5 篇的写作与发布由 **WorkBuddy 云端自动化**在每天 **08:00（Asia/Shanghai）** 自动触发，已不再使用 launchd / Qoder / Codex / Grok Bot。
-- 提示词与创建步骤见 `scripts/workbuddy-cloud-prompt.md` 与 `scripts/DAILY-TRIGGER.md`
-- 任务在 **云端工作** 模式下创建，运行于云端工作空间：自行 clone `YOMXXX/blogs` → `pnpm install` → 写稿 → `pnpm run check` → `git push master`
-- 云端工作空间需保证 `pnpm@9.12.0` 可用（`corepack enable`）与 Node >= 22.11.0
-- `scripts/daily-write.sh` 已停用，**不要**重新挂回 launchd；本机不再承载该定时任务
+每日 5 篇的写作与发布由 **WorkBuddy 本机自动化**在每天 **08:00（Asia/Shanghai）** 自动触发，已不再使用 launchd / Qoder / Codex / Grok Bot。
+- 自动化 ID：`cda81023-d270-4fae-bac4-eba9515df7bf`；工作目录即本仓库根目录
+- 提示词正文见 `scripts/workbuddy-prompt.md`；触发方式与历史沿革见 `scripts/DAILY-TRIGGER.md`
+- 执行前先跑 `bash scripts/preflight.sh`：7 项环境预检（Node / pnpm / 依赖 / git 身份 / IndexNow key / 远端可读 / 推送凭据）
+- **前提**：08:00 时 Mac 已唤醒且 WorkBuddy 客户端在运行
+- `pnpm`、`tvly` 位于 `/usr/local/bin`，命令前需 `export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"`
+- `scripts/daily-write.sh` 已停用，**不要**重新挂回 launchd
