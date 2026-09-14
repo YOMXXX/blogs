@@ -26,20 +26,36 @@ fi
 KEY=$(cat "$KEY_FILE" | tr -d '[:space:]')
 
 # ===== 获取 URL 列表 =====
+# 注意：Cloudflare Pages 部署完成前，线上 sitemap 不含当天文章。
+# 这里刻意容忍「无匹配」与「curl 失败」，避免 grep/curl 的非零退出码
+# 在 set -euo pipefail 下让脚本静默退出（无任何输出、退出码 1）。
+SITEMAP_XML=$(curl -s --max-time 30 "$SITEMAP_URL" || true)
+ALL_URLS=$(printf '%s' "$SITEMAP_XML" | sed 's/</\n</g' | sed -n 's/.*<loc>\([^<]*\).*/\1/p' || true)
+
 if [ "${1:-}" = "--new" ]; then
   DATE=$(date +%Y-%m-%d)
-  URLS=$(curl -s "$SITEMAP_URL" | sed 's/</\n</g' | sed -n 's/.*<loc>\([^<]*\).*/\1/p' | grep "$DATE")
+  URLS=$(printf '%s\n' "$ALL_URLS" | grep "$DATE" || true)
   echo "仅提交今天 ($DATE) 的新文章"
 else
-  URLS=$(curl -s "$SITEMAP_URL" | sed 's/</\n</g' | sed -n 's/.*<loc>\([^<]*\).*/\1/p')
+  URLS="$ALL_URLS"
   echo "提交 sitemap 中所有 URL"
 fi
 
-URL_COUNT=$(echo "$URLS" | wc -l | tr -d ' ')
+if [ -z "$URLS" ]; then
+  URL_COUNT=0
+else
+  URL_COUNT=$(printf '%s\n' "$URLS" | wc -l | tr -d ' ')
+fi
 echo "共 $URL_COUNT 个 URL"
 
 if [ "$URL_COUNT" -eq 0 ]; then
   echo "没有 URL 需要提交"
+  if [ "${1:-}" = "--new" ]; then
+    echo "提示：线上 sitemap 中还没有当天文章，通常是 Cloudflare Pages 仍在部署"
+    echo "      （push 后约需 1-3 分钟）。稍后重跑本脚本即可。"
+    echo "      可用此命令确认部署是否完成："
+    echo "      curl -s $SITEMAP_URL | grep -o '<loc>.*$DATE[^<]*</loc>'"
+  fi
   exit 0
 fi
 
