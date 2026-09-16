@@ -63,7 +63,7 @@ if command -v pnpm >/dev/null 2>&1; then
   fi
   if ASTRO_V=$(pnpm exec astro --version 2>/dev/null \
         | sed -n 's/.*v\([0-9][0-9.]*\).*/\1/p' | head -1) && [ -n "$ASTRO_V" ]; then
-    ok "依赖就绪（astro $ASTRO_V）"
+    ok "依赖就绪（astro ${ASTRO_V}）"
   else
     bad "依赖不可用，请执行 pnpm install --frozen-lockfile，日志见 /tmp/preflight-install.log"
   fi
@@ -104,7 +104,7 @@ fi
 echo "[7/7] 推送凭据（git push --dry-run）"
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo master)
 if git push --dry-run origin "$BRANCH" >/dev/null 2>&1; then
-  ok "推送凭据可用（$BRANCH）"
+  ok "推送凭据可用（${BRANCH}）"
 else
   bad "推送凭据不可用！请检查 git 凭据（SSH key 或 token），
      否则文章写完无法 push，只能走人工补推兜底"
