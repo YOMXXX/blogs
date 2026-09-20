@@ -1,0 +1,216 @@
+---
+title: "实战工坊：用 Stagehand v4 写一个会自己找选择器、自己修表单的浏览器 Agent"
+description: "Playwright 是给测试写的，Stagehand 是给 Agent 写的。v4 把 observe、act、extract 三件套，本地持久化登录，WebMCP 页面工具钩子和三语言 SDK 串成一条流水线。本文用可直接运行的代码走完「登录—操作—提数据」，并讲清自愈选择器与凭据不进模型的边界。"
+column: "workshop"
+tags: ["Stagehand", "BrowserAgent", "WebMCP", "Playwright", "Automation"]
+pubDate: 2026-09-20
+template: "digest"
+featured: false
+tldr: "浏览器自动化的老问题是：选择器写给测试用的，页面一改版就全废，而 Agent 恰恰最怕脆弱的定位。Stagehand v4 的解法是把「定位」交给 observe、把「执行」交给可自愈的 act、把「拿数据」交给 schema 约束的 extract，三件套共用一套模型。v4 还做了两件更关键的事：本地 profile 让登录态跨进程留存，WebMCP 把页面自身暴露的工具注册进一张页面级共享表，避免重复订阅与重复事件。"
+author: "YOMXXX"
+faq:
+  - q: "Stagehand 和 Playwright 是什么关系，是替代还是封装？"
+    a: "定位上是替代关系，能力上是互补关系。Playwright 的核心假设是「选择器由人写死、断言确定」，这套设计在回归测试里无可替场，但用在 Agent 上就立刻暴露问题：站点改版一次，脚本全废。Stagehand 把「找到元素」这件事从编译期推迟到运行期，交给模型在真实 DOM 上推理，再把结果转成 Playwright 式的真实选择器去执行。所以底层仍然跑浏览器与协议，只是定位这一层被替换掉了，你可以把它理解成「把 Playwright 的定位层换成模型，其余照旧」。"
+  - q: "为什么说 observe 返回真实选择器对安全很重要？"
+    a: "因为账号密码这类敏感值根本不需要经过模型。传统做法是把用户名密码填进提示词，让模型去决定点哪个按钮、填哪个框，凭据就跟着上下文一起进了第三方推理服务。Stagehand 的 observe 只负责回答「邮箱输入框在哪」，返回的是选择器字符串，填写动作由你本地代码用选择器完成。也就是说模型看到的是页面结构，看不到值。这是一个很实用的边界设计，把「模型能力」和「秘密数据」在架构上就分开了。"
+  - q: "WebMCP 把页面工具注册进共享表解决了什么问题？"
+    a: "解决重复订阅导致的事件风暴。启用 WebMCP 域后，Chrome 会对页面上已经存在的工具重复派发新增事件，而每次调用读取工具列表又会再触发一轮，形成「读一次、响一次」的循环。v4 把工具发现从每次调用搬到了页面自己持有的共享注册表里，读取时直接查表，不再重复启用协议域。同时它跨主框架、子框架乃至进程外 iframe 跟踪工具，并在文档跳转或框架分离时派发移除事件，让工具生命周期和页面生命周期对齐。"
+  - q: "本地持久化登录态要注意什么？"
+    a: "三点。第一，浏览器数据目录里存的是明文会话凭据，必须写进版本控制忽略文件，绝对不要提交，也不要把这个目录放在会被同步的网盘路径下。第二，它只和当前机器绑定，CI 环境里每次都是干净目录，所以不要在流水线里假设「上次已经登录过」，要准备好走完整的登录流程或用注入的会话。第三，长期运行的机器上这个目录会持续膨胀，缓存、快照、本地存储都会累积，需要定期清理，否则第一次冷启动会明显变慢。"
+  - q: "act 的「自愈」是不是意味着可以完全不管页面变化？"
+    a: "不是。自愈指的是当站点调整了表单结构、按钮文案或层级时，act 会重新推理一次并选出新的可用定位，而不是继续用失效的旧选择器。它能吸收的是外观级、结构级的漂移，吸收不了语义级的改变：如果登录流程从两步变成三步、或者多出一个短信验证环节，模型不会凭空知道该多做什么，只会如实失败。所以工程上正确的姿势是允许它自愈，同时给每个关键步骤加断言和兜底分支，把失败变成可观测事件而不是静默错填。"
+---
+
+在浏览器自动化这件事上，很多团队都有一个说不出口的体验：脚本写完能跑，但**跑着跑着就废了**。不是逻辑错了，而是页面上多包了一层 div、按钮从「提交」改成「确认提交」，选择器就全断。对于需要长期运行的 Agent 来说，这是致命的——你没法为每一条轨迹预先写好选择器，因为你根本不知道它下一步要点哪里。
+
+## 一、把「定位」从编译期推到运行期
+
+Playwright 的设计起点是**回归测试**：选择器由工程师写死，断言必须确定，同样的输入必须得到同样的输出。这套假设在测试场景里非常正确，但搬到 Agent 场景就立刻错位——Agent 面对的是「用自然语言描述一个意图，然后在真实网页上把它实现」。
+
+Stagehand 在 README 里把这件事说得很直白：**Playwright was built for testing. Stagehand is built for agents.** 它没有推翻浏览器协议那一层，而是把定位（locating）这一层换成了模型推理，并保留「最终落到真实选择器上执行」的确定性。定位是模糊的、执行是精确的，这个分工是整套设计的关键。
+
+## 二、三件套：observe / act / extract
+
+Stagehand 把浏览器 Agent 要做的事收敛成三个动词：
+
+- `observe(指令)`：在指令描述下，返回页面上**真正存在的、可交互的元素**及其选择器，不做任何执行；
+- `act(指令)`：执行一步操作，页面结构变化时能重新推理并自愈；
+- `extract(指令, schema)`：按给定的 schema 抽取结构化数据，返回值经过校验。
+
+下面这段 TypeScript 是从官方示例整理出来的完整闭环，可以直接作为模板改造。注意它用真实站点做示例，你可以替换成自己业务里的后台地址：
+
+```typescript
+import { localBrowser, Stagehand } from "@browserbasehq/stagehand";
+import { z } from "zod/v4";
+
+// userDataDir 里会持久化 cookie，第二次运行就是已登录状态
+const browser = await localBrowser.launch({ userDataDir: "./browser-data" });
+
+const stagehand = await Stagehand.create({
+  browser,
+  model: { modelName: "openai/gpt-5.4-mini", apiKey: process.env.OPENAI_API_KEY },
+});
+
+const [page] = await browser.context.pages();
+await page.goto("https://dashboard.stripe.com/login");
+
+// observe 只返回选择器：账号密码永远不会进入模型上下文
+const { data: email } = await stagehand.observe("find the email input");
+const { data: password } = await stagehand.observe("find the password input");
+
+await page.locator(email[0].selector).fill(process.env.APP_EMAIL!);
+await page.locator(password[0].selector).fill(process.env.APP_PASSWORD!);
+
+// act 会在站点改版后重新定位，而不是硬用旧选择器
+await stagehand.act("click the sign in button");
+await stagehand.act("open the billing page");
+
+// extract 返回经过 schema 校验的数据，而不是一段需要再解析的文本
+const { data } = await stagehand.extract(
+  "extract every invoice in the table",
+  z.object({
+    invoices: z.array(
+      z.object({ number: z.string(), amount: z.number(), paid: z.boolean() })
+    ),
+  })
+);
+
+console.log(data.invoices);
+
+await stagehand.close();
+await browser.close();
+```
+
+> **💡 这里最值得抄走的一行不是 extract，而是 observe**
+>
+> `observe` 返回的是选择器字符串，不是「帮你填好」的结果。这个细节把模型能力和你的秘密数据在架构层面隔开了：模型负责看页面结构，你的进程负责持有并填值。很多自动化方案为了省一次调用，直接把凭据塞进提示词，代价是把密码交给了第三方推理服务。
+
+## 三、登录一次，之后都别再登
+
+`localBrowser.launch({ userDataDir: "./browser-data" })` 是这套方案里性价比最高的一行。浏览器把 cookie、localStorage、IndexedDB 都写进这个目录，下一次启动就是已登录状态。对需要每天跑一次的 Agent 来说，这直接省掉了「登录」这个最容易失败的环节——验证码、二次验证、风控挑战，全都绕开了。
+
+Python 版本的结构完全一致，迁移成本几乎为零：
+
+```python
+import asyncio, os
+from pydantic import BaseModel
+from stagehand import Stagehand, local_browser
+
+class Invoice(BaseModel):
+    number: str
+    amount: float
+    paid: bool
+
+class Invoices(BaseModel):
+    invoices: list[Invoice]
+
+async def main() -> None:
+    browser = await local_browser.launch(user_data_dir="./browser-data")
+    try:
+        stagehand = await Stagehand.create(
+            browser=browser,
+            model="openai/gpt-5.4-mini",
+            model_api_key=os.environ["OPENAI_API_KEY"],
+        )
+        try:
+            page = (await browser.context.pages())[0]
+            await page.goto("https://dashboard.stripe.com/login")
+
+            email = await stagehand.observe("find the email input")
+            password = await stagehand.observe("find the password input")
+            await page.locator(email.data[0].selector).fill(os.environ["APP_EMAIL"])
+            await page.locator(password.data[0].selector).fill(os.environ["APP_PASSWORD"])
+
+            await stagehand.act("click the sign in button")
+            result = await stagehand.extract("extract every invoice", Invoices)
+            print(result.data.invoices)
+        finally:
+            await stagehand.close()
+    finally:
+        await browser.close()
+
+asyncio.run(main())
+```
+
+> **⚠️ 把 `browser-data` 加进忽略文件，现在就加**
+>
+> 这个目录里是明文的会话凭据。它一旦被提交，等于把登录态发到了仓库历史里，删文件也清不干净。
+
+## 四、WebMCP：让页面自己把工具交出来
+
+v4 里最有未来感的一块是 WebMCP。Chrome DevTools Protocol 提供了一个 `WebMCP` 域，页面可以主动把自身能力声明成可调用的工具。Agent 不再只能「猜按钮」，而是能拿到一份页面自己给的接口清单。
+
+但直接用它踩过一个很实际的坑：启用该协议域后，Chrome 会对**已经存在**的工具重复派发新增事件，而每次调用读取工具列表又会再触发一轮，形成「读一次、响一次」的循环。v4 的解法是把工具发现搬进一张**页面自己持有的共享注册表**：
+
+- `page.tools()` 直接查表，不再重复启用 WebMCP；
+- 跨主框架、子框架甚至进程外 iframe 跟踪工具；
+- 文档跳转或框架分离时派发移除事件，让工具生命周期跟随页面；
+- 工具跟踪独立于订阅存在，页面或客户端销毁时统一清理。
+
+```typescript
+// 只订阅未来的增量变化，不含页面已经存在的工具
+page.onToolsAdded((tool) => {
+  console.log("tool available:", tool);
+});
+
+page.onToolsRemoved((identity) => {
+  console.log("tool gone:", identity);
+});
+
+// 从共享注册表读取当前全部工具，不重复启用协议域
+const tools = await page.tools();
+```
+
+这里有个容易忽略的设计点：**通用订阅只接受 console 类事件，工具事件名会被拒绝**。如果你需要原始协议层的自由度，得走专门的事件通道。这种「把强类型接口和裸协议通道分开」的做法，在浏览器自动化里是必要的，因为页面事件实在太多，全都塞进一个回调会让错误难以归因。
+
+## 五、三语言 SDK 对齐：别小看「等 CDP 就绪」
+
+v4 把 TypeScript、Python、Go 三套 SDK 建立在同一份协议核心上。跨语言对齐听起来是工程细节，实际影响的是**故障归因**——同一段逻辑在三种语言里行为不同，是最难排查的一类问题。
+
+举一个真实修过的案例。浏览器进程启动后，Python SDK 以前是「spawn 完立刻返回」，而 TypeScript 和 Go 会**等 CDP 端点真正可用**：必须成功响应版本查询，并且返回的调试地址非空，才算启动成功。差异在于 Python 返回时浏览器可能还没准备好，后续第一个操作会随机失败。现在三套 SDK 统一成等待就绪，并竞态处理进程退出与取消信号。
+
+另一个对齐项是端口占用检查：在创建配置文件或启动进程**之前**先检查回环端口是否可用。如果显式指定的端口被占用，返回一个语义明确的错误，而不是接管一个已经存在的浏览器实例——后者会让两个 Agent 抢同一个窗口，行为完全不可预测。
+
+这些改动由一个共享测试夹具统一验证，覆盖默认启动参数、参数顺序、初始空白页、视口尺寸和配置归属权。如果你在多语言栈里维护自动化能力，建议照抄这个思路：**先用契约测试把语言间差异钉死，再去写业务**。
+
+## 六、评估：把「能跑」变成「可测量」
+
+Agent 最大的工程风险是**看起来在工作**。Stagehand 内置了一套评估框架，两个设计值得借鉴：
+
+- **追踪接收器可配置**：可以走原生通道，也可以走 OpenTelemetry，再转发到 Braintrust 或 LangSmith。配置可以持久化到本地，环境变量优先级更高，方便在 CI 里覆盖；
+- **自带基准集**：HardBench 提供 102 个任务，其中 38 个核心任务、64 个扩展任务。核心集用于快速回归，扩展集用于发布前的完整验证。
+
+```bash
+# 把追踪指向 Braintrust 项目
+evals config tracing set braintrustProject my-proj
+
+# 传输层切换到 OpenTelemetry，便于接入已有可观测体系
+evals config tracing set transport otel
+
+# 恢复默认
+evals config tracing reset
+```
+
+## 七、到底该用哪一个
+
+| 维度 | Playwright | Stagehand |
+|------|-----------|-----------|
+| 核心假设 | 选择器由人维护，行为确定 | 意图由自然语言表达，定位动态求解 |
+| 页面改版 | 选择器失效，需人工修 | 重新推理定位，可自愈 |
+| 数据获取 | 手写解析，格式自担 | 按 schema 抽取并校验 |
+| 凭据处理 | 与选择器无关，天然安全 | observe 只给选择器，同样不进模型 |
+| 适合场景 | 回归测试、固定流程 | 探索性任务、多变站点、长期无人值守 |
+| 成本结构 | 零模型调用 | 每次定位都有模型开销 |
+
+结论不是二选一。**稳定的核心路径用硬编码选择器，易变的边界路径交给模型定位**，这是成本与鲁棒性之间最实际的切法。
+
+## 八、落地清单
+
+1. 敏感值只在本进程流转，提示词里只出现结构描述；
+2. `browser-data` 进忽略文件，并定期清理防止冷启动变慢；
+3. 每个关键步骤加断言与兜底分支，把自愈当作降级而不是保证；
+4. 需要旧行为就锁在 v3 分支上，v4 是协议优先的重构，包结构变化较大；
+5. CI 里第一次冷启动明显更慢，超时阈值要留足；
+6. 用追踪把失败轨迹落盘，否则「偶发失败」永远定位不到。
+
+浏览器 Agent 的价值不在于它替代了测试框架，而在于它把「定位」这个最容易腐烂的部分从静态变成了动态。理解了这一点，上面所有 API 的取舍都会变得顺理成章。
