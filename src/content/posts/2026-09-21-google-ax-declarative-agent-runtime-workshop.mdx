@@ -1,0 +1,137 @@
+---
+title: "实战工坊：用 Google AX 把 Agent 跑成集群工作负载，四个声明式原语上手"
+description: "Agent 既不是无状态微服务，也不是跑完即走的批处理任务。Google 开源的 AX 用 Task、Workspace、Gateway、Model 四个原语把沙箱、工作区、出口网络与模型配置收敛进一份 YAML。本文从装 CLI、部署控制面到 apply、watch、ssh、suspend、resume 走完全流程。"
+column: "workshop"
+tags: ["Google AX", "AgentInfra", "Sandbox", "Kubernetes", "AgentRuntime"]
+pubDate: 2026-09-21
+template: "digest"
+featured: false
+tldr: "Agent 在工程上一直很尴尬：它会累积状态、需要强隔离、要往外调模型和工具，还能在循环里把钱烧光，而 Kubernetes 的原语是为无状态微服务设计的。Google 开源的 AX 只给四个原语——Task 管隔离沙箱、Workspace 预热 Git 仓库与 MCP 工具、Gateway 把出站流量锁到白名单、Model 统一模型与凭据配置，全部写成 ax.io/v1alpha1 清单，用 kubectl 式的命令 apply。底层 Agent Substrate 负责亚秒级挂起恢复与高密度多路复用。"
+author: "YOMXXX"
+faq:
+  - q: "AX 和 Kubernetes 是什么关系，是替代还是上层封装？"
+    a: "是上层封装，不是替代。AX 的控制面本身就跑在 Kubernetes 里，你需要一个可用的 K8s 集群、ko 用于构建镜像，以及一个能访问的 Agent Substrate 控制 API（集群内默认是 api.ate-system.svc.cluster.local:443）。它把 Task、Workspace、Gateway、Model 这些 Agent 语义编译成底层的沙箱与网络策略，然后交给 Substrate 去调度。所以它补齐的是「Agent 这类负载缺原语」的问题，而不是重写编排层。"
+  - q: "四个原语分别对应什么真实痛点？"
+    a: "Task 解决「不受信任的 Agent 代码往哪跑」，提供带 CPU 与内存上限、可随时创建和丢弃的沙箱。Workspace 解决「每个 Agent 启动都要重新配环境」，把 Git 仓库、MCP 服务器和技能包在任务开始前就位。Gateway 解决「Agent 能访问外网哪些地方」，把出站流量限制成显式白名单并支持凭据注入。Model 解决「模型配置散落在各处」，把模型、参数与密钥集中到一处，换 key 或钉版本只需要一次 apply。"
+  - q: "suspend 和 resume 为什么对成本影响这么大？"
+    a: "因为 Agent 的负载形态是「思考一分钟、等三分钟」。它大量时间在等模型响应、等工具返回、等人审批，如果这段时间沙箱必须常驻，你就为纯等待付了全价。AX 会把空闲 Agent 做检查点后挂起，恢复时声称在亚秒级完成且没有冷启动延迟；同时它让数十个任务共享同一批 worker 资源，把等待时间转成可用的算力。对跑长任务和批量评测的场景，这是成本模型上最实质的一处改动。"
+  - q: "Gateway 的出口白名单在实际项目里应该怎么配？"
+    a: "按「最小可用出口」来配，而不是按「方便」来配。先列出这个 Agent 真正需要访问的主机与端口，比如你的模型网关、代码托管域名、内部工具服务，逐条加进允许列表，其余一律拒绝。需要注意两点：一是模型 API 与工具服务器是两类不同信任级别的出口，能分开就分开；二是凭据应该由策略层在出站请求上注入，而不是塞进沙箱环境变量让 Agent 自己拿着，否则一次提示注入就可能把密钥带出去。"
+  - q: "现在把 AX 用到生产环境，最大的风险是什么？"
+    a: "仓库 README 里自己有一条显眼的警告：核心概念、协议和规范仍在积极调整，稳定版发布前很可能引入破坏性变更。这意味着现在更适合做技术预研、内部评测平台和轨迹采集这类可容忍返工的场景，而不是把关键业务链路直接压在上面。建议做法是先在一个小集群里跑通生命周期，把清单文件纳入版本控制，同时关注 apiVersion 的演进，等它收敛到稳定版本后再考虑承载生产流量。"
+---
+
+Agent 在工程上一直有点尴尬：它既不是无状态微服务，也不是跑完即走的批处理任务。它会累积状态、需要强隔离、要往外调模型 API 和工具服务器，而且如果没人在旁边盯着，它能在循环里把钱烧光。拿 Kubernetes 硬扛这类负载，结果通常很别扭——为了保住一堆「在等模型回话」的空闲沙箱，成本高得离谱；而想实现「暂停一下、之后原样恢复」，又发现平台根本没有这个原语。
+
+Google 开源的 AX（仓库 `google/ax`，站点 agentexecutor.io）就是冲着这个错位来的。它把自己定位成「高吞吐、声明式的 Agent 编排器」，目标是在一个集群里跑起十亿级的自主 Agent 负载，底层落在 Agent Substrate 这个执行运行时上。交互手感刻意做成 kubectl 那样：`apply`、`get`、`describe`、`watch`、`delete`，再加几个 Agent 特有的动词 `ssh`、`suspend`、`resume`。
+
+## 一、四个原语，四个具体的运维问题
+
+AX 的设计很克制，只给了四个原语，每个都对应一个你迟早会撞上的问题：
+
+| 你想做的事 | AX 给你的东西 |
+|---|---|
+| 在带 CPU 与内存限制的隔离沙箱里跑不受信任的 Agent 代码 | `Task` |
+| 预先接好 Git 仓库、MCP 服务器和技能包，让 Agent 一启动就是热状态 | `Workspace` |
+| 把出站流量锁死到一份显式主机白名单 | `Gateway` |
+| 集中配置平台自己用哪个模型、参数与凭据 | `Model` |
+
+这四个原语合起来的价值，不在于它们有多新奇，而在于它们把「Agent 运行时」这件事从脚本层面提升到了声明层面。以前你写的是「先 docker run，再 git clone，再 export 一堆环境变量，再起个进程」，现在你写的是「这个 Task 需要这个 Workspace，出口只允许这几个域名」。
+
+## 二、先把 CLI 和控制面装起来
+
+AX 的前置条件比较明确：一个 Kubernetes 集群、`ko`（用来构建并推送镜像）、一个集群能拉取的容器镜像仓库，以及可达的 Agent Substrate 控制 API。CLI 本身是 Go 写的：
+
+```bash
+go install github.com/google/ax/cmd/ax@latest
+
+# 装完以后 ax 会落在 GOPATH 的 bin 目录里，确认它在 PATH 上
+export PATH="$(go env GOPATH)/bin:$PATH"
+ax --help
+```
+
+接着部署控制面。这一步会把 Redis 一起铺下去，然后构建并部署控制面镜像，所有东西落在 `ax-system` 命名空间：
+
+```bash
+make deploy AX_IMAGE_REPO=<your-registry>
+```
+
+如果你只是想快速验证思路，这个门槛其实不低——它不是一个 `pip install` 就能试的库，而是要求你先把集群准备好。这一点在做技术选型时要提前算进成本。
+
+## 三、第一份 task.yaml
+
+AX 的核心体验集中在一份多文档 YAML 里。下面是官方示例的结构：一个 `Workspace` 声明代码仓库，一个 `Task` 引用它并用自然语言描述环境目标。
+
+```yaml
+# task.yaml
+apiVersion: ax.io/v1alpha1
+kind: Workspace
+metadata:
+  name: golang
+spec:
+  git:
+    - repo: https://github.com/golang/go.git
+      branch: "my-fix"
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: test
+spec:
+  workspaces:
+    - name: golang
+      goal: "Ensure that Go tool chain is available and is built from source"
+  debug: true   # 打开后可以用 ax ssh 进沙箱看现场
+```
+
+这里最值得注意的一行是 `goal`。它不是一条 shell 命令，而是一句**用自然语言描述的目标**。AX 会把这句话交给一个 Agent，让它在沙箱第一次启动时自己把工具链装好、把依赖验通。官方把这类能力叫生成式工作区（generative workspaces）——你描述「一个就绪环境长什么样」，平台负责把它变成真。
+
+这个设计有一个很现实的副作用：环境准备本身变成了不确定的过程。好处是省掉了维护一堆镜像和初始化脚本的工作量；代价是环境就绪时间变得不可预测，所以 `ax watch` 这类观察命令在调试期几乎必备。
+
+## 四、生命周期：apply、watch、ssh、suspend、resume
+
+装好之后，日常操作就是这几个动词：
+
+```bash
+# 应用多文档 YAML，文件或 stdin 都行
+ax apply -f examples/task.yaml
+
+# 看任务列表与阶段
+ax get tasks
+# NAME      ATESPACE   PHASE     ACTOR           WORKER-IP    AGE
+# task123   default    Running   task123         10.20.3.67   1m
+
+# 实时跟踪阶段与条件变化
+ax watch task task123
+
+# 进沙箱看文件、看进程
+ax ssh task123 -- ls -la /workspace
+
+# 检查点后挂起，再原样恢复
+ax suspend task task123
+ax resume task task123
+```
+
+`ax ssh` 和 `ax suspend` 是这套设计里最「像操作系统」的两个命令。前者把沙箱当成一台你可以登进去的机器，这对排查「Agent 到底把哪个文件改坏了」非常有用；后者则直接对应前面说的成本问题——Agent 空闲时不该占着资源。
+
+## 五、底层的 Agent Substrate 与三个数字
+
+AX 跑在 Agent Substrate 之上，后者是专门为高密度、快速有状态 Actor 生命周期设计的计算运行时。它对外承诺的三件事值得单独看：
+
+**十亿级任务**。每个 Task 以轻量 Actor 形式运行，因此可以扩展到单个集群内十亿级并发 Agent 会话，而不受编排器上限约束。
+
+**亚秒级恢复**。在等模型响应、等外部工具调用、等人审批时，空闲 Agent 会被检查点、挂起，然后声称在一秒内回来，且没有冷启动延迟。
+
+**高密度多路复用**。数十个任务共享同一批 worker 资源，把等待时间转成闲置算力，于是你只在 Agent 真正思考和执行代码时付费。
+
+把这三条放在一起看，能读出 AX 对 Agent 负载的判断：瓶颈不是算力，而是**等待**。传统编排器的调度假设是「任务要么在跑、要么结束了」，而 Agent 的状态空间里有一个巨大的「活着但什么都没干」的第三态，AX 的整套设计基本都在处理这个态。
+
+## 六、落地时该关注什么
+
+如果你打算在自己的团队里试点，建议按这个顺序推进。第一步先在一台小集群上把 `make deploy` 跑通，确认 Substrate 控制 API 可达，这一步不通后面都是空谈。第二步把 Workspace 的 `goal` 写清楚——它写得越具体，环境就绪越稳定，把「装好 Python 3 并验证依赖」这种表述换成带版本号的具体要求，能省掉大量反复。
+
+第三步认真配 Gateway。出口白名单不是可选项，而是这套架构里唯一挡住 Agent 把数据带出去的东西。模型 API 和工具服务器属于两类不同信任级别的出口，能拆就拆；凭据交给策略层在出站请求上注入，而不是塞进沙箱的环境变量让 Agent 自己持有。
+
+第四步才是把真实业务接进来。这里务必记得 README 顶部那条警告：核心概念、协议与规范仍在调整，稳定版之前很可能出现破坏性变更。这意味着当前的正确姿势是做预研、做内部评测平台、做轨迹采集这类可以容忍返工的事，而不是把关键链路压上去。
+
+一句话总结：AX 的价值不是又一个编排器，而是它明确承认了「Agent 是第三种负载」，并为这第三种负载补上了缺失的原语。这个判断本身，比它现在是否成熟更值得关注。
