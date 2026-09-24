@@ -1,0 +1,97 @@
+---
+title: "Strands Harness 实战：一行代码起一个会自己管上下文的 Agent"
+description: "AWS Strands 团队开源的 Agent Harness：一行 Python 或 TypeScript 拿到接近 Claude Code 的开箱体验，同一模型下 token 成本低 28%。本文带你从安装、跑通、定制到部署走一遍。"
+column: "workshop"
+tags: ["Strands", "Agent Harness", "AWS", "开源", "上下文管理", "成本优化"]
+pubDate: 2026-09-24
+template: "digest"
+featured: false
+tldr: "AWS Strands 团队开源 Strands harness：一行代码得到完整组装的 Agent Harness，内置 shell、文件、Web 工具，自动做 prompt caching 与上下文管理。同一模型下比 Claude Code、Codex 等主流 harness 省 28% token，配合 Fable 5 时成本低 77% 且 Terminal Bench 2.1 得分更高。Apache 2.0 协议，支持本地 Ollama 与云端一键部署。"
+author: "YOMXXX"
+faq:
+  - q: "Strands harness 和 Strands Agent SDK 是什么关系？"
+    a: "Strands harness 建立在 Strands Harness SDK 之上。SDK 提供底层构件（工具调用、上下文管理、记忆等原语），harness 则是把这些构件按最佳实践预装好的完整 Agent。你可以从 harness 入门，再逐层下沉到 SDK 替换任意组件，代码始终归你所有。"
+  - q: "28% 的成本节省是怎么测出来的？"
+    a: "Strands 团队在 EC2 上用 Harbor 做分布式基准测试，在六个基准上对比同一模型（Claude、GPT 系列）下的不同 harness，统计 token 消耗与准确率。结论是 Strands harness token 效率更高、分数持平或更好。需要注意的是 DeepSeek harness 整体最省 token，但准确率垫底，属于另一种取向。"
+  - q: "它能替代 Claude Code 这样的编码 Agent 吗？"
+    a: "定位不同。Strands harness 明确说自己是通用 Agent 而非编码 Agent，目标是让你把本地原型里那种顺手的感觉带到云端的自定义 Agent 上。写代码场景它也能跑（Terminal Bench 2.1 有成绩），但如果你只想要一个终端里的结对编程工具，Claude Code 仍然是更专注的选择。"
+  - q: "必须用 AWS 的模型或云服务吗？"
+    a: "不需要。模型侧支持 Amazon Bedrock、Anthropic、OpenAI、Google、LiteLLM，也能直接指向本地 Ollama 模型离线跑。部署侧虽然对 AWS 生态最友好（ECS、Bedrock AgentCore），但任何能跑 Linux 容器的平台都可以，比如 Modal、Cloudflare Containers、Google Cloud Run。"
+  - q: "上下文管理是黑盒吗？能不能改？"
+    a: "不是黑盒。默认策略是三件事：工具返回结果超过约 1500 个 token 就卸载到文件、上下文窗口占用超过 85% 触发摘要压缩、循环内检测到溢出自动做上下文恢复。这三个默认值都可以覆盖重写，你可以按自己业务的成本与质量曲线调整阈值。"
+---
+
+## 为什么值得再看一个 Agent Harness
+
+过去一年大家普遍有一个体感：Claude Code、Codex 这类成熟 harness 里，一个想法「就是能跑」；可一旦自己从零搭 Agent，就要面对工具循环、上下文溢出、prompt 缓存、失败重试这一堆细节，拼出来的东西往往「差一点感觉」。AWS Strands 团队在 9 月 21 日发布的开源项目 Strands harness，瞄准的正是这个缺口：把一个达到前沿水平的 harness 完整组装好交给你，一行代码启动，Apache 2.0 协议，可本地跑也可部署到任意云。
+
+数字先摆出来：在相同模型（Claude、GPT 系列）下，Strands harness 在六个基准上的 token 成本比 Claude Code、Codex 等主流 harness **低 28%**，准确率持平或更高；换用 Fable 5 模型时，成本比 Claude Code **低 77%**，且 Terminal Bench 2.1 得分反超。成本效率主要来自两个内置默认：prompt caching 和一套相当激进的上下文管理策略。
+
+## 十分钟跑通
+
+安装很简单，Python 与 TypeScript 双端支持：
+
+```bash
+pip install strands-harness
+# 或
+npm install @strands-agents/harness
+```
+
+TypeScript 侧的启动代码只有两行：
+
+```ts
+import { createHarness } from "@strands-agents/harness";
+
+const agent = await createHarness({ model: "bedrock/global.anthropic.claude-opus-5" });
+
+await agent("调研三个主流向量数据库，对比价格与配额，写成 comparison.md");
+```
+
+Python 侧的用法几乎对称，同样是创建后直接以自然语言派活：
+
+```python
+from strands_harness import create_harness
+
+agent = create_harness(model="anthropic/claude-opus-5")
+agent("整理本周 AI 领域五条重要新闻，逐条附来源链接，存成 weekly.md")
+```
+
+模型选择上支持 Amazon Bedrock、Anthropic、OpenAI、Google、LiteLLM，也可以指向本地 Ollama 模型——这意味着整条链路可以完全离线跑，对做本地推理的团队很友好。切换模型只需改一个字符串，不需要动任何业务代码，这对想在同一套 Agent 逻辑上横评多个模型的团队尤其省事。
+
+`create_harness()` 返回的 Agent 开箱自带这几样东西：
+
+- **工具集**：shell、文件的读取写入编辑、Web 工具。用的都是模型本来就熟悉的通用原语，而不是为单个任务定制的花哨工具；
+- **自主上下文管理**：把大体积的工具返回结果卸载到文件，并对每次请求中可复用的部分做缓存；
+- **跨运行长期记忆**：传入 session ID 就能恢复之前的对话；
+- **任务委派**：开放式子任务委派给内置的辅助 Agent，用 checklist 跟踪多步骤工作；
+- **技能加载**：目录里如果存在 skills 定义会自动加载。
+
+## 默认上下文策略：28% 省在哪
+
+这是本次发布里最有含金量的部分。三个默认值：
+
+1. 工具返回结果超过约 1500 个 token，就截断并把完整内容卸载到文件，模型需要时再读；
+2. 上下文窗口占用率超过 85% 时触发摘要压缩（compaction）；
+3. 循环内一旦检测到溢出，立即执行上下文恢复，不让会话崩掉。
+
+团队说测试中 token 效率和准确率的大头来自这套默认策略——尤其是第一条，把「工具输出灌爆上下文」这个最常见的成本黑洞直接焊死了。三个阈值都可以覆盖，如果你的任务平均工具输出很小，把截断阈值调高反而能减少读文件的往返。
+
+> **💡 提示**：如果你想复现它们的基准方法，团队预告了后续会发一篇研究员署名的基准论文，当前数据来自 EC2 上的 Harbor 分布式测试。
+
+## CLI 原型流：说人话改配置，再导出代码
+
+Strands CLI 建立在 harness 之上，提供一条很顺的路径：先用自然语言改配置，满意后导出真实代码。官方演示里，工程师对着 CLI 说「加上 Playwright MCP，然后测一下加载博客视频的延迟」，Agent 自己把 MCP 工具接好并完成测量，最后跑一句 `/export`，就能拿到包含 Playwright MCP 配置的 TypeScript 或 Python 完整代码，直接丢给编码 Agent 继续迭代。
+
+这个「原型在 CLI、交付是代码」的设计解决了一个真实痛点：早期原型阶段你不想写样板代码，但进入工程化阶段又必须拥有可版本化的代码库。`npm install -g @strands-agents/cli` 装上就能试。
+
+## 从定制到部署
+
+默认行为全部可覆盖：换模型、加工具、替换组件，一路下潜到 Strands Harness SDK 的原语层。部署侧的选择很宽——任何能跑 Linux 容器的平台都行，官方点名了 Modal、Cloudflare Containers、Azure Container Apps、Google Cloud Run、Amazon ECS 和 Amazon Bedrock AgentCore。对个人开发者，Modal 或 Cloudflare 的方案基本零运维；对企业用户，Bedrock AgentCore 提供现成的隔离与观测。
+
+## 值得注意的边界
+
+几点冷静判断。第一，它是通用 Agent harness，不是编码 Agent——写代码场景有成绩，但产品重心在「把你自己的 Agent 想法跑起来」。第二，28% 这个数字的参照系是六基准上的平均值，具体到你的工作负载，收益取决于工具输出体积和会话长度：长会话、大工具输出的任务收益最大，短问答几乎无感。第三，社区生态还很新，遇到问题官方 Discord 是最快的求助渠道。
+
+如果你最近正打算把一个原型 Agent 推上生产，或者厌倦了自己拼上下文管理逻辑，这个项目值得今天下午就花一小时试一遍。
+
+最后给一个横向视角。这次基准测试里另一个有意思的信号是开源 harness 的整体崛起：团队提到还有两个开源 harness 在成本与准确率的平衡上对 Claude Code 表现接近，而 DeepSeek harness 以最低 token 消耗换来最低准确率，展示了「极致省钱」路线的下限。也就是说，harness 之间的差异已经不是工程细节，而是实打实的账单差异——同一个任务、同一个模型，选错 harness 可能多付三倍的 token 费。把 harness 当作和模型同等重要的选型对象，是这份基准数据最直接的结论。
