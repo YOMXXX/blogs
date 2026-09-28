@@ -1,0 +1,121 @@
+---
+title: "Hindsight 实战：给 Agent 装上会学习的记忆系统"
+description: "手把手部署 Hindsight 记忆服务：retain、recall、reflect 三个核心操作，LLM Wrapper 两行接入现有客户端，编码 Agent 项目记忆一键集成。"
+column: "workshop"
+tags: ["Agent-Memory", "Hindsight", "RAG", "LLM", "Docker", "实战教程"]
+pubDate: 2026-09-28
+template: "dossier"
+featured: false
+tldr: "Hindsight 是 GitHub 3.7 万星、MIT 协议的 agent 记忆系统，在 LongMemEval 基准上拿到第一，且成绩被弗吉尼亚理工与华盛顿邮报独立复现。本文用 Docker 起服务，用 retain、recall、reflect 三个操作管理长期记忆，再用 wrap_openai 两行接入现有 LLM 客户端，最后给 Claude Code 等 CLI 编码助手装上按仓库自动构建的项目记忆。"
+author: "YOMXXX"
+faq:
+  - q: "Hindsight 和直接用 RAG 检索历史对话有什么区别？"
+    a: "RAG 的思路是把历史对话切块后做相似度检索，回答的是「之前说过什么」。Hindsight 的定位是让 agent 学会而不是只记住：它会把 retain 进来的内容提炼成结构化事实、观察和 mental model，reflect 操作还能结合已有记忆生成带倾向判断的回复。官方在 LongMemEval 上报告的成绩是同类中最高，且被第三方独立复现过。"
+  - q: "必须连 OpenAI 才能用吗？能不能全本地跑？"
+    a: "不需要 OpenAI。Hindsight 通过环境变量 HINDSIGHT_API_LLM_PROVIDER 支持 25 个以上的模型提供方，包括 ollama、lmstudio、llamacpp 这类全本地方案，也兼容任意 OpenAI 协议端点和 litellm 网关。如果你有 Claude Pro 或 ChatGPT Plus 订阅，还能直接走 claude-code 或 openai-codex 这类订阅通道，不需要单独的 API key。"
+  - q: "记忆数据存在哪里，会不会泄露？"
+    a: "自托管模式下数据完全在你自己的机器上：Docker 镜像默认用内置的 pg0 PostgreSQL 实例，卷挂在 hindsight-data；也可以通过 docker compose 接外部 PostgreSQL，企业部署甚至支持 Oracle AI Database。只有记忆提炼这一步会调用你配置的 LLM。对合规敏感的团队，还可用 Hindsight Cloud 托管或纯 air-gapped 部署。"
+  - q: "接到现有 agent 代码里要改多少东西？"
+    a: "最少两行。用 hindsight-litellm 提供的 wrap_openai 或 wrap_anthropic 把现有客户端包一层，之后每次调用会自动在调用前召回相关记忆、调用后保存新事实，业务代码零改动。需要精细控制存取时机的话，再换成 SDK 直接调 retain 和 recall。官方维护了 60 多个现成集成，LangGraph、CrewAI、Dify、n8n 这些框架基本开箱即用。"
+  - q: "给编码 Agent 用有什么实际收益？"
+    a: "编码场景是 Hindsight 的强项。hindsight-coding-agents 包会给每个仓库自动建一个 memory bank，从 git 历史和过往会话里提炼架构决策、代码约定和进行中的工作，在 agent 启动时注入上下文。相当于新会话不用重新交代「我们用 pnpm、测试跑 vitest、不要动 legacy 目录」这类背景，跨会话的项目知识可以持续积累。"
+---
+
+agent 记忆大概是 2026 年竞争最激烈的基建赛道之一，但绝大多数方案仍在做同一件事：把对话历史切块、向量化、检索、塞回上下文。这套流程解决的是「记」，解决不了「学」——agent 用了三个月，依然不知道你的团队偏好什么代码风格、上次那个坑是怎么踩的、哪些结论已经过期。GitHub 上的 vectorize-io/hindsight（MIT 协议，37312 星，本周单日涨星 1600+）给出了另一个答案，本文从部署到接入编码 Agent，把它的完整用法过一遍。
+
+## 一、为什么 RAG 不够
+
+先说清楚问题。传统 RAG 记忆有三个结构性缺陷。第一，它存的是「对话原文」，检索回来的大段历史里真正有信息量的可能只有一句话，上下文窗口被大量噪声占用。第二，它不会归纳：用户在 20 个会话里分别提过一次「我们统一用四个空格缩进」，RAG 会把这 20 条都存下来，却永远得不到「这是团队的硬约定」这个结论。第三，它不会遗忘和修正：用户换了工作、换了技术栈，旧记忆仍会被检索出来污染回答。
+
+Hindsight 的论文（arXiv 2512.12818）把这三点作为设计前提，它在 LongMemEval 基准上拿到的成绩被弗吉尼亚理工 Sanghani 中心和华盛顿邮报独立复现，这在记忆类产品普遍自报分数的环境里相当少见。更关键的是，它把记忆抽象成了三个显式操作，而不是一个黑盒。
+
+## 二、核心抽象：retain、recall、reflect
+
+Hindsight 的一切围绕三个动词展开。`retain` 是写入：你把原始内容丢给它，它会提炼出结构化事实并存入对应的 memory bank。`recall` 是检索：按查询语义召回相关记忆，返回带相关度的事实列表。`reflect` 是生成：不只召回，还会综合记忆内容生成一个「带立场」的回答，比如根据历史交互判断用户的真实意图。
+
+记忆被分成多种类型（世界事实、偏好、决策、观察等），并支持 mental model 与 knowledge page 两层汇总结构——前者是某个主题的动态画像，后者是人工或自动整理的长期知识。memory bank 是隔离单元，一个用户、一个项目、一个机器人都可以各建一个 bank，互不污染。
+
+```python
+from hindsight_client import Hindsight
+
+client = Hindsight(base_url="http://localhost:8888")
+
+# 写入：丢给它原始内容，提炼交给它
+client.retain(bank_id="my-bank",
+              content="Alice works at Google as a software engineer")
+
+# 检索：只取相关记忆
+client.recall(bank_id="my-bank", query="What does Alice do?")
+
+# 生成：结合记忆直接回答
+client.reflect(bank_id="my-bank", query="Tell me about Alice")
+```
+
+## 三、五分钟部署
+
+推荐 Docker 方式起一个带 UI 的完整服务：
+
+```bash
+export OPENAI_API_KEY=sk-xxx
+
+docker run -it --pull always --name hindsight --restart unless-stopped \
+  -p 8888:8888 -p 9999:9999 \
+  -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
+  -v hindsight-data:/home/hindsight/.pg0 \
+  ghcr.io/vectorize-io/hindsight:latest
+```
+
+跑起来后 8888 是 API 端口，9999 是管理界面，可以直接在浏览器里看记忆的写入和提炼过程——调试记忆系统时这个 UI 非常有用，你能直观看到一句对话被拆成了哪些事实。
+
+不想连 OpenAI 的话，把环境变量换成 `HINDSIGHT_API_LLM_PROVIDER=ollama` 加本地模型地址即可，支持列表覆盖 25 个以上的提供方，任意 OpenAI 兼容端点也能直接指过来。已有 ChatGPT Plus 或 Claude Pro 订阅的，甚至可以走订阅通道免掉 API key。
+
+生产环境建议外接 PostgreSQL：
+
+```bash
+export HINDSIGHT_DB_PASSWORD=choose-a-password
+cd docker/docker-compose
+docker compose up
+```
+
+## 四、两行接入现有 Agent
+
+大多数人的诉求不是重写 agent，而是给现有代码加记忆。Hindsight 提供的 LLM Wrapper 是目前我见过的最小侵入方案：
+
+```python
+from openai import OpenAI
+from hindsight_litellm import wrap_openai
+
+client = wrap_openai(
+    OpenAI(),
+    bank_id="user-123",
+    hindsight_api_url="http://localhost:8888",
+)
+
+response = client.chat.completions.create(
+    model="gpt-5-mini",
+    messages=[{"role": "user", "content": "What do you know about me?"}],
+)
+```
+
+wrap 之后每次调用会自动执行：调用前按消息内容召回相关记忆注入上下文，调用后把新信息 retain 进 bank。底层是 LiteLLM，所以同一套包装覆盖 100 多个模型；`wrap_anthropic()` 对 Anthropic SDK 做同样的事。bank、召回预算、事实类型这些参数都可以在单次调用级别用 `hindsight_` 前缀的关键字参数覆盖，灵活度足够。
+
+如果你需要显式控制存取时机——比如只在会话结束时批量写入——就绕开 wrapper，直接用 Python、Node、Go 三种 SDK 或 REST API 操作。
+
+## 五、给编码 Agent 装项目记忆
+
+编码 Agent 是 Hindsight 最有意思的应用面。`hindsight-coding-agents` 包一条命令就能给 CLI 工具装上长期项目记忆：
+
+```bash
+npx @vectorize-io/hindsight-coding-agents install all          # 检测到的全装
+npx @vectorize-io/hindsight-coding-agents install claude-code  # 只装一个
+```
+
+它的机制值得展开说：每个仓库自动对应一个 memory bank，内容不是存对话，而是从 git 提交历史和过往编码会话中提炼出架构决策、代码约定、进行中的工作三类知识，生成 curated knowledge pages。Agent 启动工作时这些页面被注入上下文，效果类似一个自动维护的 CLAUDE.md——但它是从真实历史里长出来的，而且持续更新。
+
+支持的编码工具覆盖 Claude Code、Codex CLI、Cursor、GitHub Copilot CLI、opencode、Cline、Aider、Zed、OpenHands 等主流选项，框架侧的 LangGraph、LlamaIndex、CrewAI、Pydantic AI、OpenAI Agents SDK、Dify、n8n 也都有现成集成，总计 60 多个，大部分不需要改业务代码。
+
+## 六、生产化与选型建议
+
+几个上生产前要想清楚的点。第一，存储：内置 pg0 适合开发，生产换外接 PostgreSQL，Windows 与气隙环境官方安装指南都有覆盖，企业用户还可以选 Oracle AI Database 或托管版 Hindsight Cloud。第二，成本：记忆提炼是 LLM 调用，retain 的量决定成本，建议对低价值会话做过滤再写入。第三，基准核验：LongMemEval 榜单在官方 benchmarks 站点持续更新，包含各家方案的准确率、延迟和成本，选型时值得对照——记忆系统的差异在中低负载下不明显，长会话、多用户的场景里差距会被放大。
+
+总结一下选型直觉：如果你的 agent 是短生命周期、单会话任务，任何记忆系统都帮不了太多；如果是跨会话的个人助理、客服机器人或编码助手，需要一个「越用越懂你」的层，Hindsight 当前是这个位置上基准最强、集成最全的开源选项。真正让我把它从「又一个记忆库」里区分出来的，是 reflect 带来的立场生成能力——记忆的终点不是回忆，是判断。
