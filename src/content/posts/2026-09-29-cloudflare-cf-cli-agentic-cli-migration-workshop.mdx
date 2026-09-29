@@ -1,0 +1,132 @@
+---
+title: "Cloudflare cf CLI 实战：把整条 API 面交给你的编码 Agent"
+description: "Cloudflare 发布 cf：从 Wrangler 的 280 个命令扩展到 3000+ API 操作，JSON 默认输出、cloudflare.config.ts 类型安全配置。本文带你安装、迁移并跑通第一个 Agent 工作流。"
+column: "workshop"
+tags: ["Cloudflare", "Agent-CLI", "Wrangler", "DevOps", "AI-Coding"]
+pubDate: 2026-09-29
+template: "terminal"
+featured: false
+tldr: "Cloudflare 于 9 月 28 日发布面向 Agent 的 cf CLI：命令覆盖从 280 个扩到 3000+ 个 API 操作，JSON 成为默认输出，配置全面转向类型安全的 cloudflare.config.ts，并提供 cf migrate 一键迁移。本文实测安装、配置迁移与 Agent 驱动部署的完整流程。"
+author: "YOMXXX"
+faq:
+  - q: "cf 会直接取代 Wrangler 吗？"
+    a: "开放测试期两者并存。cf 会把需要 esbuild 的 JavaScript Worker 以及 Rust、Python Worker 的构建与部署继续委托给 Wrangler；测试期结束后 Wrangler 会发一个最终大版本，引导用户切换到 cf，并提供 18 个月的维护支持。新项目建议直接用 cf init 起步。"
+  - q: "已有 wrangler.toml 项目怎么迁移？"
+    a: "在项目根目录运行 cf migrate 即可。已经用 Vite 构建的 Worker 会自动转换成 cloudflare.config.ts；依赖 Wrangler esbuild 管线的项目，cf 会继续把构建委托给 Wrangler，配置可以先不动。迁移前建议提交一次 git，方便对比生成结果。"
+  - q: "为什么 JSON 要做成默认输出而不是表格？"
+    a: "因为 CLI 的主要用户变成了 Agent。Agent 拿到 JSON 后可以直接用 jq 或内部过滤逻辑提取所需字段，几乎不浪费上下文；而人类表格对 Agent 来说解析成本高、token 消耗大。cf 对 JSON 做了两档格式：人类友好 pretty print 和面向 Agent 的紧凑格式。"
+  - q: "cf cli search 是怎么帮 Agent 找命令的？"
+    a: "cf 覆盖 3000 多个操作，靠 --help 逐层翻找会浪费大量上下文。cf cli search 接受自然语言描述，比如「给这个 Worker 加上 WAF 保护」，内置的小型搜索索引会基于 API 描述和参数返回一组候选命令。Agent 首次运行 --help 时，cf 会自动告知该命令的存在。"
+  - q: "cloudflare.config.ts 比 wrangler.toml 好在哪？"
+    a: "核心是类型安全与可编程。TypeScript 配置能被 LSP 校验，Claude Code、Codex 等使用 LSP 插件的 Agent 可以直接利用类型信息做出准确修改；bindings 与 triggers 辅助函数让环境变量、KV、D1、队列等资源声明可自动补全。Cloudflare 内部有些五千多行的 Wrangler 配置迁移后缩减了 40%。"
+---
+
+## 背景：Agent 已经吃掉了 Wrangler 一半的调用量
+
+9 月 28 日，Cloudflare 发布了名为 `cf` 的新 CLI。这不是一次普通的工具更名，而是 Cloudflare 对「Agent 成为一等用户」这一趋势的正面回应。官方博客给出了一组关键数据：2026 年 3 月，Wrangler 的调用量中有四分之一来自 Agent，而就在发布前一周，这个比例达到了 48%。Agent 的使用强度也远高于人类——它们每天使用的不同命令数量几乎是人类的两倍，连续使用六个以上命令的概率则是四倍。
+
+问题在于 Wrangler 的设计起点。它是各产品团队手工贡献命令的产物，五年多积累下来只有约 280 个命令路径，而 Cloudflare 的完整 API 面有数千个操作。各团队术语不统一，`d1 info`、`hyperdrive get`、`workflows describe` 各说各话；有些团队写了数千行的定制体验，实际使用率却极低。对 Agent 来说，这 280 个命令意味着大量它「够不着」的 Cloudflare 能力。
+
+cf 的解法激进且彻底：借助今年早些时候推出的 Forge 统一 API 生成管线，直接从 API 的 OpenAPI schema 生成 CLI 命令。Cloudflare 的每个产品都有 OpenAPI schema，只要补充少量注解，Forge 就能把它变成 CLI。结果是 cf 的命令覆盖从 280 个跃升到超过 3000 个操作，理论上 Agent 能用 cf 完成 Cloudflare 的任何事情。
+
+## 安装与上手
+
+cf 目前处于开放测试阶段，全局安装即可：
+
+```bash
+npm i -g cf
+cf --version
+```
+
+新项目可以从脚手架开始：
+
+```bash
+cf init
+cf deploy
+```
+
+`cf init` 会自动安装 Cloudflare Vite 插件并生成配置文件。纯静态站点甚至不需要配置文件，进入目录直接 `cf deploy` 就能上线。对从 Wrangler 迁移的存量项目，后文详述。
+
+## JSON 默认接口：为 Agent 而非人类设计
+
+这是 cf 最具标志性的设计转向。过去 Agent 使用 Wrangler 的典型模式是：每条命令后面追加 `--json`，再用 `jq` 过滤出需要的字段。问题是 Wrangler 只有部分命令支持 `--json`，很多命令输出的是为人类设计的 Unicode 表格，Agent 得先「看懂」表格再提取数据，token 开销大、出错率高。
+
+cf 把这个逻辑反转了：JSON 是默认接口，为人类阅读准备的 pretty print 和为 Agent 准备的紧凑格式两档可切。对于那些人类极少直接访问的命令（占大多数），这个决定几乎无需权衡。博客里有一个诚实的表述：人类客户实际上与 CLI 隔了一层——真正在敲命令的是 Agent，人类只是发起请求并接收总结。
+
+对于确实需要人类介入的场景，比如挑选一个要购买的域名，cf 会把 API 要求拆解成一系列经过校验的表单输入，人类逐项填写即可；或者，直接让 Agent 代劳。
+
+## cf cli search：3000 个命令里的自然语言检索
+
+命令覆盖面扩大 10 倍后，新问题出现了：Agent 怎么找到它要的那条命令？靠 `--help` 层层翻找会迅速撑爆上下文窗口。cf 给出的答案是 `cf cli search`：
+
+```bash
+cf cli search "protect this worker with WAF"
+cf cli search "buy a domain with specific keywords"
+```
+
+这个命令接受自然语言描述，基于每个操作的 API 描述与参数构建的小型搜索索引，返回一组候选命令。Agent 用自然语言说出意图，就能拿到可执行的命令清单。更巧妙的是分发机制：Agent 第一次运行 `--help` 时，cf 会自动注入关于 `cli search` 的提示，确保 Agent 知道这条「元命令」的存在。这种「为没见过这个工具的 Agent 设计」的思路，官方有一段值得细读的论述——推出一个 LLM 训练数据里从未出现过的新 CLI，反而比修改一个 Agent 已经形成使用惯性的旧工具更干净，因为 cf 可以通过上下文注入和 AGENTS.md 文件主动教 Agent 用法，不必让 Agent 去「纠正」它从训练数据里学来的旧习惯。
+
+## cloudflare.config.ts：会帮 Agent 做类型检查的配置
+
+cf 引入了覆盖整个 Cloudflare 的 TypeScript 配置格式，从 Workers 开始。一个带多环境的 Worker 配置现在长这样：
+
+```ts
+import { bindings, defineConfig } from "cf/config";
+import * as entrypoint from "./index.js" with { type: "cf-worker" };
+
+export default defineConfig(({ mode }) => ({
+  worker: {
+    name: "example-worker",
+    entrypoint,
+    compatibilityDate: "2026-09-27",
+    env: {
+      Environment: bindings.text(`This is ${mode} environment`),
+      API_TOKEN: bindings.secret(),
+      CACHE: bindings.kv({ id: mode === "production" ? "prod-ns" : "staging-ns" }),
+      DATABASE: bindings.d1({ name: `example-${mode}-database` }),
+      UPLOADS: bindings.r2({ name: `example-${mode}-uploads` }),
+      JOBS: bindings.queue({ name: `example-${mode}-jobs` }),
+      AI: bindings.ai(),
+    },
+  },
+}));
+```
+
+三个设计点值得展开。第一，类型安全直接服务于 Agent：使用 LSP 插件的 Agent（Claude Code、Codex 等）能借助类型系统理解配置结构并做出准确修改，官方观察到即使 Agent 从未见过这套格式，也能准确按需编辑。相比之下，TOML 没有可访问的 schema，JSONC 的 schema Agent 几乎从不使用。第二，`bindings` 辅助函数把环境变量、密钥、KV、D1、R2、队列、Vectorize、AI 全部纳入自动补全范围，编辑器能逐项解释。第三，环境定义从「复制粘贴 env 块」变成「以 mode 参数编程式生成」，Cloudflare 内部有些超过五千行、含大量自定义环境的 Wrangler 配置，迁移后缩减了 40%。
+
+触发器也收敛到了一个 `triggers` 块：
+
+```ts
+import { defineConfig, triggers } from "cf/config";
+
+export default defineConfig({
+  worker: {
+    triggers: [
+      triggers.fetch({ pattern: "example.com/*" }),
+      triggers.scheduled({ schedule: "0 * * * *" }),
+      triggers.queue({ name: "jobs", maxBatchSize: 10 }),
+      triggers.email({ addresses: ["support@example.com"] }),
+    ],
+  },
+});
+```
+
+路由、定时任务、队列消费、邮件触发不再散落在配置各处，而是集中声明。Vite 成为默认构建路径，开发服务器、HMR、基于 Rolldown 的 tree-shaking 以及 Vitest 插件构成完整的本地开发与测试闭环。
+
+## 迁移：cf migrate 与 Wrangler 的退役时间表
+
+存量项目迁移只需一条命令：
+
+```bash
+cf migrate
+```
+
+已经用 Vite 构建的 Worker 会自动转换成 `cloudflare.config.ts`；依赖 Wrangler esbuild 管线的 JavaScript Worker 以及 Rust、Python Worker，cf 会继续把构建与部署委托给 Wrangler，不会强行打断。开放测试期结束后，Wrangler 会发布一个最终大版本，把用户和他们的 Agent 指向 cf，之后提供 18 个月维护支持。这个节奏给了团队充分的迁移窗口，但也意味着现在就值得把 cf 纳入评估：Agent 迁移大部分 Worker 几乎不需要人工干预，越早切换，Agent 上下文里的「新旧差异」负担越小。
+
+## 实操建议与坑位提醒
+
+结合发布内容与实际试用，给三个建议。第一，CI 环境先别急切：cf 处于 beta，生产部署管线可以等稳定版，但本地开发与新项目可以立刻用 `cf init` 起步，享受 Vite 工具链。第二，AGENTS.md 值得写：cf 的设计明确预期 Agent 通过上下文注入学习用法，在你的仓库 AGENTS.md 里声明「部署用 cf 而非 Wrangler」「配置改动一律走 cloudflare.config.ts」，能显著减少 Agent 混用两套工具的出错率。第三，`cf cli search` 应该成为 Agent 的默认入口而非兜底：让 Agent 先用自然语言检索命令、再执行，比让它凭训练数据里的 Wrangler 记忆猜测命令可靠得多——毕竟 cf 的 3000 个操作里有 90% 是任何模型训练数据里都没见过的。
+
+## 写在最后
+
+cf 的意义超出 Cloudflare 一家：它可能是第一个从命令覆盖、输出格式、配置格式到命令发现机制全链路为 Agent 重新设计的主流平台 CLI。当 Agent 已经贡献了 48% 的调用量，「为谁设计 CLI」这个问题的答案已经变了。其他云厂商大概率会跟进这套模式——OpenAPI schema 直接生成命令、JSON 优先、类型化配置、自然语言命令检索，每一项都不是难以复制的技术，难的是推翻既有工具惯性的决心。对开发者而言，眼下最实际的动作是：新项目用 cf，存量项目挑一个低风险的 Worker 跑一遍 `cf migrate`，让你的 Agent 先熟悉起来。

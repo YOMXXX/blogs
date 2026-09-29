@@ -1,0 +1,58 @@
+---
+title: "Claude Sonnet 5.5 速评：2 美元档模型干翻旗舰，Terminal-Bench 反超 Opus"
+description: "9 月 28 日发布的 Claude Sonnet 5.5 在 Terminal-Bench 4.0 拿下 70.6% 反超 Opus 5.5，GDPval-AA 仅差旗舰 2 分，价格却只有一半。本文用官方与客户实测数据评估它该用在哪些工作流上。"
+column: "tools"
+tags: ["Claude", "Anthropic", "Model-Review", "AI-Coding", "Cost-Optimization"]
+pubDate: 2026-09-29
+template: "dossier"
+featured: false
+tldr: "Claude Sonnet 5.5（模型名 claude-sonnet-5-5，9 月 28 日发布）输入 2 美元、输出 10 美元每百万 token，比 Sonnet 5 快 30% 以上、每任务成本最多低 30%。Terminal-Bench 4.0 得分 70.6% 超过 Opus 5.5 的 66.4%，GDPval-AA 1844 分距旗舰仅 2 分，复杂开放式工作仍是 Opus 强项。"
+author: "YOMXXX"
+faq:
+  - q: "Sonnet 5.5 的 API 模型名和定价是什么？"
+    a: "模型名为 claude-sonnet-5-5，每百万 token 输入 2 美元、输出 10 美元、缓存读取 0.2 美元、缓存写入 2.5 美元，与 Sonnet 5 定价持平。由于每任务消耗的 token 大幅减少，实测每任务成本比前代最多低 30%，编码场景在 FrontierCode 上约为前代的十五分之一。"
+  - q: "它和 Opus 5.5 该怎么选？"
+    a: "经验法则是按任务性质分流：范围明确的日常任务、修 bug、文档与幻灯片制作交给 Sonnet 5.5，它在 Terminal-Bench 上甚至反超旗舰；需要持续判断的复杂开放式工作仍留给 Opus 5.5，官方明确表示后者在这方面明显更强。很多团队的合理配置是 Sonnet 打底、Opus 兜底。"
+  - q: "相比 Sonnet 5 提升有多大？"
+    a: "全领域提升，编码尤其显著：FrontierCode 1.1 同为 High effort 下高出 10 分且成本约十五分之一；CursorBench 4.0 从 34.1% 升到 55.5%；Terminal-Bench 4.0 从 10.3% 跃升至 70.6%。GDPval-AA 知识工作基准从 1449 涨到 1844，提升约 400 分。输出生成速度快 30% 以上，是迄今最快的 Sonnet。"
+  - q: "安全性上有什么新变化？"
+    a: "两个首次：它是首个发布时即配备网络安全防护的 Sonnet——由于网络能力已比肩 Opus 5，高风险任务会自动回退到 Sonnet 5，网络防御者可通过 Cyber Verification Program 申请分级权限；同时是首个配备防推理提取安全分类器的 Sonnet，防止通过推理输出蒸馏出安全行为，并扩展了 thinking 内容与账户绑定的 preserved thinking 机制。"
+  - q: "从 Sonnet 5 迁移有什么要注意的？"
+    a: "最大坑在 thinking 配置：如果现有应用在关闭 thinking 模式下运行 Sonnet，迁移前需切换到新的 between_tools 设置，否则行为会不符合预期。另外 effort 默认值因平台而异——Claude Code 和应用默认 Medium，Claude Platform 默认 High，压测成本时记得对齐这个变量，低设置更快更省。"
+---
+
+## 发布定位：Claude 5.5 家族的第二款模型
+
+9 月 28 日，Anthropic 发布 Claude Sonnet 5.5，这是继 9 月下旬 Opus 5.5 之后 Claude 5.5 家族的第二款模型，官方定位清晰：**Opus 5.5 负责需要谨慎判断的复杂工作，Sonnet 5.5 负责范围明确的日常任务**——修 bug、产出文档、幻灯片和电子表格，并且官方特意强调它「对设计有敏锐眼光」。模型名 `claude-sonnet-5-5` 已在 Claude Platform 与 AWS、Google Cloud、Microsoft Azure 全平台可用，支持零数据保留。官方同时预告 Haiku 5.5 将在未来几周加入，届时家族三件套齐整。
+
+## 基准成绩：一个中型模型的两处越级
+
+先看最重要的数字。Terminal-Bench 4.0（智能体编码）上 Sonnet 5.5 拿到 **70.6%**，不仅碾压 Sonnet 5 的 10.3%，还反超了 Opus 5.5 的 66.4%——一个价格为旗舰一半的模型在终端智能体任务上超过了自己的旗舰，这是本次发布最值得注意的信号，说明 Anthropic 在中型模型上做了明显的智能体特化。GDPval-AA v2.1（知识工作）上它拿到 1844 分，距 Opus 5.5 的 1846 仅差 2 分，比 Sonnet 5 的 1449 高出约 400 分；AA-Briefcase v1.1 同样只差旗舰 11 分。CursorBench 4.0 为 55.5%（Opus 为 57.8%），OSWorld 2.1 计算机使用为 80.1%，Humanity's Last Exam 带工具为 64.5%。唯一明显落后的维度是 FrontierCode 1.1 的 46.2%（Max effort）对 Opus 的 54.4%——最硬核的编码任务，旗舰优势仍在。
+
+跨厂商对比中，GPT-6 Sol 在 FrontierCode 上为 49.3%（Xhigh 下 52.1%），Sonnet 5.5 Max 的 46.2% 略低于它，但考虑到价差，性价比维度上 Sonnet 5.5 的位置相当舒服。还有一个趣闻性指标：它是首个仅凭截图通关《Pokémon Red》的 Sonnet 模型，多步长程规划能力的侧面注脚。
+
+## 成本与速度：一半价格，十分之一账单
+
+定价与 Sonnet 5 完全持平：每百万 token 输入 2 美元、输出 10 美元、缓存读取 0.2 美元、缓存写入 2.5 美元。真正的成本优势来自 token 效率——同样的任务，Sonnet 5.5 需要的 token 少得多，官方口径是大多数工作每任务成本最多低 30%，编码基准上更夸张：FrontierCode 上约为 Sonnet 5 的**十五分之一**，AA-Briefcase 上约为九分之一。输出生成速度比 Sonnet 5 快 30% 以上，是迄今最快的 Sonnet。
+
+客户实测数据补上了真实世界的注脚。Base44 在 118 次真实应用构建中平均 3.6 次迭代完成（Opus 5 为 7.7 次），工具调用失败最少；Balyasny 的每答案 token 从 Sonnet 5 的约 49.7 万降到 12.1 万；Box 观察到快 2.4 倍且总 token 少 12%；Zendesk 工单处理快 20%，Atlassian 的 Rovo Agents 快达 30%。Unity 的多步骤基准完成率达到 90%。这批数据的一致指向是：**迭代次数和 token 消耗的下降比基准分数更能代表体感**。
+
+## Effort 机制：同一个模型的三种价格
+
+Sonnet 5.5 延续了 effort 分档设计，这也是成本控制的核心杠杆。官方给出的使用画面是：在多个基准上，Sonnet 5.5 以 Low 或 Medium effort 运行即可超过 Sonnet 5 的最佳分数，而每任务成本约为前代的十分之一。默认值因平台而异——Claude Code 和应用默认 Medium，Claude Platform 默认 High；低设置更快更省，高设置推理更久、校验更严。对成本敏感的批处理工作流，显式锁定 Low 或 Medium 是第一优先级的优化；对难任务再按需升档。这套机制与 Opus 5.5 发布时我们分析过的迁移策略一致，两代模型间可以形成「Sonnet 默认、Opus 升档、effort 调节」的三层成本结构。
+
+## 安全与对齐：首个带网络安全防护的 Sonnet
+
+安全维度有实质变化。能力上，Sonnet 5.5 的网络安全水平已可比肩 Opus 5，因此它成为**首个发布时即配备网络安全防护的 Sonnet**：高风险任务自动回退到 Sonnet 5 执行，防御方可以通过 Cyber Verification Program 申请分级访问权限。防滥用侧首次为 Sonnet 配备防蒸馏分类器，阻止通过推理输出提取安全行为；preserved thinking（思维内容与账户绑定）机制同步扩展。对齐质量方面，官方在约 1850 个场景的行为审计中报告对齐、抗滥用与诚实度指标持平或优于 Sonnet 5，越狱容器尝试数量为所有模型中最少。
+
+## 迁移与选型建议
+
+从 Sonnet 5 迁移基本是无痛的，唯一的坑在 thinking 配置：**在关闭 thinking 模式下运行的应用，迁移前需切换到新的 between_tools 设置**，官方迁移指南有专门说明。建议的灰度路径是先在非关键工作流上按 Medium effort 对比质量与成本，再全量切换。
+
+算一笔具体的账来说明成本差异的量级。假设一个批处理文档摘要工作流，每天处理一万份文档，Sonnet 5 时代每份平均消耗 8000 输入 token 与 2000 输出 token，按旧定价每天输出侧就要 2000 万 token 乘以 10 美元每百万，仅输出就是 200 美元。Sonnet 5.5 在同样任务上如果按官方口径把每任务 token 压掉三分之一以上，再配合 effort 档位从 High 降到 Medium，输出侧账单可能落到百美元以下，且延迟降低 30% 让夜间批处理窗口更宽裕。这正是「价格持平但成本下降」的实际含义——优化藏在 token 效率里，而不是价目表上。
+
+选型上给三条可执行的规则。第一，Terminal-Bench 类智能体编码工作流（CI 修复、脚本化运维、批量重构）可以直接切 Sonnet 5.5，它在这类任务上已经是家族最优且价格减半。第二，FrontierCode 类长链路硬核编码与需要持续判断的开放式工作保留 Opus 5.5，别被 GDPval 上的 2 分差距误导——那两个分数在「范围明确」的任务上测出来的。第三，所有从 Sonnet 5 迁移的工作流都应重测一次成本基线：价格没变但 token 效率变了，不重新调 effort 档位等于白拿的优化不要。按 FrontierCode 十五分之一的成本口径，这次升级对大规模编码流水线的账单影响可能是数量级的。
+
+## 生态位观察：中型模型的军备竞赛升级
+
+把这次发布放到整个行业时间线里看，信号意义不小于产品意义。9 月下旬的 Claude 5.5 家族采用「旗舰先行、中档跟进、轻量殿后」的三段式节奏，与 GPT-6 家族的 Sol、Luna 双档结构形成镜像——两大厂商都在用「旗舰定调子、中档走量」的结构瓜分市场，因为真正的收入来自中档：它承载着绝大多数生产 API 调用。Sonnet 5.5 在 Terminal-Bench 上反超自家旗舰这一点尤其值得注意，说明厂商开始为智能体场景在中档模型上做定向特化，而不是简单把旗舰裁剪缩小。对开发者这意味着每季度一次的选型复核不再是可选项：中档模型的能力曲线三个月就换一个台阶，半年前写的「模型选型文档」今天大概率已经过时。建议团队把模型选型做成配置化的路由层——按任务类型分流到不同模型与 effort 档位，新模型发布时跑一遍内部评测集即可完成切换，而不是把模型名硬编码进业务代码。
