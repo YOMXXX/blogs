@@ -134,7 +134,8 @@ def main() -> int:
         print(f"        {summary}")
         for e in errs:
             print(f"        - {e}")
-        templates.append(re.search(r'template:\s*"([^"]+)"', pathlib.Path(f).read_text(encoding="utf-8")).group(1))
+        tpl_m = re.search(r'^template:\s*"?([^"\n]+)"?\s*$', pathlib.Path(f).read_text(encoding="utf-8"), re.M)
+        templates.append(tpl_m.group(1).strip() if tpl_m else "")
         if errs:
             failed.append(slug)
 
