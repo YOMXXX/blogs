@@ -1,0 +1,102 @@
+---
+title: "Cloudflare Artifacts 开放 Beta：为 Agent 时代重造的 Git 底座值得现在上手"
+description: "Cloudflare 把可版本化的 Git 文件系统 Artifacts 推向开放 Beta，新增 Workers 部署、绑定 API、事件订阅、数据辖区与计费，并悬赏征集下一代 Git 平台，10 月 14 日截止。"
+column: "tools"
+tags: ["Cloudflare", "Artifacts", "Git", "Agent工具", "Workers"]
+pubDate: 2026-10-05
+template: "terminal"
+featured: false
+tldr: "10 月 1 日 Cloudflare 宣布 Artifacts（一个说 Git 协议的版本化文件系统，可扩展到百万仓库级）进入开放 Beta，并补齐四块拼图：仓库可直接部署为 Worker、Worker 内可编程式 fork 与读取仓库、全生命周期事件订阅、US/EU 数据辖区。10 月 15 日起按仓库操作数与存储量计费。配套比赛要求作品至少支持多 Agent 并发协作，10 月 14 日截止，第一名获 25000 美元 Cloudflare 信用点。对做 Agent 基础设施的开发者，这是本月截止日期最近的动手机会。"
+author: "YOMXXX"
+faq:
+  - q: "Artifacts 和 GitHub 有什么本质区别？"
+    a: "GitHub 的抽象单元是「人类开发者协作的仓库」，界面是 PR 和 issue。Artifacts 是一组可编程原语：仓库可以为每个 Agent、每个会话、每个任务甚至每个用户程序化创建，数量可以到百万级。它说的是 Git 协议，Agent 现有的 Git 工具链都能直接用，但协作逻辑（评审、合并、冲突处理）留给你在 Worker 代码里自己定义。"
+  - q: "现在用 Artifacts 要花钱吗？"
+    a: "Artifacts 目前对 Workers Paid 计划客户开放 Beta，官方宣布 10 月 15 日开始正式计费，计费因子是仓库操作数和存储量。如果你的 Agent 工作流是高频 fork 和 push 型的，建议先用 Beta 窗口摸清自己的操作量级，估算好账单再决定是否上生产。"
+  - q: "「多 Agent 并发」的比赛硬门槛怎么理解？"
+    a: "Cloudflare 明确说「我们不想要一个加了 Agent 插件的 GitHub」。最低要求是你的系统能让多个 Agent 同时在改动上工作——比如每个任务 fork 出独立仓库、互不干扰地并行开发，最后比价合并。这实际上把「工作树隔离」从人类开发的最佳实践变成了 Agent 平台的准入门槛。"
+  - q: "事件订阅能拿来做哪些自动化？"
+    a: "Artifacts 在仓库创建、导入、fork、删除、push、clone、fetch 时都发布事件，你可以订阅后触发任意 Worker 逻辑。官方示例是订阅 push 事件自动发起代码评审工作流；常见的还有：push 后跑 CI、fork 时预注入 AGENTS.md 指令、检测到冲突分支时召唤协调 Agent。"
+  - q: "数据辖区功能是给谁用的？"
+    a: "创建命名空间时可以选择 US 或 EU 辖区，该命名空间下所有仓库的存储和处理都锁定在对应区域内。这对欧洲合规场景是刚需——无需自行搭建架构就能满足数据驻留要求。创建时一条 curl 命令即可指定，对存量迁移同样友好。"
+---
+
+10 月 1 日，Cloudflare 发了一篇姿态罕见的博文：标题不是「我们发布了什么」，而是「**我们想让你在 Cloudflare 上造出下一代 Git 平台**」。文章宣布两件事：为 Agent 设计的版本化文件系统 **Artifacts** 进入开放 Beta，并补齐了一批关键能力；同时悬赏一场比赛，征集真正为「成百上千个 Agent 同时改同一个代码库」设计的 Git 平台，**10 月 14 日截止**。
+
+作为一个每天在 HN 上刷过无数「为 Agent 重造 X」的读者，这次我愿意认真写一篇评测，因为 Artifacts 是少数已经跑在真实负载上、且给出完整计费与合规承诺的基础设施，而不是 demo。
+
+## 一、先理解它赌的哪个未来
+
+Cloudflare 在文章开头给出了自己的世界观判断：GitHub 是为「人类写代码」的世界设计的——仓库、分支、commit、issue、PR，全都以人为节点。而下一个时代的软件由 Agent 建造，于是问题变了：**几百上千个 Agent 同时改一个代码库时，它们怎么知道别人在改什么？冲突怎么处理？产出谁来评审？怎么记录「为什么改」而不只是「改了什么」？**
+
+Artifacts 的回答是把 Git 的底层原语开放出来，让开发者自己回答上层问题。它是一个「会说 Git 协议的版本化文件系统」，可以为每个 Agent 会话、每个任务、每个用户建仓库，规模到百万级。今年早些时候 Artifacts 以 beta 形态发布，当时的定位就是「可编程原语」而非「又一个 GitHub」。
+
+## 二、这次补齐的四块拼图
+
+开放 Beta 一次带出了四个新能力，每个都直指 Agent 工作流的真实痛点。
+
+**拼图一：仓库直接部署成 Worker。** Artifacts 仓库现在可以接入 Workers Builds：push 到生产分支自动构建并部署 Worker，push 到其他分支自动创建或更新 Workers Previews——每个分支一个可分享的隔离预览环境。对 Agent 场景这意味着什么？**Agent push 一段代码，云端立刻多一个能点的预览 URL**，「改动是否真的能用」的验证闭环被压缩到了秒级。
+
+**拼图二：Worker 里直接操作仓库。** 新的 Artifacts 绑定让 Worker 代码可以创建、fork 仓库，读文件和 commit，签发仓库级 Git token。官方示例浓缩了整个设计哲学——新任务到达时，Worker fork 出一个隔离仓库、读出 `AGENTS.md` 里的指令、把远程地址和 token 塞给 Agent：
+
+```js
+using project = await env.ARTIFACTS.get("my-project");
+const { defaultBranch } = await project.info();
+const workspace = await project.fork(`task-${crypto.randomUUID()}`);
+
+using repo = await env.ARTIFACTS.get(workspace.name);
+const instructions = await repo.readFile({
+  ref: defaultBranch,
+  path: "AGENTS.md",
+});
+
+const agentTask = {
+  remote: workspace.remote,
+  token: workspace.token,
+  instructions: instructions ? await instructions.text() : null,
+};
+```
+
+十行代码完成「给每个 Agent 一个干净的独立工作区」——这在传统 Git 托管上要绕一整套 GitHub App 和权限配置。
+
+**拼图三：事件订阅。** 仓库的创建、导入、fork、删除、push、clone、fetch 全部发事件。订阅 push 事件自动拉起代码评审工作流，是官方给出的第一个例子：把仓库、分支、新 commit 传给评审 Agent，评审链路完全事件驱动。
+
+**拼图四：数据辖区与可观测。** 命名空间创建时可指定 US 或 EU 辖区，旗下仓库自动跟随——欧洲合规需求一条 curl 解决。仪表盘里能看到每个仓库的操作数、pull、push、错误率，也支持直接查询指标自建监控。
+
+## 三、计费与门槛：明牌摆在桌上
+
+三件事提前算清楚：
+
+- **计费**：按仓库操作数和存储量计费，**10 月 15 日开始**。高频 fork-push 型的 Agent 工作流要重点评估操作数成本。
+- **准入**：开放 Beta 面向 Workers Paid 计划客户。
+- **比赛**：10 月 14 日截止，要求 5 到 10 分钟演示视频、宽松开源协议（MIT、Apache、BSD）源码、可运行说明；硬门槛是**至少支持多 Agent 并发协作**；前三名受邀去旧金山参加 Cloudflare Connect，第一名另得 25000 美元信用点。
+
+## 四、横评：它该放在你工具箱的哪一层
+
+把 Artifacts 和现有选项放在同一张表里看：
+
+| 维度 | GitHub | 自建 Gitea/Forgejo | Cloudflare Artifacts |
+| --- | --- | --- | --- |
+| 程序化建仓规模 | 受配额与费率约束 | 自己运维 | 百万仓库级原生设计 |
+| 每 Agent 隔离工作区 | 手工 fork 管理成本高 | 脚本自建 | fork 原语内置 |
+| 部署闭环 | 需外部 CI/CD | 自建 | push 即部署与预览 |
+| 事件驱动 | Webhook 可用 | 可用 | 原生事件 + 队列集成 |
+| 数据辖区 | 企业版能力 | 自行实现 | 命名空间级开关 |
+
+结论很清晰：**如果你在搭 Agent 编排平台、多 Agent 代码生成服务或者按会话隔离的开发环境，Artifacts 是目前唯一把「百万仓库、每任务一仓、push 即部署」做成原语的托管选项**。如果你只是个人项目托管，GitHub 依然是更省心的选择——Artifacts 没有要替代这个场景。
+
+## 五、动手建议：三天能验证的三件事
+
+比赛还有九天截止，给出一个务实的验证路线：
+
+```text
+第 1 天：Workers Paid 计划下建 Artifacts 命名空间，
+        用官方提示词让你的编码 Agent 建仓并推送第一个项目，
+        观察 push 触发 Workers Builds 的部署闭环。
+第 2 天：写一个 Worker 订阅 cf.artifacts.repo.pushed 事件，
+        接入你最常用的评审或测试 Agent，跑通事件驱动链路。
+第 3 天：模拟多 Agent 并发——三个任务三个 fork，
+        验证隔离性与合并流程，顺便记录操作数，估算 15 日后的账单。
+```
+
+Artifacts 不会杀死 GitHub，正如对象存储没有杀死文件系统。但它确认了一个正在加速的趋势：**当代码的生产者从人变成 Agent，版本控制的抽象必须跟着变**。比赛截止日前的这两周，大概是一年里试错成本最低的入场时机。
