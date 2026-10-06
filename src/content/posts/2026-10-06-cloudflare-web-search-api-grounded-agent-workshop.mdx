@@ -1,0 +1,90 @@
+---
+title: "Cloudflare Web Search API 实战：一条 REST 调用给 Agent 接上可审计的实时联网"
+description: "Cloudflare 在 AI Gateway 里推出 Web Search API 公测：Ceramic、Exa、Linkup 三家搜索源统一接入，Workers 绑定一行调用，支持自带密钥与零数据保留。本文带你从零跑通 REST 与 Worker 两条路径。"
+column: "workshop"
+tags: ["Cloudflare", "Web Search API", "AI Gateway", "Agent", "RAG"]
+pubDate: 2026-10-06
+template: "classic"
+featured: false
+tldr: "Agent 要联网，过去要么自己对接每家搜索 API（鉴权、计费、日志各管各的），要么依赖模型厂商内置的搜索工具（被锁死在单一生态）。Cloudflare 10 月 2 日公测的 Web Search API 把搜索做成了 AI Gateway 里的一等公民：一条 REST 调用或一个 Worker 绑定就能在 Ceramic、Exa、Linkup 三家之间切换，搜索请求进网关日志统一可审计，按提供商牌价计费不加价，还支持零数据保留与自带密钥。本文用两个可复制的最小示例带你跑通，并给出选型与合规上的实操建议。"
+author: "YOMXXX"
+faq:
+  - q: "Web Search API 和直接调 Exa 或 Linkup 的官方 API 有什么区别？"
+    a: "功能上搜索结果一致，区别在运维面。走 Cloudflare 中转后，三家提供商的调用方式统一成同一个接口，切换提供商只改一个 provider 字段；所有请求进 AI Gateway 日志，可以和你的模型调用放在一起观测；计费并入 AI Gateway 余额，不用为每家单独开账单。对多提供商策略或需要统一审计的团队，这层抽象是值得的。"
+  - q: "零数据保留（ZDR）具体指什么？"
+    a: "上线时支持的三家提供商 Ceramic、Exa、Linkup 都承诺：经 Cloudflare 转发的搜索请求，提供商侧不保留请求数据。对处理敏感业务场景的 Agent 来说，这意味着你发给搜索服务的查询词不会变成提供商的训练数据或分析素材。合规要求严格的团队建议在合同层面再与提供商确认一次适用范围。"
+  - q: "BYOK 自带密钥的回退逻辑是什么？"
+    a: "如果你在请求里显式指定了 byokAlias，而网关上没有配置对应的密钥，请求会直接报 400 错误，不会悄悄回退到 AI Gateway 余额计费——这避免了意外的费用走向。如果省略 byokAlias，网关会先找该提供商名下别名为 default 的存储密钥，找不到才走余额计费。显式指定是更可预测的做法。"
+  - q: "搜索结果能直接喂给模型吗？限制是什么？"
+    a: "响应里的 items 数组就是标准的标题、链接、摘要三元组，直接序列化后放进上下文即可。硬限制有两条：查询单条最长 1024 字符，每次最多返回 10 条结果。给 Agent 当工具用时，建议把 limit 设为 5，用查询词本身的精确度而不是结果数量来控制上下文膨胀。"
+  - q: "现在上生产靠谱吗？"
+    a: "产品处于 beta 阶段，接口形态和提供商列表都可能调整，核心链路（REST 与 Workers 绑定）已经稳定可用。建议的节奏是：内部工具与原型现在就可以接入，把 gateway 日志和延迟基线跑起来；对外生产链路等正式发布再切，同时把 provider 字段做成配置项，保留随时换搜索源的能力。"
+---
+
+Agent 开发者在这一年里反复面对同一个选择题：让模型联网，但联网这一步到底归谁管。自己对接搜索 API，鉴权、计费、配额、日志要在每家提供商那里各维护一遍；用模型厂商内置的联网功能，又被锁进单一生态，搜索质量与成本都没有议价权。Cloudflare 在 10 月 2 日给出的答案是把它做成基础设施：Web Search API 进入公测，搜索成为 AI Gateway 里的一等公民。
+
+## 它到底解决了什么
+
+这个产品的核心设计有三个点，每个都值得单独说。
+
+**第一，搜索源可插拔。** 发布时接入三家提供商：Ceramic（默认）、Exa、Linkup。切换提供商只需改请求里的一个 provider 字段，接口形态完全一致。这不是简单的代理转发——三家的爬虫都承诺遵守 Cloudflare 的 verified bot 标准，且全部支持经 Cloudflare 转发时的零数据保留。对合规敏感的场景，ZDR 意味着你的查询词不会沉淀在搜索提供商那边。
+
+**第二，可观测性是默认的。** 所有搜索请求走 AI Gateway，进网关日志。你可以在同一个地方看到「模型调用了什么搜索、花了多少、延迟多少」。过去搜索是散落在各个模型厂商后台的黑盒调用，现在它和你的 LLM 调用共享同一套观测面。排障时这条价值最大：Agent 答错问题，你终于能分清是模型没搜到、搜到了没读、还是搜索源本身返回了垃圾。
+
+**第三，计费不加价。** 搜索按各提供商的挂牌 API 价格计入 AI Gateway 余额，Cloudflare 不抽成；也可以 BYOK 自带某家的密钥，由提供商直接向你计费。密钥存在网关的 Secrets Store 里加密保存，请求中不携带明文。
+
+## 路径一：REST API，五分钟跑通
+
+前置条件只有三个：Cloudflare 账号、一个 AI Gateway（每个账号自带名为 default 的网关）、网关余额或提供商密钥。API Token 需要 Workers AI Read 与 AI Gateway Read 两个权限。
+
+```bash
+curl https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/ai/websearch/ \
+  --request POST \
+  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "query": "Cloudflare Web Search API pricing",
+    "provider": "ceramic",
+    "limit": 5,
+    "options": { "gateway": { "id": "default" } }
+  }'
+```
+
+响应结构很克制：items 数组里每条是 url、title、description 三元组，metadata 里带回 requestId 与 latencyMs。没有过度包装的嵌套结构，直接序列化塞进模型上下文即可。
+
+参数面只有四个要记的：query 最长 1024 字符；provider 可选 ceramic、exa、linkup（缺省 ceramic）；limit 在 1 到 10 之间（缺省 10）；byokAlias 用于指定网关上存储的提供商密钥别名——注意显式指定后如果密钥不存在，请求会直接报 400 而不是回退到余额计费，这个「宁可失败不做意外回退」的设计比大多数聚合网关诚实。
+
+## 路径二：Worker 绑定，生产形态
+
+在 wrangler 配置里加一个 AI 绑定，之后一行调用：
+
+```ts
+export default {
+  async fetch(request, env): Promise<Response> {
+    const response = await env.AI.websearch({
+      gatewayId: "default",
+      query: "Cloudflare Birthday Week 2026 announcements",
+      provider: "exa",
+      limit: 5,
+    });
+    const results = await response.json();
+    return Response.json(results);
+  },
+} satisfies ExportedHandler<Env>;
+```
+
+返回的是标准 Response 对象。真正有意思的用法是把它注册成模型的工具，让模型自己决定何时搜索、用什么查询词。官方文档给了完整示例：用 Workers AI 跑一个开源模型，定义 web_search 工具函数，模型发起调用后执行搜索、把结果以 tool 消息回填、再跑第二轮推理。这个「模型提词、网关搜索、结果回流」的循环，就是当前 Agent 联网 grounding 的标准形态，Cloudflare 把三个环节收进了同一个运行时。
+
+## 和模型厂商内置搜索比，取舍在哪
+
+既然各家模型 API 都有内置联网，为什么还要单独一层？把两者的差异摊开看。内置搜索的优势是零集成成本、厂商对结果与模型的对齐做过联合优化；代价是你看不到搜索了什么、搜到什么、花了多少，且换模型就要重学一套工具协议。Web Search API 这类横向抽象正好反过来：集成多花半小时，换来搜索与模型解耦——同一个搜索层可以喂给任何模型（自建的、开源的、多厂商的），评测换模型时 grounding 管线不用重写。
+
+还有一个容易被忽略的点：可复现性。AI Gateway 的日志把每次搜索的查询词、提供商、延迟、结果都记下来，这对调试「模型为什么答错」是无价的——你能精确重放当次搜索看到了什么。内置搜索的黑盒模式下，这类问题只能靠猜。当然，解耦也有代价：搜索质量与模型的配合要自己调，比如查询词改写策略、结果条数、摘要截断，这些在内置方案里是厂商帮你调好的。工程团队的判断标准很简单：如果你的 agent 是产品核心、需要跨模型评测或多提供商冗余，这半小时的集成成本非常划算；如果只是给内部问答机器人加个联网，内置搜索更省事。
+
+## 选型与落地建议
+
+三家搜索源怎么选，官方没有给基准对比，实操上可以先按这个策略摸底：Ceramic 作为默认做基线；Exa 在语义化、研究型查询上口碑较好；Linkup 偏欧洲语料与新闻源。在 gateway 日志里按查询类别分别统计三家的延迟与结果命中率，跑一周数据再做路由策略，比看任何营销页都可靠。
+
+三个工程提醒：其一，limit 控制在 5 左右，搜索结果的 token 占用是 Agent 上下文膨胀的隐形大户；其二，查询词是模型生成的，记得在网关日志侧做敏感信息过滤，别让用户的隐私数据变成搜索词发出去；其三，beta 期间把 provider 做成配置项而不是硬编码，等正式发布时三家名单可能变化。
+
+搜索这个环节正在快速基础设施化：模型厂商内置搜索是「纵向绑定」，Cloudflare 这类网关聚合是「横向抽象」。后者的价值在于把选择权还给开发者——这是 10 月最值得接入试水的新工具，没有之一。
