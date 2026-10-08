@@ -1,0 +1,144 @@
+---
+title: "Docker Agent 实战：用一份 YAML 把团队工作流装进容器"
+description: "Docker 官方工程团队的声明式智能体构建器与运行时 docker-agent：YAML 定义、MCP 工具集、多智能体委派、RAG 检索与 OCI 镜像分发，本文从安装一路跑到团队编排，给出完整可复用的配置与工程判断。"
+column: "workshop"
+tags: ["Docker", "AI Agent", "MCP", "YAML", "多智能体", "开源"]
+pubDate: 2026-10-08
+template: "editorial"
+featured: false
+tldr: "docker-agent 是 Docker 官方工程团队出品的智能体构建器与运行时，以 docker CLI 插件形式存在。本文从安装、YAML 配置、MCP 工具接入写到多智能体编排与 OCI 镜像分发，帮你把智能体像容器镜像一样版本化、分享和运行。"
+author: "YOMXXX"
+faq:
+  - q: "Docker Agent 和 Docker 本身是什么关系？"
+    a: "它是一个 docker CLI 插件，安装后可以直接用 docker agent 命令调用。Docker Desktop 4.63 及以上版本已预装该插件，因此对大多数桌面用户来说开箱即用，无需额外安装步骤。"
+  - q: "必须使用 OpenAI 的模型吗？"
+    a: "不必须。它支持 OpenAI、Anthropic、Gemini、AWS Bedrock、Mistral、xAI 等云端供应商，也支持 Docker Model Runner 在本地跑模型。只要设置对应的环境变量或配置本地模型，就能切换供应商，切换成本接近零。"
+  - q: "YAML 声明式配置相比代码框架有什么优势？"
+    a: "配置即文档，智能体的模型、指令、工具集全部收敛在一个可版本控制的文件里，方便评审、回滚和跨团队复用。缺点是复杂控制流表达能力有限，需要精细编排的场景仍要靠工具与子智能体拆解来弥补。"
+  - q: "智能体怎么分享给同事使用？"
+    a: "可以把智能体配置推送到任意 OCI 镜像仓库，同事用 docker agent run 命令按名称加标签拉取运行，就像拉取普通容器镜像一样。这复用了企业已有的镜像仓库权限体系与分发渠道。"
+  - q: "生产环境使用需要注意什么？"
+    a: "默认会收集匿名遥测数据，企业落地前应按官方文档关闭或审计。另外智能体拥有 shell 与文件访问能力，建议用容器隔离运行环境、最小化挂载目录，并给不同智能体分配尽可能小的工具权限。"
+---
+
+Docker 在十月份把一个新东西顶上了 Hacker News 首页：`docker/docker-agent`，官方描述是「AI Agent Builder and Runtime by Docker Engineering」。它不是又一个 Python 框架，而是一个 `docker` CLI 插件——装好之后你在终端里敲 `docker agent`，就能构建、运行和分享智能体。仓库开站在一年内攒下三千七百多个 star，Apache-2.0 协议，主语言 Go。对被 LangChain、CrewAI、AutoGen 的抽象层轮番洗礼过的开发者来说，这个「用容器思维做智能体」的路径值得认真试一次。
+
+## 为什么 Docker 要做智能体运行时
+
+先理解定位。Docker Agent 解决的问题是：智能体的定义散落在代码、环境变量和启动脚本里，难以评审、难以分发、难以在团队内复用。它的答案是三个词——**声明式、工具生态、镜像分发**。
+
+智能体用一份 YAML 定义：模型是谁、系统指令是什么、挂哪些工具集，全部收敛到一个可 `git diff` 的文件。工具方面内置了 think、todo、memory 等智能体常用工具，同时可以接任意 MCP 服务器，本地、远程或容器化的都行。最后，智能体可以打包推送到任意 OCI 镜像仓库，同事用一条命令拉取运行——企业现有的镜像仓库权限体系、扫描流程、CDN 分发全部直接复用。
+
+这和 Docker 当年做容器化的逻辑同构：把「在我机器上能跑」变成「在任何机器上都能跑」。智能体时代的版本可能就是「在我的配置文件里能跑」。
+
+## 五分钟跑起来
+
+三种安装方式任选。Docker Desktop 4.63 以上已经预装插件，直接可用；Homebrew 用户一条命令搞定；也可以从 GitHub Releases 下载二进制，软链到 `~/.docker/cli-plugins/docker-agent` 即可用 `docker agent` 调用。
+
+```sh
+# 方式一：Docker Desktop 4.63+ 已预装，直接运行
+docker agent run
+
+# 方式二：Homebrew
+brew install docker-agent
+docker-agent run
+
+# 方式三：交互式生成一个新智能体
+docker agent new
+```
+
+模型侧至少要设一个 API key，或者用 Docker Model Runner 走本地推理：
+
+```sh
+export OPENAI_API_KEY=sk-...
+# 或 ANTHROPIC_API_KEY / GOOGLE_API_KEY 等
+```
+
+## 第一份智能体配置
+
+一个最小可用的单智能体长这样：
+
+```yaml
+agents:
+  root:
+    model: openai/gpt-5-mini
+    description: A helpful AI assistant
+    instruction: |
+      You are a knowledgeable assistant that helps users
+      with various tasks. Be helpful, accurate, and concise.
+    toolsets:
+      - type: mcp
+        ref: docker:duckduckgo
+```
+
+几个关键字段值得展开讲。`model` 用「供应商/模型名」的写法，运行时负责路由到对应的 API；`instruction` 是系统提示词，YAML 的块标量语法让多行提示词写起来很舒服；`toolsets` 里 `ref: docker:duckduckgo` 引用的是 Docker 托管的 MCP 服务器目录——搜索能力就这样挂上了，一行配置，不用自己起进程。
+
+保存为 `agent.yaml` 后运行：
+
+```sh
+docker agent run agent.yaml
+```
+
+终端会进入交互式 TUI，可以直接对话，也可以观察智能体的工具调用轨迹。调试提示词时这个轨迹视图非常关键：哪一步搜索、搜到了什么、模型如何引用，一目了然。
+
+## 多智能体编排：委派而不是堆提示词
+
+单智能体迟早遇到上下文爆炸。Docker Agent 的解法是多智能体团队：在同一个 YAML 里定义多个专家，根智能体自动把子任务委派出去。下面是一个「技术调研小组」的例子：
+
+```yaml
+agents:
+  root:
+    model: anthropic/claude-sonnet-5-5
+    description: 调研项目负责人
+    instruction: |
+      拆解用户的调研需求，分别委派给搜索专家与代码专家，
+      汇总结果后给出结构化结论。
+    toolsets:
+      - type: mcp
+        ref: docker:duckduckgo
+  searcher:
+    model: openai/gpt-5-mini
+    description: 负责网络检索与资料整理
+    instruction: 快速检索并给出带来源的要点清单。
+    toolsets:
+      - type: mcp
+        ref: docker:duckduckgo
+  coder:
+    model: openai/gpt-5-mini
+    description: 负责写验证脚本
+    instruction: 编写并运行小型脚本验证数据结论。
+```
+
+根智能体在运行时读每个专家的 `description` 来决定把任务派给谁，被委派的智能体独立持有上下文与工具，干完活把结论交回来。这比在一条系统提示词里写「你是搜索专家兼代码专家」干净得多——每个智能体的提示词、模型、工具都可以独立调优、独立换模型。
+
+一个实用建议：给委派型根智能体配强模型，给执行型子智能体配便宜模型。编排逻辑吃推理能力，执行环节吃吞吐，成本结构立刻优化一层。
+
+## RAG 与知识接入
+
+内置的可插拔检索支持 BM25、向量嵌入、混合搜索与重排序，不用自己拼检索链路。典型做法是把一个文档目录挂进配置，智能体回答时自动检索引用。对内部知识库问答、代码库问答这类场景，省掉的胶水代码相当可观。需要更精细控制时，依然可以通过 MCP 接自建检索服务，两条路不冲突。
+
+## 打包、分发、版本化
+
+这是 Docker Agent 最有辨识度的一步：
+
+```sh
+# 推送智能体到 OCI 仓库
+docker agent push myorg/research-team:1.0.0
+
+# 任何人、任何机器上一条命令运行
+docker agent run myorg/research-team:1.0.0
+```
+
+智能体配置从此有了镜像语义：标签即版本， Digest 可锁定，回滚就是换 tag。团队里「把你的智能体发我一份」变成了 `docker pull`。对于已经建好镜像仓库治理流程的组织，这是其他框架都不具备的分发通道。
+
+## 工程视角的三点判断
+
+**第一，声明式与代码式的取舍。** LangGraph、CrewAI 们给你代码级控制流，适合产品内嵌；Docker Agent 给你配置级声明，适合工作流标准化。复杂分支逻辑在 YAML 里表达会很快变扭，它的甜区是「团队内部工具型智能体」，不是消费级产品内核。
+
+**第二，MCP 生态是它真正的护城河。** Docker 托管 MCP 目录加上任意自建 MCP 服务器，意味着工具接入这件事从「写集成代码」变成了「改一行配置」。MCP 已经是事实标准，押注它的运行时占便宜。
+
+**第三，隔离模型天然合理。** 智能体要执行 shell、读写文件，把执行环境放进容器是最不需要解释的安全边界。官方用它自己开发自己（仓库里的 `golang_developer.yaml`），这种自举通常意味着工具链打磨到了可用水平。
+
+## 小结
+
+Docker Agent 把智能体开发里最琐碎的三件事——配置管理、工具接入、分发——压回了开发者已经熟悉的心智模型。如果你的团队正在为「智能体脚本满地跑、谁也不敢删」头疼，花一个下午把它跑通，可能比再引入一个 Python 框架更划算。仓库与文档都在 GitHub 与 docker.github.io，Apache-2.0 协议，可以放心改造。
