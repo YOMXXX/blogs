@@ -1,0 +1,133 @@
+---
+title: "Whistle 16.9MB 端侧语音转写实战：一个 CPU 引擎吃下语音与工具调用"
+description: "Cactus 开源 Whistle 语音识别模型，单文件 16.9MB、纯 CPU 运行，转写七种语言并输出词级时间戳，首 token 仅 11 毫秒。本文带你在本地把它跑起来，并与 Whisper 做实测对比。"
+column: "workshop"
+tags: ["语音识别", "Whistle", "端侧推理", "Whisper", "本地部署", "Cactus"]
+pubDate: 2026-10-09
+template: "terminal"
+featured: false
+author: "YOMXXX"
+tldr: "Cactus 发布开源语音识别模型 Whistle：单文件 16.9MB、零依赖纯 CPU 运行，支持英德法西意荷波七种语言，词级时间戳与语音嵌入一体化输出。在 Apple M4 Pro 上首 token 延迟 11.1 毫秒、解码 1319 token 每秒，体积只有 Whisper base 的八分之一，LibriSpeech 等多个基准的词错率反而更低，还能与 Needle 文本模型共载一个引擎直接输出工具调用。"
+faq:
+  - q: "Whistle 和 Whisper 相比，核心差异在哪里？"
+    a: "Whistle 是为端侧重新设计的架构：编码器用八层 Simple Attention 块（含 mHC 残差与 Monarch Hadamard MLP），解码器用阶梯式分层结构，任何一个深度都能独立加载。它没有依赖 Python 生态，而是一个 16.9MB 的模型文件加一个 C++ 引擎，首 token 延迟 11.1 毫秒，比 Whisper base 的 73.2 毫秒快六倍多，体积只有其八分之一。"
+  - q: "Whistle 支持中文吗？"
+    a: "目前不支持。首发支持英语、德语、法语、西班牙语、意大利语、荷兰语和波兰语七种语言，语言检测会作为词表里的一个语言 token 输出。中文场景暂时建议继续用 Whisper large 系列或 SenseVoice 等专门优化过中文的模型，Whistle 的价值在于极端受限的端侧环境。"
+  - q: "词级时间戳是怎么得到的，准确吗？"
+    a: "Whistle 的时间戳直接从解码器注意力对齐得到，每个词输出开始时间、结束时间和概率三项。这是传统 CTC 对齐之外更轻的做法，不需要额外的强制对齐模型。官方在 86174 条 utterance 上用 Whisper 标准归一化器评测词错率，时间戳质量随转写质量走，对清晰语音足够用。"
+  - q: "语音转写和工具调用是怎么在同一个引擎里串起来的？"
+    a: "Whistle 与 Cactus 的文本模型 Needle 共用同一个 C++ 运行时和量化体系。把两个模型同时加载后，引擎先把音频转写，再把转写文本直接送进 Needle 与你的工具定义做匹配，最后返回一个 JSON 对象：function_calls 字段是工具调用，audio_text 和 audio_language 是语音字段。调用方完全不用碰中间转写文本。"
+  - q: "生产环境部署 Whistle 需要注意什么？"
+    a: "引擎为十七个平台提供预编译产物，覆盖 macOS、Linux、Android、iOS、watchOS、Windows on ARM、RISC-V、MIPS、浏览器和 WASI。行为全部由编译默认值或显式标志控制，不读环境变量，这对容器化部署非常友好。注意音频要求 16 kHz 单声道，其他采样率需要额外装 soxr 做重采样，麦克风采集再加 sounddevice。"
+---
+
+端侧语音识别长期被一个尴尬卡住：Whisper base 有 145.3MB，moonshine tiny 也要 41.9MB，放到手表、微控制器或者车载低功耗芯片上，光是模型体积就已经逼近存储预算，更别说延迟。Cactus 团队 10 月 2 日发布的 Whistle 把这个数字直接砍到 **16.9MB**，单文件、零 Python 依赖、纯 CPU 推理，还顺手把「语音进、工具调用出」这条链路收进了同一个二进制。这篇实战把它在本地完整跑一遍。
+
+## 一、为什么 16.9MB 是个值得认真对待的数字
+
+先看官方在 Apple M4 Pro CPU 上给出的三方对比（10 秒音频、各自官方运行时默认配置）：
+
+| 指标 | Whistle | Whisper base | Moonshine tiny v2 |
+|------|---------|--------------|-------------------|
+| 体积 | 16.9MB | 145.3MB | 41.9MB |
+| 首 token 延迟 | 11.1ms | 73.2ms | 22.8ms |
+| 解码速度 | 1319 token/s | 266 token/s | 262 token/s |
+
+体积小了八倍多，速度反而快了五倍，这不是用精度换来的：在 LibriSpeech test-clean、test-other、SPGISpeech、Earnings-22 和 FLEURS 多语平均上，Whistle 的词错率全面低于 Whisper base；Whisper 只在 TED-LIUM、AMI 和 MLS 平均上占优。对端侧场景来说，这是一次「便宜而且更好」的升级，而不是妥协。
+
+首 token 延迟还有个细节：Whisper 会把所有输入补齐到 30 秒，所以它的首 token 延迟与音频长度无关、恒定偏高；Whistle 的延迟跟随音频长度走——5 秒音频 5.9ms，10 秒 11.1ms，30 秒 36.3ms。对「按下说话、立刻出字」的交互，短音频的收益最大。
+
+## 二、架构速览：它靠什么做到这么小
+
+Whistle 的结构分三段，理解这个对后面调参有用：
+
+**前端**：16 kHz 单声道音频按 25ms 窗口、10ms 步进切帧，提 80 维 log-mel 特征，频带限制在 250 到 3500 Hz。30 秒音频是 3000 帧，经过一个 128 通道、kernel 9 的卷积 stem 三次降采样后剩 375 帧，每帧对应 80ms 音频。之后所有阶段都跑在这个速率上。
+
+**编码器**：八层 Simple Attention 块，其中四个是 mHC 多残差通道，前馈网络换成 Monarch Hadamard MLP——这套积木与 Cactus 家文本模型 Needle 完全同源。注意力是非因果的，3 秒处的帧可以直接看到 12 秒处的帧。
+
+**解码器**：八层阶梯式 Simple Attention，宽度 512，8 个 query 头对 2 个 KV 头，第 3 层和第 7 层带 engram 查表（18432 个槽位）。语音特有的部分是每层一个门控交叉注意力，把编码器输出注入进来，K、V 投影只在音频到达时算一次、整个解码过程复用——所以 5 路 beam search 的代价只是 5 份转写缓存，不是 5 遍音频。
+
+最实用的设计是「阶梯」：解码器每个深度（从 2 层起）都作为独立模型训练过，加载时用 `--audio-depth` 参数选一层。设备紧张就砍深度，编码器永远全量跑。这等于一个模型文件内置了从高到低一整条精度-速度曲线。
+
+## 三、五分钟跑起来
+
+安装一个包就够：
+
+```bash
+pip install cactus-needle
+```
+
+最基础的转写：
+
+```python
+import needle
+
+result = needle.transcribe("clip.wav")
+print(result["text"])
+# turn off the kitchen lights
+```
+
+返回字典里除了 `text`，还有语言、首 token 毫秒数和解码 token 每秒。几个常用开关：
+
+```python
+result = needle.transcribe(
+    "clip.wav",
+    language="de",            # 强制德语，默认自动检测
+    word_timestamps=True,     # 每个词输出起止时间与概率
+    keywords=["Siobhan", "Krzysztof"],  # 关键词偏置
+)
+```
+
+关键词偏置值得单独说：它在解码时用 Aho-Corasick 自动机同步扫描 beam，随着匹配前缀推进抬高对应短语的 log 概率。人名、产品名、领域术语这些「模型没见过但你知道会出现」的词，靠这个机制能显著降低转写错误，而且不用微调模型。
+
+想先在终端里试手感，内置了两个命令：
+
+```bash
+needle whistle playground   # 麦克风实时转写
+needle whistle compare      # 同一段音频跑 Whistle、Whisper、Moonshine 三方对比
+```
+
+## 四、语音直出工具调用：一行命令的组合
+
+这是 Whistle 最有意思的用法。它和 Needle 共享同一个 `.cact` 模型容器格式与 C++ 引擎，把两个模型同时加载，引擎会把音频转写后直接交给文本模型做工具匹配：
+
+```bash
+needle --model whistle.cact --model needle3.cact \
+       --tools tools.json --audio clip.wav
+```
+
+输出是一个 JSON 对象：
+
+```json
+{"function_calls":[{"name":"set_lights","arguments":{"room":"kitchen","on":false}}],
+ "confidence":0.94,
+ "audio_text":"turn off the kitchen lights",
+ "audio_language":"en"}
+```
+
+注意 `function_calls` 和 `audio_text` 在同一个返回里：调用方拿到的直接是结构化指令，转写文本只是附属字段。对智能家居、车载语音、机器人这类「说话就是下指令」的场景，这意味着不需要再写一层转写-理解-路由的胶水代码，一个进程搞定。
+
+C API 也一样极简，全部语音能力就三个函数：`needle_load`、`needle_transcribe`、`needle_embed`。
+
+## 五、部署与踩坑提示
+
+引擎为十七个目标平台提供预编译产物，每个目录里有 `needle` 二进制、`libneedle.a` 静态库和 `needle.h` 头文件：
+
+```bash
+needle download macos-arm64
+needle download whistle
+./macos-arm64/needle --model whistle.cact --audio clip.wav --audio-word-timestamps
+```
+
+几个工程上要注意的点：
+
+1. **音频规格**：16 kHz 单声道 WAV 或裸采样开箱即用；其他采样率要装 `[mic]` extra（soxr 重采样），麦克风采集再加 sounddevice。
+2. **静音处理**：引擎在解码前先测音频响度范围，低于阈值直接返回空转写、不进 beam search——处理 VAD 时不需要在外面包一层静音判断。
+3. **零环境变量**：引擎不读任何环境变量，全部行为由编译默认值或显式标志决定，容器里不用担心配置漂移。
+4. **嵌入输出**：`embed(audio)` 返回编码器输出，每 80ms 帧一行，不解码文本——拿语音做检索、声纹聚类或下游分类时直接用这个接口，省掉整个解码开销。
+
+## 六、适用边界
+
+Whistle 明确不适合的场景也要说清楚：七语言清单里没有中文，需要中文转写继续用 Whisper large 或专门模型；单次最多 30 秒，长音频要自己做分段拼接；它是转写模型而非通用音频理解模型，说话人分离、音乐检测都不在能力清单里。
+
+它的甜点区非常清晰：手机、可穿戴、机器人、智能家居、车机、微控制器这些「存储以 MB 计、没有 GPU、要求毫秒级响应」的地方。16.9MB、11ms 首 token、1319 token/s 这三个数字放在一起，把「语音交互上端侧」的门槛从旗舰设备拉到了几乎任何设备。如果你正在给某个嵌入式产品加语音入口，这个模型值得今天下午就试一轮。
