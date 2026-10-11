@@ -1,0 +1,96 @@
+---
+title: "Talorys 实战：一条命令把私人 AI Agent 部署进你自己的 Cloudflare 账号"
+description: "开源项目 Talorys 用一条 npx 命令把聊天、记忆、任务、提醒四件套部署进你自己的 Cloudflare 免费层，数据全部落在你的 Durable Object 里。本文拆它的架构与部署流程。"
+column: "workshop"
+tags: ["Cloudflare", "个人 Agent", "开源项目", "Durable Objects", "Workers AI", "自托管"]
+pubDate: 2026-10-11
+template: "editorial"
+featured: false
+author: "YOMXXX"
+tldr: "Talorys 是 10 月 10 日刚发布的开源个人 AI 助手：一条 npx create-talorys 命令，把聊天、长期记忆、任务笔记、定时提醒整套部署进你自己的 Cloudflare 免费账号。Agent 跑在 Durable Object 里，数据存它内置的 SQLite，模型用 Workers AI 的 glm-4.7-flash，Agent Worker 不设公网地址，前后端靠 service binding 通信。本文拆它的架构设计并走一遍部署。"
+faq:
+  - q: "Talorys 和把 ChatGPT 当私人助手有什么本质区别？"
+    a: "区别在数据主权和记忆控制。ChatGPT 的对话与记忆存在厂商那边，你只能看和删；Talorys 的全部数据存在你自己的 Cloudflare 账号里的 Durable Object SQLite，包括对话、记忆、任务和设置，随时可以导出或整个删掉项目。记忆是显式可编辑的：你能看到它记了什么、改掉哪条、删掉哪条，每轮只把最相关的记忆发给模型。"
+  - q: "免费层真的够用吗，会不会悄悄超出额度？"
+    a: "它刻意只用了四样有免费额度的服务：Pages、Workers、Durable Objects 和 Workers AI，明确不用 R2、D1、KV、Vectorize 这些。单用户场景下请求量很低，Durable Object 的 SQLite 存储对个人笔记任务这类数据规模绰绰有余。唯一的变量是 Workers AI 的每日额度，用完也不会坏——任务、笔记、记忆、提醒都不依赖模型，照常工作，只是聊天不可用。"
+  - q: "为什么说它的安全设计值得其他个人 Agent 项目抄？"
+    a: "两个细节。第一，Agent Worker 部署时把 workers_dev 和 preview_urls 都设为 false，也就是根本没有公网 URL，浏览器只访问你的 Pages 站点，API 请求由 Pages Function 通过 service binding 转发到私有 Worker，外部攻击面收窄到前端这一层。第二，认证和鉴权在 Worker 里做而不是前端做，安装器只设一个 owner 密码，单用户设计把多租户那套复杂度整个砍掉了。"
+  - q: "定时提醒是怎么做到不常驻在线的？"
+    a: "靠 Durable Object 的 alarms 机制。Durable Object 平时可以休眠，不占计算时间，到点由平台唤起执行提醒、每日任务摘要或循环例程，跑完再睡。这就是无服务器架构对个人 Agent 的真正意义：不需要你养一台永远开着的机器，也不需要自己折腾 cron 和推送服务，平台的调度器替你兜底，免费层也覆盖这个能力。"
+  - q: "部署和使用的前置要求是什么？"
+    a: "一台装了 Node.js 20.18 以上的机器、一个 Cloudflare 账号，然后运行 npx create-talorys 按提示登录并选区即可。安装器会自动拉起 Pages 前端和私有 Worker，让你设置 owner 密码。模型侧不用申请任何 API key， Workers AI 的模型直接绑定使用。后续升级也是重新跑一次安装命令，数据留在原 Durable Object 里不受影响。"
+---
+
+个人 AI 助手这个赛道这两年挤满了产品，但绝大多数都绕不开同一个别扭点：你的日程、笔记、对话、甚至银行卡片的上下文，全都躺在别人的服务器上。10 月 10 日在 Show HN 上冒出来的开源项目 Talorys 给了一个干脆的答案——别托管了，把 Agent 直接部署进你自己的 Cloudflare 账号。一条 `npx create-talorys@latest` 命令，聊天、记忆、任务、提醒四件套全部落进免费层，项目发布当天就冲到了几百个 star。这篇实战拆它的架构，并完整走一遍部署。
+
+## 一、它到底是个什么东西
+
+Talorys 的自我定位是「your personal AI agent, your own cloud」，功能清单不花哨，但每一样都是私人助手的高频刚需：
+
+- **流式聊天**：带 Markdown 渲染和工具调用状态提示，走 Server-Sent Events 全链路流式；
+- **长期记忆**：可查看、可编辑、可删除的个人事实与偏好，每轮对话只把最相关的记忆注入上下文；
+- **任务、笔记、项目**：完整的增删改查，UI 里能操作，聊天里说一句「明天提醒我 review 这个项目」也能建；
+- **自动化**：一次性提醒、循环提醒、每日任务摘要，跑在 Durable Object 的 alarms 上，不需要任何常驻进程。
+
+三个设计约束让它在同类项目里显得很克制：**单用户**——没有注册、没有账号体系、没有团队协作，安装时设一个 owner 密码就完事；**免费层友好**——只碰 Cloudflare 四样有免费额度的服务；**无遥测**——开发者声称不收集任何数据，毕竟项目的卖点就是「数据在你那」。
+
+还有一点容易被忽略：它**离了模型也能用**。任务、笔记、记忆、提醒都是纯 Durable Object 功能，Workers AI 额度用光或服务不可用时，助手降级成一个普通的待办与笔记工具，而不是整个瘫痪。
+
+## 二、架构拆解：Agent 藏在一个私有 Worker 里
+
+官方 README 给的架构图值得逐层看：
+
+```
+Browser ──HTTPS──▶ Cloudflare Pages（React 前端 + /api Pages Function）
+                         │  service binding（无公网 URL）
+                         ▼
+                   Private Worker（Hono 路由）
+                         │  getAgentByName("personal-agent")
+                         ▼
+                   TalorysAgent（Cloudflare Agents SDK Durable Object）
+                     ├─ SQLite：对话、记忆、任务、笔记、项目、
+                     │          自动化、会话、设置、用量
+                     ├─ Workers AI：glm-4.7-flash（流式 + 工具调用）
+                     └─ Alarms：提醒与循环日程
+```
+
+这里最有意思的是三层简化：
+
+**第一层，前端只认识 Pages。** 浏览器永远只跟你自己的 pages.dev 站点说话，所有 API 请求打到 `/api/*`，由 Pages Function 接住。前端代码里没有任何第三方服务地址。
+
+**第二层，私有 Worker 没有公网身份。** 部署配置里 `workers_dev: false`、`preview_urls: false`，这个 Worker 在公网上不存在。Pages Function 与它之间走 Cloudflare 的 service binding——平台内部的进程间通道，不经过公网，天然绕开了「给 Worker 鉴权」这一整类问题。认证和授权都在 Worker 内部完成。
+
+**第三层，Agent 就是一个 Durable Object。** TalorysAgent 基于 Cloudflare Agents SDK 构建，一个 DO 实例就是一个完整的私人助手：SQLite 管全部持久化状态，Workers AI 的 `glm-4.7-flash` 负责流式对话与工具调用，alarms 负责定时任务。DO 的特性刚好匹配单用户助手的负载——同一时刻只有你一个人在用，单实例串行处理反而省去了并发协调；平时休眠不烧钱，到点被平台唤醒跑提醒。
+
+模型选择上它没有接 OpenAI 或 Anthropic，而是用 Workers AI 里的开源模型 glm-4.7-flash。这既是成本决策（免 key、有每日免费额度），也是隐私决策——模型调用本身也留在 Cloudflare 体系内。
+
+## 三、部署实战：五分钟从零到能用
+
+前置要求只有两样：Node.js 20.18 以上、一个 Cloudflare 账号。跑：
+
+```bash
+npx create-talorys@latest
+```
+
+安装器会依次做这几件事：检查 Node 版本并使用其自带的 Wrangler；引导你登录 Cloudflare（没有账号它会给你开注册页）；让你选部署区域；然后创建 Pages 前端项目与私有 Worker；最后让你设置 owner 密码——这就是整个系统的唯一凭据。
+
+部署完成后浏览器打开你的 pages.dev 地址，输密码进入主界面。几件值得马上做的事：
+
+1. **在设置里确认 Workers AI 绑定正常**，发第一条消息测试流式输出与工具调用指示器；
+2. **手动建几条记忆**试试记忆系统——比如告诉它你的时区、常用技术栈，之后在聊天里引用这些事实，观察它是否带上了记忆上下文；
+3. **从聊天里建一个任务**（「明天上午提醒我开周会」），然后去 Automations 页看它生成的自动化记录，理解提醒与循环例程的数据形态；
+4. **翻一眼记忆页**，确认你对「AI 记了什么」有完全的可见性——这是它与传统托管助手体验差异最大的地方。
+
+升级路径也简单：重新跑一次安装命令即可，数据都在原有 Durable Object 的 SQLite 里，不会丢。想迁移或备份，导出 DO 数据即可，没有平台锁定的后顾之忧。
+
+## 四、它真正示范的东西：个人 Agent 的正确形态
+
+Talorys 的代码量不大，架构也谈不上前沿，但它把「个人 AI 助手该长什么样」的几个关键取舍示范得很清楚。
+
+**数据主权不是口号，而是架构起点。** 它没有先做一个多租户 SaaS 再谈隐私合规，而是从第一天就把「单用户、数据在你的账号、无遥测」写进架构。Agent Worker 无公网地址、service binding 内通、认证在 Worker 内做，这三件事共同把攻击面压到了最小。
+
+**免费层不是营销话术，而是硬约束。** 明确列出用了哪四样服务、不用哪六样，等于把「月成本为零」变成了可审计的事实。对一个每天用几十次的个人助手来说，这种可预测性比功能多寡更重要。
+
+**Durable Object 是个人 Agent 的被低估载体。** 单租户、强状态、需要定时任务、需要低频常驻——这四个特征拼起来，DO 几乎是量身定做的运行时。类比一下：以前做一个私人助手，你要么养一台 VPS（操心系统更新和进程守护），要么拼一大堆云函数加数据库（操心冷启动和状态同步）。现在一个 DO 全装下。
+
+当然局限也要说清楚：单用户设计意味着它天生不适合团队；模型固定在 Workers AI 目录里，想用最强模型得自己改绑定；提醒推送目前走应用内通知中心，没有手机推送通道。但作为「把自己的 Agent 跑在自己的云上」这个命题的第一个完整开源答案，Talorys 值得所有想做个人 Agent 的开发者先部署一遍再动手造轮子。
