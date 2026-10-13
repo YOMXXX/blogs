@@ -1,0 +1,139 @@
+---
+title: "Muse Wonder 实战：用 Meta Model API 搭一个个人智能体"
+description: "Meta 10 月 12 日发布前沿模型 Muse Wonder，OpenAI SDK 改个 base_url 就能接入。本文带你从鉴权到工具调用，搭一个带记忆与长任务的个人智能体。"
+column: "workshop"
+tags: ["Muse Wonder", "Meta Model API", "Agent", "OpenAI 兼容", "个人智能体"]
+pubDate: 2026-10-13
+template: "terminal"
+featured: false
+tldr: "Meta 昨日发布 Muse Wonder 与 Muse Wonder Full，主打 Active Memory 与 Active Focus 两大个人智能体能力，经 Meta Model API 与 Muse Code 开放。API 兼容 OpenAI SDK，换 base_url 即可迁移，上下文窗口 1048576 token，支持工具调用与子智能体编排。本文给出从鉴权、开发消息、重试到个人智能体最小闭环的完整代码路径。"
+author: "YOMXXX"
+faq:
+  - q: "Muse Wonder 和 Muse Wonder Full 有什么区别？"
+    a: "Muse Wonder 是标准版前沿模型，通过 Meta Model API 与 Muse Code 开放；Muse Wonder Full 是更强的旗舰版本，目前仅面向 Muse Code 订阅用户开放，官方称其在 DeepSWE 与 SWE-Marathon 等智能体与编码基准的第三方独立评测中登顶。日常开发用标准版即可，长跑型工程任务再考虑 Full。"
+  - q: "现有 OpenAI 代码迁移过来要改几行？"
+    a: "理论上只改两处：base_url 指到 https://api.meta.ai/v1，model 换成 muse-wonder-1.0。密钥换成在 Meta Model API 控制台创建的 MODEL_API_KEY。但要注意它同时接受大多数 Chat Completions 参数，少数参数如 stop、logit_bias、未关思考的 logprobs 会返回 400，迁移后先跑一轮参数回归。"
+  - q: "Active Memory 是模型自带还是需要我自己实现记忆？"
+    a: "Active Memory 是模型层的能力：它能在跨会话间携带关于用户的重要上下文，并按任务主动检索相关细节。但 API 的 Chat Completions 端点本身无状态，服务端记忆更像产品层（Muse 应用）与 Responses API 的组合能力。自己在 API 上做智能体时，仍需要自己管理历史与长期记忆存储。"
+  - q: "不注册 Meta 的 API 能用上 Muse 系列吗？"
+    a: "可以走 OpenRouter，Muse Spark 系列已经在 OpenRouter 上架，可在现有工具链中直接换模型。另外还有开源权重的 Muse Glimmer，专为本地常驻智能体设计，可在 Hugging Face 下载。想零成本试水先跑 Glimmer，想用最强能力再上 Wonder 的付费 API。"
+  - q: "个人智能体放行哪些操作比较安全？"
+    a: "建议分层放行：只读类操作（检索、总结、草拟）直接执行；写操作（建文件、发消息）先预览再确认；不可逆操作（删除、付款、对外发送）一律人工放行。官方文档的 staged approvals 与 contained execution 两个配方值得直接抄，把复合命令按风险分级自动放行或挂起。"
+---
+
+## 一条 HN 四百多点的新模型，到底新在哪
+
+昨天（10 月 12 日）Meta 发布了 Muse Wonder 系列，包含 Muse Wonder 与 Muse Wonder Full 两个型号，官方定位是「面向个人与专业智能体的前沿模型」。HN 讨论帖几个小时冲到近 500 点，评论区的争论焦点不是跑分，而是一个更实际的问题：一个真正常驻你生活里的智能体，模型层到底需要什么能力。
+
+Meta 给出的答案是两个关键词。**Active Memory**：跨会话携带关于你的重要上下文，并在任务需要时主动检索相关细节——比如你上周提过的饮食禁忌，这周订餐厅时它自己想起来。**Active Focus**：面对一个有阻力的目标持续工作，尝试替代路径、穿越阻塞点、在新信息出现时调整方案，中途该问就问、该确认再动手。
+
+这两个能力恰好是个人智能体此前的两大断点：记忆靠开发者手搓向量库，坚持靠开发者手写重试与状态机。模型层直接内建之后，应用层的脚手架可以薄很多。官方还给了 FocusBench 与 SWE-Marathon（长周期软件项目测试）作为这两项能力的专项评测，称 Muse Wonder Full 在 DeepSWE 与 SWE-Marathon 的第三方独立评测中登顶。
+
+模型在 Meta 的吉瓦级 Prometheus 数据中心训练，这是 Muse Spark 之后公开推进路线图的下一步。对我们更实际的信息是分发渠道：Meta Model API（自助注册）与 Muse Code（终端多智能体编码工具）当天可用，Muse Wonder Full 目前仅限 Muse Code 订阅用户。
+
+## 五分钟接入：改两行代码的事
+
+Meta Model API 兼容 OpenAI SDK。你在 Model API 控制台创建一个 MODEL_API_KEY，然后把现有客户端的 base_url 指过去即可。下面是完整的最小可用示例：
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.meta.ai/v1",
+    api_key=os.environ["MODEL_API_KEY"],
+)
+
+ping = client.chat.completions.create(
+    model="muse-wonder-1.0",
+    messages=[{"role": "user", "content": "回复一个词：就绪"}],
+)
+print(ping.choices[0].message.content)
+```
+
+官方 cookbook 用 `muse-spark-1.3` 做基础演示，Muse Wonder 的模型 ID 是 `muse-wonder-1.0`。有几个迁移细节值得提前知道：
+
+- **上下文窗口是 1,048,576 token**。仓库级上下文可以一次塞进去，不用急着上 RAG。
+- **Muse 系列是推理模型**，思考 token 计入输出并出现在 `usage` 的 `reasoning_tokens` 字段。一个单词的回复报几十个 completion token 属于正常现象，成本估算时别按输入输出线性外推。
+- **`stop`、`logit_bias`、未设置 `reasoning_effort="none"` 的 `logprobs` 会返回 400**。这三类参数不兼容，迁移老代码时要先摘掉。
+- **行为引导用 `developer` 角色**。它接受 `system` 角色是为了兼容，但实际按 developer 层级处理；自己写新代码直接用 `developer`。
+- **温度保持默认 1.0**。官方明确说该模型在默认温度下调优最佳，想要更稳定的输出，优先写清楚指令而不是调低温度。
+
+工程化封装的官方建议是：环境变量读密钥、429 与 5xx 用指数退避加抖动重试、400 直接暴露给调用方别重试。官方 cookbook 里这段重试函数可以直接抄：
+
+```python
+import random, time
+from openai import APIStatusError, APITimeoutError, RateLimitError
+
+def complete_with_retry(messages, *, max_retries=5, **kwargs):
+    delay = 0.5
+    for attempt in range(max_retries):
+        try:
+            return client.chat.completions.create(
+                model="muse-wonder-1.0", messages=messages, **kwargs
+            )
+        except (RateLimitError, APITimeoutError):
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(delay * (2 ** attempt) + random.uniform(0, 0.5))
+        except APIStatusError as exc:
+            if exc.status_code >= 500 and attempt < max_retries - 1:
+                time.sleep(delay * (2 ** attempt) + random.uniform(0, 0.5))
+                continue
+            raise
+```
+
+## 个人智能体最小闭环：记忆、工具、确认
+
+围绕 Active Memory 与 Active Focus 的卖点，我们搭一个真正有个人智能体味道的最小系统：三件套是「长期记忆存储 + 工具调用 + 关键操作确认」。
+
+**第一步，自己管历史。** Chat Completions 是无状态的，每轮把完整的 messages 数组发回去。一百万 token 的窗口意味着你可以把用户偏好、历史决定、项目状态全量装在上下文里，而不是先冲去做向量检索。经验做法是分三层：`developer` 消息放固定人设与铁律，历史区放对话，再开一个「用户档案区」放结构化的长期偏好，每轮拼装时重写它。
+
+```python
+def build_messages(profile, history, user_input):
+    return [
+        {"role": "developer", "content": PERSONA_RULES},
+        {"role": "developer", "content": "用户长期档案（每轮由系统重写）：" + profile},
+        *history,
+        {"role": "user", "content": user_input},
+    ]
+```
+
+**第二步，接上工具。** 工具调用流程与 OpenAI 完全一致：声明工具、收到 `tool_calls`、执行、把结果以 `role: "tool"` 塞回对话再请求一轮。Meta 的 cookbook 里专门有 search grounding 配方，加一个内置搜索工具就能让模型拿到带引用的实时网页结果——个人智能体查订票政策、比价这类场景直接受益。
+
+**第三步，分级放行。** Active Focus 意味着模型会持续自主工作，这恰恰放大了误操作的代价。官方 Muse Code 文档里有两个模式值得照搬进自己的系统：`staged approvals` 把复合 shell 命令拆成阶段，安全片段自动放行、风险片段挂起等审核；`contained execution` 要求每次命令都在操作系统沙箱里跑，且运行时证明隔离生效才继续。最小实现可以先用一个白名单函数包一层：
+
+```python
+RISKY = {"send_email", "delete_file", "make_payment"}
+
+def guarded_tool(name, args):
+    if name in RISKY:
+        preview = render(name, args)
+        if input(f"确认执行 {preview}? [y/N] ") != "y":
+            return "用户拒绝了该操作"
+    return TOOLS[name](**args)
+```
+
+## 子智能体编排：官方认可的三种姿势
+
+Muse Wonder 官方描述里明确提到「规划长任务并把部分工作委托给子智能体、并行调用工具、出错自恢复」。在 API 层复刻这个模式，官方 cookbook 给了三条现成路线：
+
+**其一，multi-agent orchestration**：一条一行描述的产品需求，交给四个角色的智能体团队（规划、实现、评审、验收），通过共享看板协调。适合把模糊想法变成可运行的工程产物。
+
+**其二，subagent fanout**：把一个任务扇出到多个子智能体，每个在独立的 git worktree 里工作，互不踩踏。并行改不同模块时特别干净，合并阶段统一收口。
+
+**其三，computer use**：给模型屏幕截图与键鼠事件的控制权，让它像人一样操作浏览器和桌面应用。个人智能体的大部分「帮我办事」场景（填表、订票、整理相册）最终都落在这条路上。
+
+对个人场景还有一个省钱的组合拳：开源权重的 **Muse Glimmer** 跑本地常驻智能体，处理日程整理、回复草拟这类高频低危任务；只在用户确认关键文本后，才把任务升级给云端的 Muse Spark 或 Wonder。官方 cookbook 里「Local agent that asks first」就是这个配方，本地管隐私、云端管智力，成本与隐私两头都占。
+
+## 迁移检查清单
+
+把这套东西跑起来之前，过一遍这张表：
+
+- 密钥走环境变量，永不硬编码；观察 `x-ratelimit-remaining-*` 响应头，在撞限之前主动节流。
+- 多轮对话记得把 assistant 回复 append 回 messages 再整包重发，否则「上一个回答」在模型眼里不存在。
+- 推理模型的成本估算要把 `reasoning_tokens` 算进输出预算，长任务的自恢复循环尤其明显。
+- 长跑任务先设计检查点：官方 Muse Code 的 audit 与 deterministic replay 配方演示了如何把会话事件记成只追加日志，随时精确回放——Active Focus 的长跑特性让「崩了能续」从加分项变成必答题。
+- Muse Wonder Full 目前锁在 Muse Code 订阅里，API 侧先按标准版做容量规划。
+
+一句话总结：Meta 把「记忆」与「坚持」从开发者脚手架下沉到了模型层，而接入成本只有两行代码。个人智能体这条赛道上，真正稀缺的不再是模型能力，而是你的放行策略和检查点设计。
