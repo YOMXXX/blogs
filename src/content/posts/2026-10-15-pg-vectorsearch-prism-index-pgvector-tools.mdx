@@ -1,0 +1,93 @@
+---
+title: "pg_vectorsearch 速评：PRISM 索引能否撼动 pgvector 的 HNSW 王座"
+description: "Timescale 开源 pg_vectorsearch：以 RaBitQ 量化与层级质心树构建的 PRISM 索引，在 1 亿向量规模上以四分之一内存跑出比 HNSW 更快的同召回查询，且完全兼容 pgvector 既有表。"
+column: "tools"
+tags: ["PostgreSQL", "Vector-Search", "pgvector", "ANN", "Timescale"]
+pubDate: 2026-10-15
+template: "classic"
+featured: false
+author: "YOMXXX"
+tldr: "Timescale 新开源的 pg_vectorsearch 扩展带来了 PRISM 索引：IVF 式分区加层级质心路由，配合带理论误差界的 RaBitQ 量化和 SIMD 优化的距离计算。官方基准称在 1 亿向量、同召回率下比 pgvector 的 HNSW 更快且只需四分之一内存。支持在既有 pgvector 列上直接建索引，当前处于 alpha 阶段。"
+faq:
+  - q: "PRISM 与 HNSW 的核心区别是什么？"
+    a: "HNSW 是图索引，查询时在多层图上游走，内存占用大且构建成本高。PRISM 是分区式索引：用层级质心树把向量空间划分成簇，查询时沿树定位最近的几个簇，再扫描簇内的 posting list。向量以 RaBitQ 压缩编码存储，误差界让搜索能直接排除不可能是近邻的候选，重排量大减。"
+  - q: "RaBitQ 量化的优势在哪？"
+    a: "常见量化方法只压缩存储，误差不可控，召回率要靠多拉候选硬补。RaBitQ 的编码自带可计算的误差界：两个向量的量化距离与真实距离的偏差范围是已知量，搜索时可以直接推导「这个候选不可能是最近邻」并安全剪枝。两段式搜索因此既省内存又不牺牲召回。"
+  - q: "既有 pgvector 表能无痛迁移吗？"
+    a: "可以，这是设计亮点。pg_vectorsearch 与 pgvector 并行安装，直接在现有的 vector 或 halfvec 列上建 PRISM 索引，表结构、查询语句都不用改。原生类型 vec32 与 vec16 和 pgvector 对应类型二进制兼容，两种扩展可以共存于同一个库，迁移路径是增量的。"
+  - q: "现在能上生产吗？"
+    a: "不建议。官方明确标注 alpha 状态，意为仅用于测试：预发布版本之间可能无法原地升级，需要删掉扩展与索引重建。生产环境建议等待 beta 或正式版，或先用影子流量验证召回率与延迟，把降级路径（回落 pgvector）设计好再试。"
+  - q: "什么样的负载适合选它？"
+    a: "向量规模在千万到亿级、内存预算紧张、对查询延迟敏感的场景最对口，比如大规模语义检索与推荐召回层。它靠缓冲池保持质心树常驻内存，内存开销远低于图索引；反之，如果你的向量只有几万条或更新极频繁，pgvector 的 HNSW 仍是更省心的默认选择。"
+---
+
+> **💡 项目信息：timescale/pg_vectorsearch，PostgreSQL License，2026 年 1 月创建、10 月 13 日仍在活跃提交，GitHub 273 星。官方基准文章见 TigerData 博客「Announcing pg_vectorsearch」。当前为 alpha 状态。**
+
+PostgreSQL 的向量检索生态里，pgvector 几乎是默认答案，而它的 HNSW 图索引是默认答案的默认索引。Timescale（TigerData）这次拿出的 pg_vectorsearch 想挑战的就是这一层：**用分区式索引加量化误差界，在亿级向量上同时打赢速度与内存**。本文按架构、性能、用法、适用性四步拆解，最后给出选型建议。
+
+## 一、PRISM 索引：分区式路线的回归
+
+PRISM（Partitioned Routing Index for Similarity Matching）是一个 PostgreSQL 原生的索引访问方法，概念上接近 pgvector 的 IVFFlat，但内部换掉了三样东西：路由结构、量化方案、距离计算。
+
+**路由**：层级质心树把向量空间递归划分成簇，树的根到叶构成一条由粗到细的路径。查询时从根出发，只展开离查询向量最近的几个分支，快速收敛到候选簇。官方的实现细节是**依赖 PostgreSQL 的缓冲池让质心树保持热态**——这一点很关键，后面选型部分会回到这里。
+
+**量化**：向量以 RaBitQ 编码存进 posting list。RaBitQ 的特别之处是编码携带**理论误差界**：量化距离与全精度距离之间的偏差范围是可计算的。搜索规则因此可以做安全剪枝——一个候选如果连「误差界的上界」都够不到当前第 k 名，就直接排除，不需要全精度重排。两段式搜索（估计、误差界校验、重排）的重排量大幅下降。
+
+**距离计算**：SIMD 优化覆盖 AVX2、AVX512 与 NEON 三套指令集，x86 与 Apple Silicon 都能吃到加速。posting list 的页布局也专为 SIMD 距离计算设计，减少内存搬运。
+
+官方给的查询流水线是：遍历质心树找最近簇（缓冲池）、异步 IO 扫描 posting list（缓冲池）、RaBitQ 两段式过滤、从堆表全精度重排、返回 k 近邻。每一步都有明确的内存来源与 IO 特征，这对容量规划非常友好。
+
+## 二、性能主张：快多少，代价是什么
+
+官方基准的核心主张：**1 亿向量数据集上，同等召回率下 PRISM 比 pgvector 的 HNSW 查询更快，且实例内存只要四分之一**。索引构建速度也更快。
+
+对这组数字要做的解读有三层。第一，比较对象是 IVFFlat 与 HNSW 两种索引，pgvector 生态里 HNSW 是质量更高的那个，赢它才有意义，Timescale 没有选软柿子。第二，「同召回」的口径依赖测试数据集与查询分布，向量检索基准对数据集选择非常敏感，建议在自己数据上复测。第三，四分之一内存的来源是结构性的：图索引要把邻居关系常驻内存，PRISM 只需要质心树与压缩后的 posting list，量级差是架构决定的，不是参数调出来的。
+
+这就是分区式路线在 2026 年回归的原因：当向量规模从百万走向十亿，图索引的内存曲线撑不住，而 SSD 便宜、缓冲池管理是数据库的老本行。PRISM 把「冷数据放页面、热路由放内存」这个数据库三十年的老智慧搬进了向量检索。
+
+## 三、上手：两条路径与一份 SQL
+
+安装扩展后，使用分两条路径。全新场景用原生类型，已有 pgvector 的场景直接在旧列上建索引。
+
+路径一，原生类型：
+
+```sql
+CREATE EXTENSION pg_vectorsearch;
+
+-- PLAIN 把向量内联存储；EXTERNAL（默认）超过约 2KB 会 TOAST，
+-- 重排时要额外取一次页面
+CREATE TABLE items (
+    id serial PRIMARY KEY,
+    embedding vec32(3) STORAGE PLAIN
+);
+
+-- 先灌数据再建索引，索引按建索引时的行数定容
+INSERT INTO items (embedding)
+SELECT ARRAY[i::real, (i % 7)::real, (i % 5)::real]::vec32
+FROM generate_series(1, 1000) i;
+
+CREATE INDEX ON items USING prism (embedding vec32_l2_ops);
+
+-- 0 为自动（约 0.95 召回）；调高加召回，调低换速度
+SET prism.nprobe = 40;
+
+SELECT * FROM items
+ORDER BY embedding <-> '[3,1,2]'
+LIMIT 5;
+```
+
+路径二，pgvector 兼容：表和查询完全不动，直接对既有 vector 或 halfvec 列执行 `CREATE INDEX ... USING prism`。距离操作符与 pgvector 一致（L2、内积、余弦三种），应用层零改动。混合部署时两种扩展共存于同一数据库，可以按表选择索引。
+
+两个调优要点：`prism.nprobe` 控制展开的簇数，是召回与延迟的主旋钮；建索引前先灌数据，因为索引容量取自建索引时的行数，这一点与 IVFFlat 的经验一致。动态写入方面，插入、更新、删除都支持，posting list 满了会通过维护命令触发重平衡，见仓库的 Maintenance 章节。
+
+## 四、选型建议：谁该试，谁该等
+
+**适合现在就试的**：向量在千万到亿级、内存预算紧、读多写少的语义检索与推荐召回；已经在用 pgvector 且 IVFFlat 召回不够、HNSW 内存吃紧的团队——兼容模式让试错成本几乎为零，影子流量下跑一天就能拿到自己数据的真实曲线。
+
+**应该等的**：核心业务生产库。alpha 状态意味着升级可能要求删库重建索引，官方文档说得很直白。写入极重的场景也要观察：posting list 重平衡的写放大特性还需要社区数据验证。万级以下的小数据集则无需纠结，顺序扫描都够快，索引选型没有意义。
+
+**值得关注的技术信号**：RaBitQ 误差界剪枝如果在大规模基准上稳定兑现，可能成为 ANN 领域的新默认组件——它是少数「理论保证」而非「经验调参」的剪枝机制，这个思路对自研检索层的团队也有参考价值。
+
+## 五、结语
+
+pg_vectorsearch 的出现把 2025 年以来量化 ANN 研究（RaBitQ 一族）的成果第一次装进了 PostgreSQL 的原生索引框架，并且用兼容层把迁移摩擦降到接近零。它现在还是 alpha，但方向清晰：**数据库自己把向量检索做成本职工作，而不是靠外挂图索引**。这对 pgvector 是竞争，对 PostgreSQL 用户是好消息。建议跟进仓库的 release 节奏，等 beta 出现时在自己的数据上复测一轮官方基准。
