@@ -1,0 +1,104 @@
+---
+title: "Muse Spark Open 本地部署实战：816B 开源权重怎么跑起来"
+description: "Meta 于 10 月 15 日开源 Muse Spark Open：816B 总参、42B 激活、1M 上下文。本篇给出托管 API、Mac Studio 双机、云 GPU 三条部署路径的完整实操与合规要点。"
+column: "workshop"
+tags: ["Meta", "Muse-Spark-Open", "开源模型", "本地部署", "MLX", "vLLM"]
+pubDate: 2026-10-16
+template: "editorial"
+featured: false
+tldr: "Meta 把 816B 参数的 Muse Spark 开源了：42B 激活的 MoE、1M 上下文、四模态输入，NVFP4 量化后至少要 700GB 显存，BF16 要 2TB。本篇拆解托管 API、双 M5 Ultra Mac Studio、云 GPU 三条部署路径，并给出租期选型与许可证合规清单。"
+author: "YOMXXX"
+faq:
+  - q: "Muse Spark Open 真的能在两台 Mac Studio 上跑吗？"
+    a: "可以，但门槛不低。官方方案是两台各 512GB 统一内存的 M5 Ultra Mac Studio，合计 1TB 内存，通过 MLX 框架运行 BF16 或量化权重。512GB 配置要到 2026 年 10 月下旬才发货，整套成本预计数万美元。Meta 的演示（改 Ice Cubes 应用、操作 DaVinci Resolve）是自展示性质，官方没有公布实测生成速度。"
+  - q: "没有大显存机器，还有什么办法用上它？"
+    a: "最现实的路径是托管 API：Together AI、Fireworks、Groq、OpenRouter、Baseten 等都上了架。Together 的 serverless 定价是输入每百万 token 1.25 美元、缓存输入 0.15 美元、输出 4.25 美元。注意各托管方上下文上限不同：Groq 只给 131072 token，Fireworks 才是完整的 1048576。"
+  - q: "它和上个月的 Muse Glimmer 是什么关系？"
+    a: "两个是完全不同定位的模型。Muse Glimmer 是 30B 的 agentic 模型，Apache 2.0 许可，权重不到 20GB，24GB 显存就能跑，适合本地 agent；Muse Spark Open 是 816B 的旗舰，自定义 Muse Model License，主打多模态理解与长上下文。预算有限的个人开发者建议先用 Glimmer，Spark Open 走 API。"
+  - q: "下载权重为什么要填真实姓名和出生日期？"
+    a: "Hugging Face 上的 Muse Spark Open 是门控仓库，要求提交完整法定姓名、出生日期和组织全称，且不允许缩写和特殊字符，提交后不可编辑。这些信息受 Meta 隐私政策约束。想匿名尝鲜的话，走 OpenRouter 或 Together 的 API 更省事，不需要过门控。"
+  - q: "816B 模型的许可证有哪些坑？"
+    a: "Muse Model License 允许运行、修改、微调、蒸馏和再分发，但有一条收入条款：如果贵司及关联公司任意连续 12 个月总收入超过 2000 万美元，且把模型作为模型服务对外提供，就需要通知 Meta 并签单独协议。内部部署、研究、把 AI 集成进自家产品都不受影响。另外产品里要标注 Built with Muse Spark Open。"
+---
+
+Meta 在 10 月 15 日做了一件让本地推理圈集体失眠的事：把 4 月发布的旗舰闭源模型 Muse Spark 的权重开放了。816B 总参数、42B 激活的 MoE 架构、1048576 token 的上下文窗口、文本图像视频音频四模态输入——这是目前美国厂商交出的最大规格开源权重模型。HN 上「Muse Spark Open」一天冲到 577 分，评论区一半在跑分，一半在算自己的电费。
+
+这篇实战不讲跑分，讲怎么把它跑起来。无论你手里是一台 MacBook、一台云服务器还是预算充足的全套 Mac Studio，都有一条对应的路径。
+
+## 先搞清楚你要付多少内存
+
+Muse Spark Open 有两个关键规格决定了部署方案：**NVFP4 量化版本至少需要 700GB 加速器内存，BF16 版本需要 2TB**。激活参数只有 42B 并不会把显存需求降到 42B 稠密模型的水平——专家权重全部要驻留显存，MoE 省的是每个 token 的计算量，不是存储量。
+
+官方支持的推理框架相当全：SGLang、vLLM、TensorRT-LLM、Transformers、MLX、llama.cpp、Unsloth，硬件覆盖 AMD、Apple、Intel 和 NVIDIA，微调用 PyTorch TorchTitan。也就是说工具链是现成的，问题只剩「把这么大的权重放在哪里」。
+
+## 路径 A：托管 API，五分钟接入
+
+对绝大多数开发者这是唯一理性选择。Meta 权重发布当天，Baseten、Fireworks AI、Groq、Modal、Nebius、OpenRouter、Together AI 全部上架，Amazon SageMaker、Google Cloud Model Garden、Microsoft Foundry 也提供了权重托管。
+
+以 Together AI 的 serverless 端点为例，OpenAI 兼容接口直接可用：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.together.xyz/v1",
+    api_key="你的 Together 密钥",
+)
+
+resp = client.chat.completions.create(
+    model="meta-llama/Muse-Spark-Open",
+    messages=[{"role": "user", "content": "总结这段视频里发生了什么"}],
+)
+print(resp.choices[0].message.content)
+```
+
+定价：输入每百万 token 1.25 美元，命中缓存 0.15 美元，输出 4.25 美元。横向看，这比同档闭源旗舰便宜不少，且上下文给到完整的 1M（选 Fireworks 才有，Groq 限制在 131072）。如果你的工作负载是长视频或大代码库分析，**选托管方之前先核对上下文上限**，这是最容易踩的坑。
+
+## 路径 B：预算有限？先跑 Muse Glimmer
+
+Meta 这次实际放了两个东西。除了 Spark Open，还有早前发布的 Muse Glimmer：30B 参数、Apache 2.0 许可、权重不到 20GB，24GB 显存的消费级显卡就能跑。Glimmer 定位就是本地 agent——工具调用、图像理解、失败恢复都有针对性优化，Together 上它的定价是输入 0.35 美元、输出 1.50 美元每百万 token。
+
+如果你的场景是「个人助手、本地 RAG、小规模工具编排」，Glimmer 的性价比远高于硬上 Spark Open。Spark Open 的价值在多模态长上下文和知识密度，这两点 Glimmer 给不了。
+
+## 路径 C：双 Mac Studio 方案，隐私敏感场景的终点站
+
+Meta 官方演示的本地方案是**两台 M5 Ultra Mac Studio，各 512GB 统一内存，合计 1TB，通过 MLX 做跨机推理**。有几个现实问题要先想清楚：
+
+1. 512GB 配置要到 2026 年 10 月下旬才发货，目前只有 256GB 版（10799 美元档），四台才凑得齐 1TB 内存，税前 43196 美元。双机方案等新配置到货后预计也要数万美元。
+2. 官方没有公布双机方案的 token 生成速度，HN 上的第三方实测目前还很少。MoE 结构对内存带宽极其敏感，跨机链路大概率是瓶颈。
+3. 这条路径的真正价值是**数据不出本地**：医疗、法务、国防类工作负载里，「模型在你自己的房间里」本身就是需求。
+
+如果你决定走这条路，MLX 侧的基本流程是把权重分片到两台机器，用 MLX 的分布式后端做张量并行。等 512GB 机型到货后社区会有完整的踩坑帖，建议先观望一周再下单。
+
+## 路径 D：云 GPU 自托管
+
+BF16 要 2TB 显存，意味着至少 11 张 H200（141GB）或 8 张 B200（192GB，共 1536GB）。NVFP4 量化版 700GB，8 张 B200 比较从容。vLLM 和 SGLang 都已支持，官方推荐的生产路径是：
+
+```bash
+# NVFP4 量化权重 + vLLM，8x B200 示意
+vllm serve meta-llama/Muse-Spark-Open-FP4 \
+  --tensor-parallel-size 8 \
+  --max-model-len 1048576
+```
+
+自托管的划算阈值大约是每天数亿 token 的稳定负载。低于这个量级，托管 API 的边际成本更低，还能免掉运维。
+
+## 合规清单：三条容易忽略的条款
+
+Muse Model License 不是 OSI 开源，签字前过一遍这三条：
+
+- **收入条款**：公司及关联公司任意连续 12 个月总收入超过 2000 万美元，且以模型服务形式对外提供 Spark Open（或其衍生物），需通知 Meta 并签单独协议。内部部署和「把 AI 做进产品」不触发。
+- **归属标注**：产品中要放「Built with Muse Spark Open」，文档、网站或设置页均可。
+- **衍生物定义很宽**：用 Spark Open 的输出改进出来的模型也算衍生物，蒸馏时要想清楚下游许可证链路。
+
+另外 HF 门控要求提交法定姓名、出生日期和组织全称，不能缩写、提交后不可编辑。企业用户建议用公司主体提前申请，别等到项目上线当天。
+
+## 基准怎么看：别只信「美国最强」
+
+Meta 的口径是「迄今最强美国开放权重模型」，这个限定词很重要。官方表格里它在 JobBench（61.8）、MCP-Atlas（89.2）、HLE-Diamond（26.1）、ZeroBench（50）领先，但 Terminal-Bench 2.1（76.4）和 DeepSWE（60）明显落后于 Kimi K3（85.0 / 68）和 GLM 5.3（83.9 / 67）。Artificial Analysis 的独立指数里，它拿 39 分，低于 MiMo-V2.6-Pro 的 46、GLM 5.3 的 45 和 Kimi K3 的 44。
+
+翻译一下：**多模态理解和 agent 生态适配是它的强项，终端编码和软件工程不是**。选型时按场景对号入座，别按国别站队。
+
+## 写在最后
+
+Muse Spark Open 的战略意义大于单点性能意义：当 816B 级别的权重进入托管市场，输入 token 的价格锚点会被整体拉低，这比任何一条基准曲线都更影响开发者。对个人开发者，今天就能做的三件事：在 OpenRouter 上花几美元跑通第一个请求；用 Glimmer 搭本地 agent 原型；把 Spark Open 的 1M 上下文设计进你的长文档处理管线——价格还会继续降，管线可以先修好。
