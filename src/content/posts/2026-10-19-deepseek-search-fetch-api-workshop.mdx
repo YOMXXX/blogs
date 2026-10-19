@@ -1,0 +1,231 @@
+---
+title: "DeepSeek Search 与 Fetch API 实战：给 Agent 接上每千次 0.75 美元的网页搜索"
+description: "DeepSeek 上线 Search 与 Fetch API：自研搜索引擎驱动，按成功请求计费每千次 0.75 美元，比 Exa、Brave、Kagi 便宜一个量级。本文按官方文档逐字段拆解两个端点，给出可运行的研究型 Agent 示例、错误码重试策略与成本估算。"
+column: "workshop"
+tags: ["DeepSeek", "Search API", "网页抓取", "Agent 开发", "API 实战"]
+pubDate: 2026-10-19
+template: "editorial"
+featured: false
+tldr: "DeepSeek 官方文档显示 Search 与 Fetch API 已正式可用：Search 用自研引擎找页面并返回结构化结果，Fetch 把单个网页转成 Markdown，两者按成功请求计费、每千次 0.75 美元，速率限制各为每秒 5 次。本文逐字段解读请求与响应，梳理查询运算符、计费规则、错误码重试策略，并给出一个 Python 研究型 Agent 的完整实现与月度成本估算。"
+author: "YOMXXX"
+faq:
+  - q: "DeepSeek Search API 和普通搜索引擎 API 有什么不同？"
+    a: "它面向 Agent 场景设计：响应里除了标题链接，还带 snippet、面向模型阅读的 600 至 800 字符长摘要、页面正文、发布时间和 0 到 4 的权威度分级，并可按 site、lang、after 等运算符精确控制查询。计费按成功请求而非按token或结果条数，空结果不计费，适合把搜索当成 Agent 的常规动作频繁调用。"
+  - q: "Fetch API 能绕过网站的防爬机制吗？"
+    a: "不能把当成万能绕过工具。官方文档明确说抓取受目标站点的可用性与访问策略约束，遇到被站点策略拦截、内容类型不支持或无可提取 Markdown 的页面会返回 404。HN 讨论中开发者的共识是：源站反爬该挡还是挡，DeepSeek 提供的是稳定的索引与渲染通道，不是攻防工具。做合规抓取仍需遵守目标站点的 robots 与条款。"
+  - q: "为什么现在调用免费，11 月才开始计费？"
+    a: "官方文档注明：通过 DeepSeek Harness、Claude Code 或 Codex 使用服务端工具调用时，目前命中 Search 与 Fetch 免费，按请求计费从北京时间 2026 年 11 月 1 日零时开始。也就是说模型内置的网页搜索动作正在灰度免费期，直接调 API 的开发者需要为 11 月起的账单做预算。"
+  - q: "速率限制只有每秒 5 次，够用吗？"
+    a: "对单账号研究型或中等规模生产足够：每次查询返回最多 50 条结果，Fetch 一次拿整页 Markdown，不需要靠堆请求数补质量。Search 与 Fetch 限额独立计算、互不消耗，账户级统计。高并发场景应做客户端队列与指数退避，文档明确 429 时等待重试即可。"
+  - q: "和自建搜索抓取栈相比成本如何？"
+    a: "HN 上一位开发者说自建基于第三方抓取供应商的 MCP 工具比 OpenAI 与 Anthropic 内置网页工具便宜 15 到 20 倍，但要自己维护代理池与验证码处理。DeepSeek 把索引、渲染、缓存打包成每千次 0.75 美元的 API，省掉基础设施维护，适合绝大多数团队；只有抓取量极大或有特殊源站需求的场景才值得自建。"
+---
+
+Hacker News 周日出现一条 534 分的热帖：「DeepSeek search and fetch – 0.75 美元 per 1000 successful requests」。点进去是 DeepSeek 官方文档：Search 与 Fetch 两个 API 正式可用，由 DeepSeek 自研搜索引擎驱动，给 Agent 和 RAG 应用提供实时网页内容。价格表一出，评论区直接变成竞品比价现场——Exa 每千次 4 美元、Brave 5 美元、Kagi 12 美元，而 DeepSeek 两项都只要 0.75 美元。
+
+先交代本文定位：10 月 18 日本店写过 DeepSeek V4.1 Flash 模型发布的 workshop，那篇讲**模型**；这篇讲同一家公司新放出的**工具层 API**，两者可独立使用——你可以继续用 Claude 或 GPT 当大脑，只把「眼睛」换成 DeepSeek。下面按官方文档逐字段拆解，最后给一个能跑的研究型 Agent 示例和成本估算。
+
+## 两个端点：一个找页面，一个读页面
+
+官方文档对两个 API 的分工说得很直白：Search 为查询找到网页并返回结构化结果，Fetch 检索单个网页并把内容转成 Markdown 返回。两者都是原始 JSON API，沿用与 DeepSeek 聊天接口相同的 bearer 认证，base URL 是 `https://api.deepseek.com`。
+
+| API | 方法与端点 | 作用 | 计费 |
+|---|---|---|---|
+| Search | POST `/v1/tools/search` | 查询网页，返回结果列表 | 每千次成功请求 0.75 美元 |
+| Fetch | POST `/v1/tools/fetch` | 抓单个网页，返回 Markdown | 每千次成功请求 0.75 美元 |
+
+认证方式与聊天接口一致，请求头带 API key 和 JSON 内容类型即可，OpenAI 兼容 SDK 改个 base_url 就能用。
+
+## Search 请求字段：少而准
+
+Search 的请求体只有五个字段，官方对每个都给了明确边界：
+
+| 字段 | 类型 | 必填 | 默认 | 说明 |
+|---|---|---|---|---|
+| query | string | 是 | 无 | 1 到 128 个 Unicode 字符，不能全是空白 |
+| count | integer | 否 | 10 | 返回结果数，1 到 50 |
+| ori_question | string | 否 | 无 | 触发搜索的原始问题，1 到 128 字符，改善查询理解 |
+| localization | string | 否 | 空 | 可选 IP 地址，用于本地化搜索结果 |
+| need_content | boolean | 否 | false | 是否在 content 字段返回页面正文 |
+
+两个细节值得注意。第一，`count` 只控制返回几条，**不影响单次价格**——取 50 条和取 1 条一样贵（也一样便宜），所以默认可以拉满。第二，`need_content` 打开才会带正文，关闭时 content 永远是空字符串；如果目标页面内容不可用，即使开了也是空。请求体里的未知字段会被直接忽略，不会报错。
+
+## 查询运算符：搜索引擎语法原样透传
+
+文档明确 query 会带着搜索语法原样转发，支持以下运算符，且可组合：
+
+| 运算符 | 示例 | 作用 |
+|---|---|---|
+| `site:` | `DeepSeek site:github.com OR site:huggingface.co` | 限定站点，多个用空格加 OR |
+| `-site:` | `DeepSeek -site:example.com` | 排除站点，多个用空格分隔 |
+| `-` | `DeepSeek -advertisement` | 排除含某词的页面，多个用空格 |
+| `-"..."` | `DeepSeek -"release notes"` | 排除精确短语 |
+| `"..."` | `DeepSeek "exact phrase"` | 匹配精确短语 |
+| `lang:` | `DeepSeek lang:zh,en` | 限定语言，逗号分隔 |
+| `after:` | `DeepSeek after:2025-01-01` | 只返回该日期之后发布的页面 |
+| `before:` | `DeepSeek before:2026-06-01` | 只返回该日期之前发布的页面 |
+
+官方给的组合示例长这样：`DeepSeek site:github.com OR site:huggingface.co lang:en after:2025`。对 Agent 来说这是关键能力——**用一条 query 完成「站点限定 + 语言 + 时间窗」三重过滤**，省掉客户端二次筛选的 token 与代码。时间敏感的研究任务（比如只看最近三个月的发布）直接写进 query，比拉回 50 条再过滤高效得多。
+
+## 响应字段：为模型阅读而设计
+
+成功请求返回 HTTP 200 与 results 数组，没有匹配时返回空数组。单条结果的字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| rerank_score | number | 0 到 3 的相关度综合分，融合相关性、权威度与新鲜度，1.5 以上算高质量 |
+| title | string | 结果标题 |
+| url | string | 链接 |
+| snippet | string | 约 100 到 200 字符短摘要，面向 UI 展示 |
+| summary | string | 约 600 到 800 字符长摘要，**面向模型阅读** |
+| content | string | 页面正文，need_content 为 false 或不可用时为空 |
+| site_name | string 或 null | 站点名 |
+| site_icon | string 或 null | 站点图标 URL |
+| date | string 或 null | UTC 发布时间，RFC 3339 格式，未知为 null |
+| authority | integer | 页面权威度分级 0 到 4，-1 表示未知，3 以上为高权威 |
+
+这套字段设计有明显 Agent 思维：`summary` 给模型读、`snippet` 给人看、`authority` 让 Agent 自己决定信谁、`rerank_score` 提供开箱即用的排序依据。写 Agent 时可以直接把 `rerank_score` 大于等于 1.5 且 `authority` 大于等于 3 当作高质量信源的筛选条件，不用自己训排序模型。
+
+## Fetch：整页转 Markdown，约束很少
+
+Fetch 的请求只有一个字段 `url`：必填，最多 8192 字符，必须是带 host 的 HTTP 或 HTTPS 地址，且不能包含用户名或密码。响应返回 `title` 与 `content`，content 就是抓取页面的 Markdown 文本，标题拿不到时为空字符串。
+
+官方明确提示：抓取受目标站点可用性与访问策略约束。错误码 403 表示请求被安全策略拒绝，404 表示抓不到可用内容——URL 不存在、被站点策略拦截、目标站报错、内容类型不支持或页面没有可提取的 Markdown，都归为 404。把 Fetch 当成「稳定的正文提取服务」而不是「反爬绕过器」来用，预期才正确。
+
+## 计费规则：只在成功时收钱
+
+计费逻辑值得逐字读，因为它直接影响成本模型：
+
+- **按成功请求计费**，不按 token、不按返回结果条数。
+- 只有返回 HTTP 200 且产出结果才计费：Search 必须返回非空 results 数组，Fetch 必须返回页面内容。
+- 失败请求、空搜索结果、超时**不计费**。
+- `count` 只影响返回条数，不影响单价。
+
+另一条关键时间点：通过 DeepSeek Harness、Claude Code 或 Codex 使用服务端工具调用时，目前完全免费；**按请求计费从北京时间 2026 年 11 月 1 日零时开始**。也就是说现在接入的内置网页搜索动作还在免费窗口期内，11 月起按量计费。
+
+速率限制方面，每个账户的 Search 与 Fetch **独立限流、互不消耗**，各为每秒 5 次请求，按账户级统计。
+
+## 错误码与重试策略
+
+错误沿用 OpenAI 兼容格式，param 恒为 null：
+
+| HTTP 状态 | 含义 | 应对 |
+|---|---|---|
+| 400 | 请求头或请求体非法，含 JSON 格式错误、字段值越界 | 修请求，别重试 |
+| 401 | API key 缺失或无效 | 检查 key |
+| 402 | 账户余额不足 | 充值后重试 |
+| 403 | Fetch 请求被安全策略拒绝 | 别重试，换来源 |
+| 404 | Fetch 拿不到可用内容（URL 失效、被拦、类型不支持等） | 别重试，换 URL |
+| 408 | 读请求体超时 | 等待后重试 |
+| 413 | 请求体过大 | 检查请求大小 |
+| 429 | 超出 Search 或 Fetch 的 QPS 限制 | 等待后重试 |
+| 500 | 服务端内部错误 | 等待后重试 |
+| 504 | 下游请求超时 | 等待后重试 |
+
+官方建议：408、429 与 5xx 等待重试；402 先充值；其他 4xx 不改请求就别重试。工程上按这个分组写重试策略即可，429 和 5xx 用指数退避加抖动，403 和 404 直接计入「该来源不可用」缓存，避免反复撞墙。
+
+## 实战：一个研究型 Agent 的最小实现
+
+下面是一个完整可跑的研究型 Agent：接收问题，先搜索，按分数与权威度筛出高可信结果，再抓取正文，最后让模型基于正文作答。代码用 OpenAI 兼容 SDK 模式，换成 requests 也只是几十行的事。
+
+```python
+import os
+import time
+import requests
+
+BASE = "https://api.deepseek.com"
+HEADERS = {
+    "Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}",
+    "Content-Type": "application/json",
+}
+
+
+def search(query: str, count: int = 10, need_content: bool = False) -> list[dict]:
+    """调用 Search API，带简单退避重试。"""
+    payload = {"query": query, "count": count, "need_content": need_content}
+    for attempt in range(4):
+        resp = requests.post(f"{BASE}/v1/tools/search", headers=HEADERS, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return resp.json().get("results", [])
+        if resp.status_code in (408, 429, 500, 504):
+            time.sleep(2 ** attempt)  # 指数退避
+            continue
+        resp.raise_for_status()
+    raise RuntimeError("search failed after retries")
+
+
+def fetch(url: str) -> str:
+    """调用 Fetch API 抓取单个页面的 Markdown。"""
+    for attempt in range(4):
+        resp = requests.post(f"{BASE}/v1/tools/fetch", headers=HEADERS, json={"url": url}, timeout=60)
+        if resp.status_code == 200:
+            return resp.json().get("content", "")
+        if resp.status_code in (408, 429, 500, 504):
+            time.sleep(2 ** attempt)
+            continue
+        return ""  # 403/404 等：该来源不可用，返回空让上层降级
+    return ""
+
+
+def pick_trusted(results: list[dict], min_score: float = 1.5, min_authority: int = 3) -> list[dict]:
+    """按 rerank_score 与 authority 筛选高可信结果，兜底放行前两条。"""
+    trusted = [
+        r for r in results
+        if r.get("rerank_score", 0) >= min_score and r.get("authority", -1) >= min_authority
+    ]
+    return trusted if trusted else results[:2]
+
+
+def research(question: str, top_k: int = 3) -> str:
+    """研究型 Agent 主流程：搜索 -> 筛选 -> 抓正文 -> 拼接证据。"""
+    results = search(question, count=10)
+    if not results:
+        return "没有找到相关结果。"
+    evidence = []
+    for r in pick_trusted(results)[:top_k]:
+        body = fetch(r["url"])
+        if not body:
+            continue  # 抓取失败：跳过该来源，不影响其他证据
+        evidence.append(f"# {r['title']}\n来源: {r['url']}\n\n{body[:8000]}")
+    return "\n\n---\n\n".join(evidence)
+
+
+if __name__ == "__main__":
+    q = "DeepSeek V4.1 Flash 发布 有哪些改进"
+    docs = research(q)
+    print(docs[:2000])
+```
+
+这个实现里有四个工程决策，比 API 本身更值得说：
+
+1. **query 里写时间与站点约束**。比如 `... site:arxiv.org OR site:github.com after:2026-10-01`，把过滤前移到搜索引擎，省客户端 token。
+2. **筛选兜底**。`pick_trusted` 先按分数与权威度挑，一条都不达标时退化为前两条——宁可要次优证据，也不要空手回家。
+3. **失败静默降级**。Fetch 的 403 与 404 直接返回空串让上层跳过，绝不重试；只有 408、429、5xx 才退避重试，与官方建议一致。
+4. **正文截断**。单页正文截到 8000 字符再进上下文，控制成本；要全文就换 Fetch 出的原始 Markdown 自行分块。
+
+## 成本估算：把它当日常动作用
+
+按每千次成功请求 0.75 美元算一笔账。假设一个研究型 Agent 平均每个问题做 2 次 Search、3 次 Fetch，共 5 次成功请求：
+
+| 使用强度 | 每日问题数 | 每日请求 | 每日成本 | 每月成本（30 天） |
+|---|---|---|---|---|
+| 个人尝鲜 | 5 | 25 | 约 0.019 美元 | 约 0.56 美元 |
+| 小团队工具 | 50 | 250 | 约 0.19 美元 | 约 5.6 美元 |
+| 生产服务 | 500 | 2500 | 约 1.88 美元 | 约 56 美元 |
+| 大规模 | 5000 | 25000 | 约 18.8 美元 | 约 563 美元 |
+
+对比 HN 评论区给的价格：Exa 每千次搜索 4 美元、Brave 5 美元、Kagi 12 美元，同样的「每个问题 5 次请求」在 Exa 上大约要 20 美元一千次量级，DeepSeek 便宜约 5 倍；唯一更便宜的选手是 Ceramic.ai 的 0.25 美元每千次，但社区讨论热度与文档完整度相差一个量级。空结果不计费这条对「搜了但没有」的探索型任务尤其友好——试错成本趋近于零。
+
+速率限制每秒 5 次看起来紧，但注意 Search 一次最多回 50 条、Fetch 一次拿整页，正常研究流不需要堆请求。真要高并发，做客户端队列加多账号分流即可，文档明确 Search 与 Fetch 限额独立。
+
+## 注意事项与合规边界
+
+最后三句丑话：
+
+- **它不是反爬工具**。官方文档写明抓取受目标站点策略约束，HN 高赞评论也指出源站反爬该挡还是挡。拿它做合规的内容获取没问题，拿它突破站点访问控制与条款，风险自担。
+- **结果可能来自索引缓存**。评论区有开发者推测 DeepSeek 自建了索引并返回缓存结果，这对时效性敏感的任务意味着「最新页面」未必实时，重要场景用 `after:` 运算符约束时间窗并交叉验证。
+- **11 月起开始计费**。现在通过 Harness、Claude Code、Codex 的服务端调用免费，但直接调 API 的团队应按上表把 11 月起的预算排进去。
+
+## 结语
+
+DeepSeek 这一刀切在了一个正确的位置：Agent 的基础设施层。模型可以换，但「找页面」和「读页面」是每个 Agent 每天都要做的机械动作，把它的价格打到每千次 0.75 美元、字段设计到 snippet 给人看、summary 给模型读、authority 给筛选用，等于给整个生态的 Agent 降本。对开发者，行动很直接：把现有 Agent 里手工维护的搜索抓取栈换成这两个端点，先按上面的示例跑一周，用真实请求数对一遍成本表，再决定要不要迁生产。
