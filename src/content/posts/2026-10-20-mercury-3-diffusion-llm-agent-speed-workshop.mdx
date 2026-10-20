@@ -1,0 +1,139 @@
+---
+title: "Mercury 3 实战：把 1000 tokens/s 的扩散语言模型接进 Agent 工作流"
+description: "Inception Labs 发布 Mercury 3，迄今最强的扩散语言模型：1068 tokens/s、1M 上下文、5 折首发价。本文用可运行代码把它接入 Agent 工作流，并给出延迟敏感场景的选型清单。"
+column: "workshop"
+tags: ["Mercury 3", "Inception Labs", "diffusion LLM", "推理加速", "Agent"]
+pubDate: 2026-10-20
+template: "terminal"
+featured: false
+tldr: "Mercury 3 是 Inception Labs 于 2026-10-19 发布的旗舰扩散语言模型，速度 1068 tokens/s、上下文 1M token，官方基准超过 GPT-6 Luna 与 Claude Haiku 5.5。本文覆盖 API 接入、参数调优与三类生产场景的落地代码。"
+author: "YOMXXX"
+faq:
+  - q: "扩散语言模型和自回归模型有什么区别？"
+    a: "自回归模型逐 token 从左到右生成，每一步依赖前文；扩散语言模型从带噪声的整段文本开始并行去噪，多步迭代后收敛到完整输出，因此天然适合并行加速，单步吞吐可以轻松超过每秒一千 token。"
+  - q: "Mercury 3 的 API 兼容 OpenAI 格式吗？"
+    a: "兼容。官方端点 api.inceptionlabs.ai/v1 的 chat completions 接口与 OpenAI 一致，只需替换 base_url 与 model 字段即可；同时支持 OpenAI 客户端、LiteLLM、LangChain、AISuite 与 Vercel AI SDK。"
+  - q: "新用户能免费试用吗？"
+    a: "可以。注册 Inception Platform 后每个新账号自动获得 1 亿免费 token，无需绑定支付方式，足够完成小规模压测与功能验证，之后再在 Billing 页面充值。"
+  - q: "什么场景不适合用 Mercury 3？"
+    a: "对输出多样性、创意写作要求极高的任务，以及需要严格逐步推理展示的场景建议先小规模评估；另外 Mercury 2 与 2.5 已停止向新用户开放，存量用户需在 11 月 15 日前完成迁移。"
+  - q: "reasoning_effort 参数应该怎么设？"
+    a: "该参数控制推理投入，可选 low、medium、high 等档位。延迟极度敏感的场景如语音助手用 low，代码与多步规划任务用 medium 或 high；官方示例默认 medium，建议按任务 A/B 测试后固定。"
+---
+
+2026 年 10 月 19 日，Inception Labs 发布 Mercury 3，这是目前能力最强的扩散（diffusion）语言模型。对每天和推理延迟搏斗的开发者来说，这次发布的意义不止于又一个新模型：它第一次在公开基准上证明，扩散架构可以扩展到与前沿自回归模型正面竞争的水平。
+
+Inception 给 Mercury 3 的定位非常直白——质量对标 GPT-6 Luna 与 Claude Haiku 5.5 这一档「速度优化型」前沿模型，速度则是它们的 4 到 8 倍。本文是一篇工坊：从架构差异讲起，用可运行代码把 Mercury 3 接进 Agent 工作流，最后给出延迟敏感场景的选型清单。
+
+## 扩散架构为什么快
+
+自回归模型生成文本像写字，必须一笔一画按顺序来：每生成一个 token，都要等前一个 token 确定。扩散语言模型则像修图——从一整段带噪声的文本开始，通过多轮并行去噪，让所有位置同时收敛到合理输出。token 之间没有严格的先后依赖，单步可以并行处理整段，这就是 Mercury 3 能做到 1068 tokens/s（NVIDIA GPU）的物理基础。
+
+更关键的是 Inception 本次披露的扩展性证据：Mercury 3 的总参数量比 Mercury 1 大了 40 倍以上，而智能水平提升了约 3 倍，速度保持不变。官方结论是「推动自回归模型进步的 scaling laws 对扩散架构同样成立」。如果这个判断经受住时间检验，推理加速的技术路线就多了一条主干道。
+
+规格速览：
+
+- 速度：1068 tokens/s（NVIDIA GPU）
+- 上下文：1M token（上一代 Mercury 2.5 为 260K）
+- 定价：每百万输入 token 0.20 美元、每百万输出 token 0.70 美元；首发五折，即 0.10 与 0.35 美元；缓存输入再打一折，低至 0.02 美元
+- 家族：Mercury Voice（语音低延迟，首 token 时间低于 170 毫秒）、Mercury Decide（大批量分类决策，带校准概率）
+
+## 接入：十分钟跑通第一次调用
+
+Mercury 3 已上线 Inception API Platform，同时可通过 OpenRouter、Baseten、Vercel 访问。接口完全兼容 OpenAI chat completions 格式，意味着现有代码几乎零改动。
+
+先拿免费额度：注册平台账号后自动获得 1 亿 token，在 Dashboard 创建 API Key，然后设置环境变量：
+
+```bash
+export INCEPTION_API_KEY="你的key"
+pip install inceptionai
+```
+
+最直接的调用方式是一条 curl：
+
+```bash
+curl https://api.inceptionlabs.ai/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $INCEPTION_API_KEY" \
+  -d '{
+    "model": "mercury-3",
+    "messages": [
+      {"role": "user", "content": "用三句话解释扩散语言模型"}
+    ],
+    "reasoning_effort": "medium",
+    "temperature": 0.75,
+    "max_completion_tokens": 8192
+  }'
+```
+
+用 Python SDK 则是这样，注意 `reasoning_effort` 是这个平台的特有参数：
+
+```python
+from inceptionai import InceptionAI
+
+client = InceptionAI()
+
+resp = client.chat.completions.create(
+    model="mercury-3",
+    messages=[{"role": "user", "content": "把这段日志归类为正常或异常"}],
+    reasoning_effort="medium",
+    temperature=0.75,
+    max_completion_tokens=8192,
+)
+print(resp.choices[0].message.content)
+```
+
+如果你已经在用 LiteLLM 或 LangChain，走标准 provider 配置即可，官方文档给出了 AISuite、LiteLLM、LangChain、OpenAI 客户端与 Vercel AI SDK 五种接入示例。对 Agent 框架来说，把它当任何一个 OpenAI 兼容端点注册进去就行。
+
+## 场景一：浏览器智能体，把每一步的等待压到最低
+
+Agent 每一步都在等模型，延迟会沿着步骤数复利式放大。Inception 用自家生产级 web-agent harness 做了对照实验：在 50 个真实的 Mind2Web 导航任务上，Mercury 3 完成了其中 50%，显著高于 GPT-6.1-Sol；关键是两者消耗的 token 量与 agent 步数完全相同，Mercury 3 的每 token 成本只有对手的一个零头。
+
+对这类负载，工程上的做法是把模型调用嵌进循环，并显式控制推理档位：
+
+```python
+for step in range(max_steps):
+    action = client.chat.completions.create(
+        model="mercury-3",
+        messages=state.messages,
+        reasoning_effort="low",      # 导航决策不需要深度推理
+        temperature=0.3,
+        max_completion_tokens=1024,
+    )
+    result = browser.execute(action)
+    if result.done:
+        break
+```
+
+`reasoning_effort` 设 low 是这里的核心技巧：浏览器导航的每一步都是短决策，深度推理的边际收益低，而延迟成本线性累加。把重推理留给最后的结果汇总步骤，整条链路的中位耗时会好看得多。
+
+## 场景二：教育反馈，一秒内返回批改
+
+RevisionDojo 的 CTO Michael Tong 分享了迁移体验：给学生即时反馈意味着提示、标记答案、定义讲解都要在一秒内返回，同时不能牺牲推理质量。迁到 Mercury 3 后这些反馈约一秒返回，质量不低于此前使用的模型，且是「对现有技术栈的直接替换」。
+
+这个案例的工程启示是：延迟预算要按用户体验倒推。交互式学习场景里，学生等待超过两三秒就会脱离学习流，模型选择因此从「质量优先」变成「延迟达标前提下的质量优先」——Mercury 3 恰好卡在这个生态位。
+
+## 场景三：端侧搜索，智能眼镜上的 0.9 秒
+
+Octen AI 在智能眼镜的 Sense API 上做了测试：在他们的场景里，「五秒才返回的答案等于坏掉」。实测 Mercury 3 的生成时间中位数为 0.9 秒，端到端响应中位数 2.2 秒，是测试过的快速模型中速度与质量平衡最好的一档。
+
+眼镜、车载、可穿戴这类设备的共同点是：用户对延迟的容忍度以百毫秒计。Mercury 3 配合 Mercury Voice（首 token 低于 170 毫秒）基本覆盖了这类负载的全链路。
+
+## 成本账：便宜到什么程度
+
+按首发价粗算：每百万输入 token 0.10 美元、每百万输出 token 0.35 美元。一个日均 5000 次调用的客服 Agent，假设每次平均消耗 2000 输入 token 与 300 输出 token，一天的 token 成本约为 1.55 美元；同样的调用量若用每百万 3 美元输入、15 美元输出的模型，成本是它的数十倍。再叠加缓存输入 0.02 美元的定价，多轮对话场景（系统提示与历史高度重复）还能再省一截。
+
+对 Agent 负载，成本结构比单价更重要：Mercury 3 在 Mind2Web 上用同样的 token 量完成了更多任务，意味着「每个完成任务的成本」而非「每 token 成本」才是该看的指标。
+
+## 迁移与注意事项
+
+几个实操提醒：
+
+1. **Mercury 2 与 2.5 已停止向新用户开放**，存量用户的访问保留到 11 月 15 日，企业客户按既有协议执行。迁移时把 model 字段从 `mercury-2` 改为 `mercury-3`，其余请求参数不变。
+2. **temperature 建议从 0.75 起步微调**。扩散模型的输出分布与自回归模型手感不同，同参数下的多样性表现会有差异，固定参数前跑一轮业务样例评测。
+3. **免费额度用做压测**。1 亿 token 足够验证功能与延迟，正式上线前把 P50 与 P99 延迟测出来，特别是高并发下（官方企业版才提供专属容量与自动扩缩容）。
+4. **输出校验别省**。任何新模型上线都建议过一遍业务自己的回归集，尤其是结构化输出与工具调用格式的稳定性。
+
+## 小结
+
+Mercury 3 把「扩散模型能否规模化」从开放问题变成了有证据的回答：40 倍参数增长、3 倍智能提升、速度不降。对开发者，它的吸引力很具体——1068 tokens/s、1M 上下文、首发五折价、OpenAI 兼容接口。如果负载长在延迟敏感区间（Agent、教育、实时搜索、语音），值得用免费额度跑一轮对比测试；如果追求极致的复杂推理质量，它目前的定位是速度优化档，不是深度思考档。两条生态位分开选，就不会错配。
