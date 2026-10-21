@@ -6,7 +6,7 @@ import Footer from '../components/astro/Footer.astro';
 
 <BaseLayout
   title="About · YOMXXX"
-  description="About YOMXXX — a personal engineering log on AI frontier, written weekly by an applied AI engineer."
+  description="About YOMXXX — a personal engineering log on the AI frontier, written by an applied AI engineer. Three essays a week, Monday / Wednesday / Friday."
 >
   <Header />
   <main class="container">
@@ -23,36 +23,60 @@ import Footer from '../components/astro/Footer.astro';
     <div class="prose">
       <h2>Who I am</h2>
       <p>
-        I'm an applied AI engineer with a focus on LLM-driven systems — agents, RAG, and the
-        production infrastructure that holds them up. I write here because I read and build a
-        lot, and I'd rather externalize my notes than let them rot in a markdown drawer.
+        I'm an applied AI engineer working on LLM-driven systems — agents, RAG, and the
+        production infrastructure that holds them up. Day to day that means reading papers,
+        reading other people's code, and shipping systems that have to stay up. This blog is
+        where that work gets written down.
       </p>
 
       <h2>Why this blog</h2>
       <p>
-        AI is moving too fast for most blogs to keep up. I want to publish at a sustainable
-        cadence (~12 essays/month) but with depth — every essay aims to be one I'd want to
-        reference six months later.
+        I read and build a lot, and I'd rather externalize my notes than let them rot in a
+        markdown drawer. Every essay here starts from something I actually needed to understand —
+        a paper I had to evaluate, a tool I had to run, an architecture decision I had to defend.
+      </p>
+      <p>
+        A note on cadence: this blog started in May 2026 and ran at five posts a day for a
+        while. That was a mistake — volume crowded out depth, and it read like what it was.
+        Since October 2026 the schedule is <strong>three essays a week (Monday, Wednesday,
+        Friday)</strong>, and each one has to be something I'd still want to reference six
+        months later.
       </p>
 
       <h2>What you'll get</h2>
       <ul>
-        <li><strong>workshop</strong> · production lessons, code-first</li>
-        <li><strong>long-form</strong> · architecture & systems</li>
-        <li><strong>paper</strong> · arXiv distilled with engineering bias</li>
-        <li><strong>tools</strong> · honest reviews</li>
-        <li><strong>weekly</strong> · the AI week in 5 bullets</li>
+        <li><strong>workshop</strong> · production lessons, code-first — code I actually ran, with the real output</li>
+        <li><strong>long-form</strong> · architecture &amp; systems, with an argument rather than a summary</li>
+        <li><strong>paper</strong> · arXiv distilled with engineering bias — can I use this, and where does it break</li>
+        <li><strong>tools</strong> · honest reviews with hands-on comparison data</li>
+        <li><strong>weekly</strong> · the AI week in 5 bullets (archive, paused for now)</li>
+      </ul>
+
+      <h2>Original work</h2>
+      <p>
+        The code behind most workshop posts lives on
+        <a href="https://github.com/YOMXXX" target="_blank" rel="noopener noreferrer">my GitHub</a>.
+        If a post claims a number, it came from a run I did — not from a README.
+      </p>
+
+      <h2>Site history</h2>
+      <ul>
+        <li><strong>May 2026</strong> — first post; static Astro site on Cloudflare Pages</li>
+        <li><strong>2026</strong> — 500+ essays across workshop, paper, long-form, tools, weekly</li>
+        <li><strong>October 2026</strong> — switched from daily volume to three curated essays a week</li>
       </ul>
 
       <h2>EEAT note</h2>
       <p>
         Every article carries author and timestamps. Code I publish has been run; opinions I
-        publish I've held for at least a week before writing them down.
+        publish I've held for at least a week before writing them down. If I got something
+        wrong, the contact page reaches me directly and I correct posts in place.
       </p>
 
       <h2>How to reach me</h2>
       <p>
-        See the <a href="/contact">contact</a> page.
+        See the <a href="/contact">contact</a> page, or open an issue on
+        <a href="https://github.com/YOMXXX" target="_blank" rel="noopener noreferrer">GitHub</a>.
       </p>
     </div>
   </main>

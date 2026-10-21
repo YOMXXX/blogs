@@ -111,27 +111,26 @@ FAQ 中的 `<` 不需要转义（YAML frontmatter 由 YAML 解析器处理，不
    - **开发者实用性**（能用的 > 能看的 > 只能聊的）
    - **深度空间**（能写 1500+ 字的 > 只能写 500 字的）
 
-### Step 3: 确定 5 篇选题
+### Step 3: 确定当日 1 篇选题
 
-从候选中选出 5 篇，确保覆盖不同栏目。优先选择：
+按「每周发文计划」的星期门控确定当日栏目，从候选主题中选出 1 篇。优先选择：
 - 有**完整代码示例**可写的主题（workshop）
 - 有**明确论文来源**的主题（paper）
 - 有**多方对比数据**的主题（tools）
 - 有**架构级洞察**的主题（long-form）
 
-## 每日发文计划（5 篇/天）
+## 每周发文计划（3 篇/周）
 
-按以下顺序每天各写一篇，覆盖所有栏目：
+> **2026-10-21 起从「每日 5 篇」降频为「每周 3 篇」。** 机械日更是 Google「scaled content abuse」政策的典型打击对象，曾导致本站被 AdSense 以「低价值内容」拒绝 3+ 次。写作由 WorkBuddy 自动化在每周一/三/五 08:00 执行，其余日期跳过（星期门控见 `scripts/workbuddy-prompt.md` 与 `scripts/daily-write-prompt.md`）。
 
-| 顺序 | 栏目 | 主题选择策略 |
+| 星期 | 栏目 | 主题选择策略 |
 |------|------|-------------|
-| 1 | `workshop` | 从 GitHub Trending / HN 中选新框架或工具，写实战教程 |
-| 2 | `paper` | 从 arXiv / HF Daily Papers 中选高引论文精读 |
-| 3 | `long-form` | 从 Reddit 讨论或行业趋势中选深度架构分析 |
-| 4 | `tools` | 从产品发布或 HN 讨论中选工具横评 |
-| 5 | `weekly` | 综合所有渠道的本周热点（仅周日发） |
+| 周一 | `workshop` | 从 GitHub Trending / HN 中选新框架或工具，写实战教程（必须含实际跑过的代码与真实输出） |
+| 周三 | `paper` | 从 arXiv / HF Daily Papers 中选高引论文精读（必须含自己的工程判断） |
+| 周五 | `long-form` / `tools` 轮换 | long-form 从 Reddit 讨论或行业趋势中选深度架构分析；tools 从产品发布或 HN 讨论中选工具横评（必须含实测数据） |
 
-周日发 weekly，其余天 weekly 替换为额外一篇其他栏目文章。
+- `weekly` 栏目暂停新更，存量文章保留。
+- 原创性红线：全站单篇选题不得与已有文章重复；各栏目第一手内容要求见 `scripts/daily-write-prompt.md`。
 
 ## 代码规范
 
@@ -177,9 +176,10 @@ FAQ 中的 `<` 不需要转义（YAML frontmatter 由 YAML 解析器处理，不
 
 ## 定时任务
 
-每日 5 篇的写作与发布由 **WorkBuddy 本机自动化**在每天 **08:00（Asia/Shanghai）** 自动触发，已不再使用 launchd / Qoder / Codex / Grok Bot。
+每周 3 篇（周一/三/五）的写作与发布由 **WorkBuddy 本机自动化**在 **08:00（Asia/Shanghai）** 自动触发，已不再使用 launchd / Qoder / Codex / Grok Bot。
 - 自动化 ID：`cda81023-d270-4fae-bac4-eba9515df7bf`；工作目录即本仓库根目录
 - 提示词正文见 `scripts/workbuddy-prompt.md`；触发方式与历史沿革见 `scripts/DAILY-TRIGGER.md`
+- 2026-10-21 起：自动化仍每天 08:00 触发，但提示词与 `scripts/daily-write-prompt.md` 内含**星期门控**，仅周一/三/五写稿。若在 App 内把 rrule 改为 `FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8;BYMINUTE=0`，与星期门控二选一，不要叠加
 - 执行前先跑 `bash scripts/preflight.sh`：7 项环境预检（Node / pnpm / 依赖 / git 身份 / IndexNow key / 远端可读 / 推送凭据）
 - **前提**：08:00 时 Mac 已唤醒且 WorkBuddy 客户端在运行
 - `pnpm`、`tvly` 位于 `/usr/local/bin`，命令前需 `export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"`

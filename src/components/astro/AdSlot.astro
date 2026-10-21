@@ -1,4 +1,11 @@
 ---
+// ── 广告位总开关 ──────────────────────────────────────────────
+// AdSense 送审期间必须为 false：
+//   全站不渲染任何广告位，避免审核时将站点判定为「为广告而建的内容农场」。
+//   审核通过后改回 true，全部广告位即刻恢复，无需改动其他文件。
+// 背景：2026-10-21 本站因「低价值内容」被拒 3+ 次，整改期关闭广告位。
+const SHOW_ADS = false;
+
 interface Props {
   position: string;
   slot: string;
@@ -8,19 +15,21 @@ interface Props {
 const { position, slot, format = 'auto' } = Astro.props;
 ---
 
-<div class="ad-slot" data-position={position}>
-  <ins
-    class="adsbygoogle"
-    style="display:block"
-    data-ad-client="ca-pub-7299456929245815"
-    data-ad-slot={slot}
-    data-ad-format={format}
-    data-full-width-responsive="true"
-  ></ins>
-  <script is:inline>
-    try { (adsbygoogle = window.adsbygoogle || []).push({}); } catch(e) {}
-  </script>
-</div>
+{SHOW_ADS && (
+  <div class="ad-slot" data-position={position}>
+    <ins
+      class="adsbygoogle"
+      style="display:block"
+      data-ad-client="ca-pub-7299456929245815"
+      data-ad-slot={slot}
+      data-ad-format={format}
+      data-full-width-responsive="true"
+    ></ins>
+    <script is:inline>
+      try { (adsbygoogle = window.adsbygoogle || []).push({}); } catch(e) {}
+    </script>
+  </div>
+)}
 
 <style>
   .ad-slot {
