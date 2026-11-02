@@ -1,0 +1,164 @@
+---
+title: "5 个 27B 小模型打赢 Fable 5？我把 Memdoor 的 team-solve 装起来跑了一遍"
+description: "Memdoor 用 8 个 YAML 文件把 5 个 Qwen3.8-27B 组成解题团队，50 次实测平均 9.8/10。本文记录本机安装、三次踩坑、50 条原始数据重算与工程判断。"
+column: "workshop"
+tags: ["Memdoor", "MultiAgent", "Qwen", "LiveCodeBench", "AI Workflow", "开源"]
+pubDate: 2026-11-02
+template: "terminal"
+featured: false
+tldr: "我在 Mac 上实测了 Memdoor v1.775.0：官方安装脚本因网络问题失败（本文给出替代路径），照 README 拷贝示例目录会把 DAG 污染成 23 个任务，无 provider 时 agent 步骤秒挂；重算 50 次运行的原始 TSV 确认 9.8/10 与 35.79 美元总成本属实，但单次均值成本接近宣称中位数的两倍，10 题样本不宜过度解读。"
+author: "YOMXXX"
+faq:
+  - q: "Memdoor 和 LangGraph、CrewAI 这类多智能体框架有什么区别？"
+    a: "最大的区别在完成判定：Memdoor 的每个步骤是否完成由 target 证明（文件存在或命令退出码为 0），而不是模型自己说完成就算完成。另外它是单个 Go 静态二进制，无 Docker、无 Python 依赖，workflow 就是一个目录里的 YAML 文件，可以直接进 git 版本管理。LangGraph 偏代码编排，CrewAI 偏角色抽象，Memdoor 更像一个把确定性外壳做厚的执行引擎。"
+  - q: "5 个 27B 小模型真的打赢了 Fable 5 吗？"
+    a: "严格说没有。9.8 对 8.0 的对比里，Fable 5 是单次调用、没有重试和修复环节，两者拿到的帮助不对等；和原论文 harness 的 9.6 相比只是打平，10 题样本差异在噪声范围内。GVS5H 论文修订版在全部 100 题上的数据甚至是 Fable 5 以 87.4 对 86.4 微弱反超。可信的结论是：好 harness 能把 27B 模型抬到接近前沿模型的水平，而不是小模型更强。"
+  - q: "自己复现这套 workflow 需要什么条件？"
+    a: "一台能跑 memdoor 的机器（macOS、Linux 都有预编译二进制），一个模型接入方式：OpenRouter、Anthropic、OpenAI 等 API key 任选其一，或者用 memdoor connect local 接 Ollama、llama.cpp 等本地运行时。跑 team-solve 原样复现需要 Qwen3.8-27B 级别的模型，本地跑显存要求不低，还需要 32K 上下文窗口；只是体验流程的话，用任何能写 Python 的模型都行。"
+  - q: "单次运行成本到底多少？宣称的 0.39 美元靠谱吗？"
+    a: "0.39 美元是 50 次运行的中位数，我重算原始 TSV 得到的中位数是 0.40 美元，基本一致。但均值是 0.72 美元，接近中位的两倍：多数题目便宜（最低 0.06 美元），少数难题长尾很贵（最贵一次 4.24 美元）。预估成本时应该按均值甚至按最坏情况预算，不要拿中位数乘以题目数。"
+  - q: "这套 ledger 加 fresh context 的模式适合搬到日常开发任务吗？"
+    a: "适合的场景是有明确验收标准的任务：算法题、带测试套件的 bug 修复、有 lint 和编译做裁判的重构。它的核心收益是每一步只读文件、上下文干净、失败可从断点恢复。不适合开放式任务，比如探索性的架构设计——那里没有能自动判卷的 target，强套这套流程只会多花钱。"
+---
+
+上周末 Hacker News 有一条 419 分的热帖：Memdoor 项目用 5 个 Qwen3.8-27B 组成解题团队，在 LiveCodeBench Hard 的前 10 道题上拿下平均 9.8/10，而对照里 Fable 5 单次调用只有 8.0。标题很唬人，但它把全部 50 次运行的原始数据（每次的请求、回复、程序、判题输出和成本）都公开了，这比大多数论文的姿态诚实得多。于是我把它装到自己的 Mac 上，从头跑了一遍流程，顺便把原始数据亲手重算了一遍。这篇文章记录的是我实际看到的输出和踩到的坑，不是 README 翻译。
+
+## Memdoor 是什么
+
+先把项目本身说清楚。Memdoor 是一个 Go 写的单文件 CLI（Apache-2.0 协议），定位是「编码与自动化 agent 的轻量 harness」：无 Docker、无 Python 依赖，本机跑或者通过 SSH 在远程机器上跑。它有三层东西：
+
+1. **网关**：一个后台守护进程，掌管会话、调度和 workflow 运行，终端、IDE、手机、CI 都是它的「门」；
+2. **决策模型**：一个轻量分类器，在每轮回合前判断要不要读文件、读什么，官方数据称能省约七成输入 token；
+3. **Workflow 引擎**：底层是作者的另一个项目 mario，每个步骤一个 YAML 文件，`requires` 声明 DAG 依赖，步骤完成与否由 target（文件存在或命令退出码）证明。
+
+team-solve 是它最有名的示例 workflow：8 个 YAML、零代码、不指定模型。团队角色是一个 planner、两个并行的 ideator、一个 solver、一个 manager 加一个 repair worker，每个角色从全新上下文启动，只通过磁盘上的文件交流——原论文把这种纪律称为 ledger discipline，也是这套方法涨分的关键。
+
+## 实测一：安装就不顺利，但替代路径很干净
+
+官方一行命令 `curl -fsSL https://memdoor.ai/install.sh | bash` 在我机器上失败了：脚本从 memdoor.ai 拿到下载地址后实际跳转到 github.com，而我这里的网络到 github.com 的 443 端口直连超时（75 秒后放弃）。绕过代理重试依然超时。
+
+好在这个二进制同时发布在 GitHub Releases，而 Releases 走 api.github.com 是通的。三条命令搞定：
+
+```bash
+# 拿到最新版本资产列表，找到 darwin-arm64 的 asset id
+curl -s https://api.github.com/repos/guregodevo/memdoor/releases/latest
+# 用 octet-stream Accept 头直接经 API 下载资产
+curl -sL -H 'Accept: application/octet-stream' \
+  'https://api.github.com/repos/guregodevo/memdoor/releases/assets/699912331' \
+  -o ~/.local/bin/memdoor && chmod +x ~/.local/bin/memdoor
+# 下载官方 SHA256SUMS 核对
+shasum -a 256 ~/.local/bin/memdoor
+```
+
+校验和与官方 SHA256SUMS 完全一致（9a0cfaa7 开头），版本输出如下：
+
+```text
+memdoor v1.775.0 (2e4143a, built 2026-11-02T00:04:57Z)
+  go1.25.0 darwin/arm64
+```
+
+顺带一提，这个版本是发帖当天凌晨刚构建的，项目 push 频率相当高。`memdoor doctor` 在全新机器上会直白地告诉你「什么都没配置」，并列出接入 provider 的两条路：环境变量塞 key，或者 `memdoor connect` 走交互配置；还有第三条 `memdoor connect local`，直连 Ollama、llama.cpp 这类本地运行时，不需要任何 key。
+
+## 实测二：照 README 抄安装命令，DAG 被污染成 23 个任务
+
+README 给的体验路径是：把示例目录整个拷到用户级 workflow 目录，然后在任意项目里跑起来。我照做了，第一次运行 `memdoor workflow run team-solve` 时先看到它自动把网关拉起来（监听 18789 端口）、初始化了用户目录——这部分「第一次运行自动装机」的体验确实顺滑。但接着输出让我愣了一下：
+
+```text
+▶ team-solve started as team-solve-20261102-081923 — 23 tasks
+  ○ answer                      waiting  ← single-lcb.steps.read
+  ○ grade                       waiting  ← single-lcb.steps.write
+  ○ team-llm-lcb.steps.plan     waiting  ← team-llm-lcb.steps.read
+  ○ team-solve.steps.plan       waiting
+  ...
+```
+
+明明是 8 个步骤的 workflow，怎么冒出来 23 个任务？原因是示例目录里还带着 `bench/` 子目录，里面躺着另外两套实验用的 steps（single-lcb 和 team-llm-lcb），引擎会递归扫描目录下所有 YAML，把它们全部收进同一个 DAG。这不是我瞎改了什么——照着 README 一字不差地执行就会踩到。
+
+**修复**：只保留 `steps/` 目录和 `check-samples.sh`，删掉 `bench/` 和 `sample/`，重跑后 DAG 干净地回到 8 个任务：
+
+```text
+▶ team-solve started as team-solve-20261102-082053 — 8 tasks
+  ○ ideate-a  waiting  ← plan
+  ○ ideate-b  waiting  ← plan
+  ○ plan      waiting
+  ○ solve     waiting  ← ideate-a, ideate-b
+  ○ test      waiting  ← solve
+  ○ review    waiting  ← test
+  ○ repair    waiting  ← review
+  ○ verify    waiting  ← repair
+```
+
+依赖关系一目了然：两个 ideator 并行，solve 汇合，test 之后 review、repair 串成修复回路，最后 verify 一锤定音。
+
+## 实测三：没有模型时，agent 步骤和命令步骤表现完全不同
+
+我机器上没有配任何 LLM API key，这正好构成一个天然实验：workflow 引擎在无 provider 时会怎么表现？答案是两类步骤分道扬镳：
+
+- **命令步骤**（type: command）照常执行——它们是引擎直接跑的 shell 命令，不需要模型。第一次运行里 `single-lcb.steps.read` 就正常完成了；
+- **agent 步骤**在 0 秒内失败，错误信息清晰不模糊：
+
+```text
+✗ team-solve.steps.plan  failed 0s
+    no model is configured: set a provider key
+    (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, …) or run memdoor connect
+```
+
+这个设计值得点赞：失败发生在正确的位置（该失败的步骤）、消息直接给出修复动作、其余等待中的任务保持原状，随时可以 `memdoor workflow resume` 从断点继续。
+
+## 实测四：亲手验证命令步骤的判卷链路
+
+为了确认 target 证明机制不是摆设，我绕过模型，自己写解法喂给官方判卷脚本。示例题是「统计字符串中 a、b、c 数量相等的非空子串个数」，数据规模到 20 万字符，要求 O(N) 或 O(N log N)。
+
+第一版我定义的状态是「a 减 b 的差」和「c 的计数」——只对 c 做了单变量计数。测试 1 碰巧输出正确，但这是假象：按这个定义，`ab` 这种不平衡子串会被误判成平衡。正确的做法是两个差分状态同时归零才代表平衡：`x = a - b`、`y = b - c`，子串平衡当且仅当两端前缀状态相等。修正后：
+
+```python
+import sys
+from collections import defaultdict
+
+def main():
+    s = sys.stdin.readline().strip()
+    cnt = defaultdict(int)
+    cnt[(0, 0)] = 1
+    x = y = 0  # x = a - b, y = b - c
+    ans = 0
+    for ch in s:
+        if ch == 'a':
+            x += 1
+        elif ch == 'b':
+            x -= 1
+            y += 1
+        else:
+            y -= 1
+        ans += cnt[(x, y)]
+        cnt[(x, y)] += 1
+    print(ans)
+
+main()
+```
+
+5 个样例全部通过，官方 `check-samples.sh` 的退出码为 0，尾行输出「Samples: 5; failures: 0」。这就验证了命令步骤的契约：workflow 只认磁盘上的事实（solution.py 加 tests 目录加 diff 比对），不认任何人的口头承诺。顺带一提，团队在评测里唯一丢掉的那道题 abc399_e，恰恰是「manager 编造了一个错误的反例，团队把正确的程序改错」——判卷链路是对的，但修复回路里缺少对反例本身的验证，这是原方法留下的已知缺口。
+
+## 重算 50 次运行：宣称的数字经得起核对
+
+team-solve 的 bench 目录里有完整的原始数据（TSV 格式），我用几行 Python 重算了一遍：
+
+- **成绩**：5 轮分别是 10、10、10、10、9，平均 9.8/10，与 README 宣称一致；唯一失败是第 5 轮 abc399_e（隐藏测试 32/44）；
+- **对照**：作者原 harness 同题 9.6，Fable 5 单次调用 8.0，均与宣称一致。README 没直接给的第三个数：Qwen3.8-27B 不套 harness 直接单干只有 6.2——harness 把它抬了 3.6 分；
+- **成本**：50 次总计 35.79 美元，与宣称分毫不差；中位 0.40 美元/次，但均值 0.72 美元，最贵一次 4.24 美元（arc196_c），最便宜 0.06 美元，长尾明显；
+- **其他**：13 次运行触发了 128K 回复上限的重试（arc196_c 一题占了 4 次）；输出 token 中位数约 16.6 万；运行宿主分布在 Modal、CoreWeave、Wafer 三家 GPU 云上。
+
+数字全部对得上，这份坦诚在开源项目里少见。但有两个「诚实的小字」值得放大：其一，10 题乘 5 轮的样本里，一道题就值 2 个百分点，9.8 与 9.6 的差距毫无统计意义，项目自己也承认这是 parity check（复现核对）而非优越性证明；其二，有第三方核对指出，GVS5H 论文修订版在全部 100 题上的数据是 Fable 5 以 87.4 对 86.4 微弱反超——小样本高光与大样本打平，同时成立。
+
+## 工程判断：什么值得抄，什么别当真
+
+**别当真的**：「27B 打败前沿模型」这个标题。对照条件不对等（Fable 5 没有重试和修复环节）、样本只有 10 题、 contamination 未排除（题目来自 2025 年春季赛事）。真正站得住的结论是：一个设计良好的 harness 能把 27B 开源模型从 6.2 分抬到 9.8 分，harness 的贡献比模型本身大。
+
+**值得抄的三个设计**：
+
+1. **target 证明完成**。步骤完成的唯一凭证是文件存在或命令退出码为 0，「模型说完成」永远不算数。这是对 LLM 自述偏差最朴素也最有效的防御，任何 agent 系统都该有这一层；
+2. **ledger 纪律加全新上下文**。每个角色只读文件、不带聊天历史，上下文污染和角色间的隐性约定被物理切断了。代价是 token 用量（输出中位 16 万 token），收益是每一步可审计、可重放；
+3. **失败可恢复**。run 状态落在本地数据库，挂掉后 resume 会跳过已完成步骤。长任务（本例中位 40 分钟）没有这个能力根本不可用。
+
+**实际采用建议**：如果你的任务有天然判卷器（测试套件、编译器、lint），Memdoor 这类 workflow-first harness 是省钱的好选择——27B 级模型在 OpenRouter 上的价格加一个靠谱外壳，很多时候够用。如果是开放式任务，没有 target 可证明，这套强流程只会让你多花两倍的钱。另外本机复现前记得两个坑：别把 bench 目录拷进 workflow 目录，以及本地模型需要 32K 上下文窗口（Ollama 默认 4K 会被截断）。
+
+这台 Mac 上的完整链路我已验证：安装（含校验和）、网关自启、DAG 编排、错误恢复路径、判卷脚本。剩下的最后一块拼图——接上模型真跑一轮——等你有 key 或者有显存的时候，命令都在本文里。
