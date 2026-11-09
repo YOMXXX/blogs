@@ -1,0 +1,94 @@
+---
+title: "实战工坊：把 Matt Pocock 的 39 个 Agent Skills 拆给你看"
+description: "mattpocock/skills 是当前最值得深拆的技能包：39 个 skill、四个分层目录、一份共享词汇表和一条严苛的收录门槛。本文基于真机实测拆解它的设计决策，并给出安装与二次定制的完整路径。"
+column: "workshop"
+tags: ["AgentSkills", "ClaudeCode", "Codex", "Workshop", "EngineeringWorkflow"]
+pubDate: 2026-11-09
+template: "classic"
+featured: false
+tldr: "拆解 mattpocock/skills 的四个设计决策：超过半数 skill 禁止模型自动触发、tdd skill 沉淀的是工程判断而非流程清单、GLOSSARY 统一跨 skill 词汇、SCOPE 用「实测失败」做收录门槛。附真机实测：沙箱 HOME 安装产出 70 条符号链接，39 个 skill 命名全部一致，以及两个真实踩坑。"
+author: "YOMXXX"
+faq:
+  - q: "mattpocock/skills 和我自己写一份 CLAUDE.md 有什么区别？"
+    a: "CLAUDE.md 是全局常驻指令，每个会话都占上下文；skill 是按需加载的流程包。这个仓库的关键区别在于它把「什么时候该做什么」和「具体怎么做」分层了：触发条件写在 description 里由模型判断，执行细节放在正文里按需读取，而高频操作通过 disable-model-invocation 改成手动命令，把控制权留给人。"
+  - q: "为什么一半以上的 skill 要禁止模型自动触发？"
+    a: "因为它们是带副作用的操作而非参考资料。比如 grill-me 会连续盘问你的设计、to-tickets 会拆票写进 issue tracker，这些动作如果模型自作主张触发，体验是灾难性的。作者用 disable-model-invocation 把它们降级成斜杠命令，只有你明确调用才会执行，这是「参考资料自动触发、操作类手动触发」的边界划分。"
+  - q: "我该用 plugin 安装还是 skills.sh 的可编辑副本？"
+    a: "官方 README 明确说两个装法只能选一个，因为同时安装会让每个 skill 出现两份。想省心、跟着上游自动更新就装 plugin；想魔改、把 skill 变成自己团队的工作流就用 skills.sh 拿一份可编辑副本，代价是更新要手动。我的建议是先装 plugin 用两周，确认哪些 skill 真的常用，再 fork 定制。"
+  - q: "直接全量安装 39 个 skill 有什么风险？"
+    a: "两个风险。一是上下文稀释：39 条 description 全部常驻系统提示，模型每次都要在更多候选里做触发判断，误触发概率上升。二是行为耦合：engineering 桶里的 to-spec、implement、code-review 是一条流水线，单装一个会破坏它的前置假设。更稳的做法是只装你真会用的那几个，我从 tdd 和 code-review 这两个最独立、最不依赖其他 skill 的开始。"
+  - q: "这篇文章的方法论能迁移到我自己写 skill 吗？"
+    a: "能，而且这正是它最值得学的部分。四条可直接抄的规则：目录名必须等于 frontmatter 里的 name 字段（39 个 skill 无一例外）；description 只写触发条件不写执行细节；带副作用的操作加 disable-model-invocation；多 skill 共享的领域词汇抽成一份 GLOSSARY.md，让测试命名和接口词汇保持一致。每一条都能在你自己的技能目录里落地。"
+---
+
+做 agent 工程的人都攒过一份自己的 skills 目录，但绝大多数人的技能包停在「把常用提示词存成 markdown」这一步。上周我在翻 GitHub 热点时注意到 mattpocock/skills 又冲上了趋势榜——Matt Pocock 是 TypeScript 圈最有影响力的教育者之一，这份仓库是他每天真实在用的工程技能集，star 数早已是数十万量级，最近一周还在密集更新。站内 2026 年 8 月的横评文章只用一句话带过它，这次我决定把它当成一个完整的工程样本拆开看：clone 下来跑了结构统计，在沙箱环境里真实执行了它的安装脚本，也踩了两个坑。结论先说：这份仓库最值钱的不是 skill 本身，而是它组织 skill 的四条工程决策。
+
+## 一、先跑一遍结构：四个桶，不是平铺
+
+克隆仓库之后第一件事是数数。实测输出如下：
+
+```text
+skills/engineering   20 个 SKILL.md，共 2745 行
+skills/productivity   7 个 SKILL.md，共  521 行
+skills/in-progress    8 个 SKILL.md，共  985 行
+skills/misc           4 个 SKILL.md，共  418 行
+合计                 39 个 SKILL.md
+```
+
+这个分层不是随手归类。engineering 是核心：to-spec、to-tickets、implement、implement-spec、code-review、tdd、diagnosing-bugs、retro——这是一条完整的软件工程流水线，从需求到复盘全覆盖。productivity 是个人工作流：grill-me（盘问你的设计）、handoff（会话交接）、teach、wait-what。in-progress 是公开试运行的实验区，作者明确欢迎反馈；misc 则被标记为 frozen，停止维护、issue 全部关闭。
+
+最有意思的是仓库根目录的三个文件：SCOPE.md、GLOSSARY.md、CHANGELOG.md。一个技能包配正式的收录门槛、领域词汇表和变更日志，用 changesets 做版本管理（当前版本 1.3.2），还有脚本保证插件清单里的版本号同步。这不是「存了一堆提示词」，这是在用一个真实软件项目的方式维护行为资产。
+
+## 二、设计决策一：超过半数的 skill 禁止模型自动触发
+
+把 39 个 SKILL.md 的 frontmatter 全部扫了一遍，统计 `disable-model-invocation` 字段的分布：
+
+```text
+engineering:  11/20 开启
+productivity:  5/7  开启
+in-progress:   8/8  开启
+misc:          0/4  开启
+```
+
+也就是说 39 个 skill 里有 24 个明确禁止模型自主调用，只能由人手动触发。这个比例出乎我的意料，因为它和「skill 让 agent 更自动」的直觉相反。
+
+看几个具体例子就明白了。grill-me 的 SKILL.md 正文只有一行——「Call the Skill tool with 'grilling'」，真正的逻辑在 grilling 这个 skill 里：对你的方案连续盘问，逼你回答边界条件和失败路径。这种会打断你、反复质询你的交互，如果模型觉得「该盘问了」就自动触发，体验是灾难。同理还有 to-tickets（把讨论拆成 issue 写进 tracker）、triage（给 issue 打状态标签）——全都是带副作用的操作。
+
+而 tdd、codebase-design、domain-modeling 这些 0 副作用的参考型 skill 不带这个字段，模型可以在写代码途中自主查阅。于是边界很清晰：**参考型自动触发，操作型手动触发**。这是我在自己技能目录里最先抄走的一条规则。
+
+## 三、设计决策二：skill 沉淀的是工程判断，不是流程清单
+
+多数技能包的 skill 是步骤列表：第一步做什么，第二步做什么。mattpocock 的 tdd skill 完全不是这个写法。它先定义核心概念——「接缝（seam）」：测试应该扎在公共接口的边界上，而不是实现细节里。然后是几条强约束：**只在事先确认过的接缝上写测试**，动手前先列出接缝清单让用户确认；反模式部分点名了「同义反复测试」（断言用和实现一样的方式重算期望值，测试从构造上就永远不可能失败）和「水平切片」（先写完所有测试再写实现，验证的全是想象中的行为）。
+
+这些内容读起来不像是给模型的操作手册，更像是给模型传输一套老工程师的判断力。每条反模式都带着「判别特征」——比如实现耦合测试的标志是「重构时挂了但行为没变」。模型拿到的是可执行的判别标准，而不是死流程。这也解释了为什么它宣称对任何模型都有效：判断标准比步骤序列更抗模型差异。
+
+## 四、设计决策三：一份 GLOSSARY.md 管住所有 skill 的嘴
+
+39 个 skill 分散在一条流水线上，最容易崩的是词汇不一致：triage 写「backlog」，to-tickets 写「issue」，implement 写「ticket」，模型在这些概念之间跳来跳去就会产生混乱。这个仓库的解法是根目录一份 GLOSSARY.md，逐条定义 Issue tracker、Issue、Decision ticket、Triage role 这些核心词，每个词条还带「避免用法」栏——比如明确废弃了歧义的「backlog」一词。
+
+更妙的是 skill 会主动引用它：tdd 里写着「探索代码库时先读 GLOSSARY.md，让测试命名与项目领域语言一致」。一份词汇表同时约束了 skill 作者、模型行为和项目自身的命名。这是跨 skill 一致性成本最低的方案，比我见过的任何「在每个 skill 里重复写术语约定」的做法都干净。
+
+## 五、设计决策四：收录门槛是「实测失败」，不是「我觉得好」
+
+SCOPE.md 定义了一条双因子门槛：一个改进建议必须同时满足「观察到的失败」（描述真实会话里跑错了什么，假设性改进不收）和「符合哲学」（不属于已拒绝概念）。所有被拒绝的提案都记录在 .out-of-scope/ 目录里，包括「为某个 harness 写分支」「加配置项」这类需求——理由是它们应该属于你自己的 CLAUDE.md 或 fork。新 skill 的提案通道甚至直接关闭：如果现有 skill 能组合出这个行为，就不新增。
+
+这在开源技能包里极其罕见。大多数仓库的 issue 区是被「能不能加个开关」淹没的，而它把「不加开关」写成了正式决策存档。维护技能包和维护代码库一样，说「不」的能力决定它能活多久。
+
+## 六、真机实测：沙箱安装与两个踩坑
+
+光读不练不算 workshop。我用隔离的 HOME 目录真实执行了它的维护者安装脚本：
+
+```bash
+git clone https://github.com/mattpocock/skills.git
+HOME=/tmp/mp-test-home bash scripts/link-skills.sh
+```
+
+输出验证了三件事。第一，脚本把 skill 以符号链接形式装进 HOME 下的两个技能目录，我数了一遍：**70 条链接**，等于 35 个 skill 乘以 2 个目标目录——39 减 35 正好是 4 个 misc skill，脚本按注释约定把它们排除了。第二，仓库自带防御：如果目标目录本身是指向仓库内部的符号链接，脚本会拒绝执行并提示手工清理，避免把链接写回仓库自己。第三，我写了个循环校验全部 39 个 skill，目录名与 frontmatter 的 name 字段**全部一致**。这不是巧合——skill 发现机制靠目录名匹配，名字不一致就会静默失效，39 比 39 的全对说明作者把这条规则当成了铁律。
+
+踩坑有两个，都是我自己真实撞上的。其一，跑统计命令时我在 zsh 里写了「变量名后紧跟全角括号」的 shell 代码，macOS 自带的 bash 3.2 对多字节字符不敏感，全角括号被吞进变量名，配合 `set -u` 直接报 unbound variable 中断——写成带花括号的变量形式即可规避。其二，README 反复强调 plugin 和 skills.sh 两种安装方式**只能选一个**，同时安装会让每个 skill 出现两份，触发判断也会翻倍。我先用一份副本做了拆解，如果你要正式使用，装 plugin 更省心（自动更新），想魔改就用 skills.sh 拿可编辑副本。
+
+## 七、怎么把这套东西搬回自己的仓库
+
+最后给三条可执行的迁移建议。第一，今晚就能做：扫一遍你自己的技能目录，给所有带副作用的 skill 补上 disable-model-invocation，这一步零成本。第二，本周末做：如果你的多个 skill 共享一套领域词汇，把词汇抽成一份 GLOSSARY.md 并在每个 skill 里加一行引用，不一致的术语清单一次性清掉。第三，慢慢做：给自己立一条「观察到的失败」门槛——只有当某个流程真的在会话里出错时，才为它写新 skill 或改旧 skill，用 .out-of-scope 文件记录所有拒绝过的想法，半年后你会感谢这份决策存档。
+
+技能包的竞争已经从「谁收集得多」进入「谁工程化得更认真」的阶段。mattpocock/skills 值得拆，不是因为它的 39 个 skill 个个能直接用，而是因为它示范了行为资产该怎么被认真维护。
