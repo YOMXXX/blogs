@@ -1,0 +1,230 @@
+---
+title: "fast-anything 实战：只把慢的 5% 移植成 Rust，42 倍提速且逐调用可验证"
+description: "在 macOS 上完整实测 fast-anything：画像定位 Python 热点、手写 Rust 移植、41 个用例逐调用验证后一键替换，4.03 秒降到 0.10 秒，含 x86_64 与 arm64 Python 架构不匹配的真实踩坑。"
+column: "workshop"
+tags: ["Rust", "性能优化", "Python", "PyO3", "本机实测"]
+pubDate: 2026-11-23
+template: "editorial"
+featured: false
+tldr: "fast-anything 把「整个重写成 Rust」改成「只移植慢的 5%」：scan 画像定位热点，port 录制真实调用，verify 用边界与派生用例证明行为一致后才 enable。我在本机把 4.03 秒的名单去重脚本移植后单次调用 42 倍、端到端 23 倍，输出逐字节一致；最大的坑是它按 PATH 选了 x86_64 Python 而 Rust 产物是 arm64，dlopen 直接报架构不匹配。"
+author: "YOMXXX"
+faq:
+  - q: "fast-anything 和直接手写 PyO3 扩展或用 Cython 有什么区别？"
+    a: "区别在验证层。手写扩展靠单元测试兜底，fast-anything 先录制函数在真实运行中的调用与返回值，再自动派生边界用例（空输入、NaN、非 ASCII、超大输入），移植后逐调用对拍，浮点误差容忍 1e-9，全部一致才允许 enable。等于把「移植是否等价」从人工审查变成了机械化证明，还能一条命令回滚。"
+  - q: "为什么它移植的是外层循环而不是最内层的 levenshtein 函数？"
+    a: "因为跨语言调用本身有成本。如果只移植内层的编辑距离函数，Python 循环每比较一对名字就要跨一次 Python 到 Rust 的边界，80 多万次调用的开销会吃掉大部分收益。我的 scan 结果里 81.5 万次调用全部发生在内层，工具自动把外层的 find_duplicate_pairs 连同内层一起移植，数据一次跨越边界，这才是 42 倍的来源。"
+  - q: "verify 的 41 个用例是怎么来的，能证明绝对等价吗？"
+    a: "41 个用例分三类：1 条真实录制的调用、15 条固定边界用例（空输入、零值、非 ASCII 文本、空字符串等）、25 条自动派生的用例（边缘取值、缩小和放大的随机输入）。它证明的是「这些用例上逐值一致」，不是形式化等价——但比绝大多数手写扩展的验证强度高得多。我的实现里 round 函数必须模拟 Python 的银行家舍入，这种坑就是靠逐调用对拍兜住的。"
+  - q: "什么样的函数能被移植，什么样的不能？"
+    a: "能移植的是顶层、确定性、输入输出都是纯数据的函数：数字、字符串、列表、字典，Python 里包括模块级函数和静态方法。不能移植的三类我在 scan 里都见到了：做 I/O 的 main 函数（里面有 print）、用了 random.Random 的 build_names（非确定性）、以及依赖闭包或全局状态的函数。scan 会逐个给出不能移植的原因。"
+  - q: "这套流程适合生产环境吗？风险在哪里？"
+    a: "适合低风险渐进优化，不适合当作常规手段。风险点：一是移植出的 Rust 代码仍要人审查，验证只覆盖记录到的调用模式，换个输入分布未必等价；二是引入了 Rust 工具链和 PyO3 编译依赖，CI 和部署环境都要装 rustup；三是多了一层加载逻辑（源码里注入的标记块）。好在逃生门很干净：环境变量一键切回纯 Python，标记块整块删除即可复原。"
+---
+
+11 月 22 日 Hacker News 上一个 Show HN 冲到 177 分：`EL4CTEO/fast-anything`，口号相当挑衅——「Don't rewrite it in Rust. Rewrite the 5% that's slow.」不要把整个应用重写成 Rust，只重写那慢的 5%。我点进去看了 README：Rust 写的 CLI，1875 个 star（截至发稿），MIT 协议，支持 Python、Node、Ruby、Java、Go、PHP、C、C++、C# 十一种语言的函数级移植，昨天还有新提交。
+
+这个主张我部分认同：全量重写的成本和风险早就被无数团队验证过了，热点集中规律（少数函数吃掉绝大部分运行时间）也确实是性能工作的常识。但「移植 5%」最难的不是写 Rust，而是**证明移植后的函数和原来行为完全一致**——这才是这类工具该解决的核心问题。fast-anything 宣称用「录制真实调用 + 边界用例 + 派生用例」的机械验证来兜底。是骡子是马，我拉到本机完整跑了一遍，本文是全程实录，包括一次真实翻车。
+
+## 一、安装与 doctor：环境盘点的第一坑
+
+安装走 npm（也有 crates.io 版本）：
+
+```bash
+npm i -g @el4cteo/fast-anything
+```
+
+装完先跑 `fast-anything doctor`，它会检查 Rust 工具链和各语言运行时。我本机的输出很有代表性：
+
+```text
+⚡ fast-anything v0.7.0
+  ✓ cargo    cargo 1.88.0
+  ✗ python   Python 2.7.18 too old, 3.10 or newer is needed
+  ✓ node     v22.14.0
+  ✗ ruby     ruby 2.6.10p210 too old, 3.3 or newer is needed
+  ✓ go       go1.26.3
+  ✓ claude   2.1.221 (Claude Code)
+  ✓ codex    codex-cli 0.146.0
+✓ ready
+```
+
+注意那个 `✗ python 2.7.18`：doctor 检查的是裸 `python` 命令（macOS 上残留的系统 Python 2），而我实际用的 `python3` 是 3.13。这个检查项略误导，但不影响后面流程——真正影响后面流程的是另一个更隐蔽的问题，第三节详述。
+
+工具链要求：Rust 编译移植产物（rustup 一键装），npm 只提供 CLI 本体。`--agent` 参数可以接 `claude`、`codex` 或任何「从 stdin 读提示词的命令」，让编码 agent 自动完成移植；也支持 MCP server 接入 Claude Code / Cursor。我没有用它内置的 agent 流程——移植本来就是我的活，手写更清楚。
+
+## 二、实验对象：4 秒的名单模糊去重
+
+我写了一个贴近真实业务的慢脚本 `dedupe.py`：1400 条客户名单（程序生成的英文名加脏后缀），两两比较找拼写相近的重复项，相似度用纯 Python 手写的归一化 Levenshtein 距离，阈值 0.85。
+
+```python
+def find_duplicate_pairs(names, threshold=0.85):
+    pairs = []
+    n = len(names)
+    for i in range(n):
+        a = names[i]
+        for j in range(i + 1, n):
+            b = names[j]
+            if abs(len(a) - len(b)) > 3:
+                continue
+            score = levenshtein_ratio(a, b)
+            if score >= threshold:
+                pairs.append([a, b, round(score, 4)])
+    return pairs
+```
+
+这是性能优化的典型形态：外层双重循环套一个字符级 DP，纯解释执行，没有任何库可以借力。基线实测 **4.03 秒**（800 条时 1.36 秒，1400 条涨到 4 秒——注意它是平方复杂度，数据翻 1.75 倍时间翻 3 倍）。
+
+## 三、scan：画像准确得有点吓人
+
+```bash
+fast-anything scan -- /path/to/arm64/python3 dedupe.py
+```
+
+（这里我直接写了 Python 的绝对路径，原因见第五节。）
+
+输出：
+
+```text
+✓ python3 dedupe.py ran in 9.92s
+
+   #  function                     time        calls     verdict
+   1  dedupe.py:find_duplicate_…   100.0%      1         ✓ port it
+      ! calls levenshtein_ratio, they get ported together
+      ! missing type hints, types are inferred from recorded calls
+   2  dedupe.py:main               100.0%      1         ✗ does I/O: print
+   3  dedupe.py:levenshtein_ratio  96.3%       815,332   ↳ ported inside find_duplicate_pairs
+   4  dedupe.py:build_names        0.0%        1         ✗ not deterministic: random.Random
+```
+
+三个细节值得说：
+
+**画像开销**。基线 4 秒的脚本，带 profiler 跑成了 9.92 秒（第一次用 x86_64 Python 跑更是 17.31 秒）。profiling 的采样开销在纯 Python 热循环上会放大好几倍，时间占比数据仍然可信（都是 100%），但绝对时长别拿去当基准。
+
+**判定质量**。四个函数四种判定，每个都给理由：`main` 有 print 是 I/O，`build_names` 用了 `random.Random` 非确定，内层 `levenshtein_ratio` 被标记「跟随外层一起移植」。它能读懂 Python 语义，不是靠行数猜的。
+
+**外层循环优先**。815,332 次调用全发生在内层函数上，但它选的是外层 `find_duplicate_pairs`。这是刻意设计：跨语言边界（Python 到 Rust）每次调用都有序列化成本，移植内层函数等于让 80 万次调用各自跨一次边界，收益会被吃掉大半。README 自己也承认：只移植内层 `levenshtein` 只有 35 倍（函数级）和 1.9 倍（应用级）。这个设计判断比工具本身更有含金量。
+
+## 四、port 与手写 Rust：类型从录制调用推断
+
+```bash
+fast-anything port dedupe.py:find_duplicate_pairs
+```
+
+它把应用再跑一遍，录制目标函数的**真实调用与返回值**（我的场景函数只被调 1 次，单次传入 1400 条名字），然后生成一个独立的单函数 Rust crate：
+
+```text
+✓ recorded 1 real call to dedupe.py:find_duplicate_pairs (of 1 made)
+✓ Rust crate ready: .fast/ports/dedupe.py.find_duplicate_pairs
+  Have your coding agent follow TASK.md and write src/lib.rs
+```
+
+crate 里最有价值的是 `TASK.md`：原始 Python 源码、被调用的辅助函数、真实调用样本，以及一页硬规则——Python 字符串按 Unicode 码点索引要用 `chars()`、浮点比较容差 1e-9、保持相同运算顺序、Python 抛异常的地方 Rust 也要抛。这些规则全部来自真实踩坑经验，比我记忆里大多数「手写扩展注意事项」文档都准。
+
+crate 骨架是 PyO3 绑定，`abi3-py310` 特性意味着产物兼容 3.10 以上所有解释器（同一个架构下）。我手写的核心部分：
+
+```rust
+fn levenshtein_ratio(a: &[char], b: &[char]) -> f64 {
+    if a == b { return 1.0; }
+    let (la, lb) = (a.len(), b.len());
+    if la == 0 || lb == 0 { return 0.0; }
+    let mut prev: Vec<u32> = (0..=lb as u32).collect();
+    let mut cur: Vec<u32> = vec![0; lb + 1];
+    for i in 1..=la {
+        cur[0] = i as u32;
+        let ca = a[i - 1];
+        for j in 1..=lb {
+            let cost = if ca == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    1.0 - prev[lb] as f64 / la.max(lb) as f64
+}
+```
+
+有两处我刻意「多做了」：
+
+一是**预切字符**。Python 侧按码点索引，我先把所有名字一次性切成 Rust 的字符向量并缓存长度，而不是每次比较都重新切。这层优化不影响语义（码点数一致），但把 O(n²) 次重复切分省掉了。
+
+二是**round4 必须模拟 Python 的银行家舍入**。Python 的 `round(score, 4)` 对正好落在 .5 上的第五位小数舍入到偶数，Rust 的 `f64::round` 是远离零舍入。我的分数值形如「1 减去整数除以整数」，在小字符串场景下恰好可能踩中精确的半数边界：
+
+```rust
+fn round4(x: f64) -> f64 {
+    let scaled = x * 10000.0;
+    let nearest = scaled.round();
+    let v = if (scaled - nearest).abs() == 0.5 {
+        let f = scaled.floor();
+        if (f as i64) % 2 == 0 { f } else { f + 1.0 }
+    } else {
+        nearest
+    };
+    v / 10000.0
+}
+```
+
+verify 的浮点容差是 1e-9，而舍入方向错了差的是 0.0001，必挂。这种坑就是「逐调用对拍」要抓的东西——如果只靠目测 diff，很难发现某个 0.90 应该是 0.9000 而非 0.9001。
+
+## 五、第一次 verify 翻车：架构不匹配
+
+写完 lib.rs，verify 直接给我抛了一大段红色报错：
+
+```text
+ImportError: dlopen(...abi3.so, 0x0002): mach-o file, but is an incompatible
+architecture (have 'arm64', need 'x86_64')
+```
+
+排查过程：Rust 产物是 arm64（本机原生编译，没有问题），报错说明**跑 verify 的 Python 是 x86_64**。回头看第一节的 doctor 输出——工具自己就是从 PATH 里解析 `python3` 的，而我机器上 `/usr/local/bin/python3` 指向 Homebrew 的 x86_64 Python 3.14（Rosetta 转译运行）。scan 时画像跑得奇慢（17.31 秒）也是这个原因：整个应用跑在转译层上。
+
+修复：scan 时显式传 arm64 Python 的绝对路径，重跑 scan、port、verify 一条龙：
+
+```text
+✓ 41/41 calls give the same result (1 recorded + 15 edge cases + 25 derived)
+✓ dedupe.py:find_duplicate_pairs per call: 4240.4ms in Python, 100.6ms in Rust: 42× faster
+```
+
+41 个用例 = 1 条真实录制 + 15 条固定边界（空输入、零值、非 ASCII、空字符串等）+ 25 条自动派生（缩小和放大的随机输入）。全部逐值一致后，它才给出 enable 建议。
+
+这个坑值得单独强调：**fast-anything 的 Python 发现逻辑跟随你 scan 命令里的解释器**，在多 Python 环境（Homebrew x86_64、arm64、pyenv、conda 并存是 Mac 常态）下，务必用 `python3 -c "import sys; print(sys.executable)"` 确认架构（`platform.machine()` 应输出 arm64）再进 scan。工具没有把这个架构检查做进 doctor，属于明显的改进空间。
+
+## 六、enable、bench 与回滚：替换是字节级的
+
+```bash
+fast-anything enable dedupe.py:find_duplicate_pairs
+```
+
+enable 之后再看 `dedupe.py` 源码：原函数还在，文件尾部多了一个标记块，把同名函数绑定到编译好的 Rust 扩展上。原 Python 代码一个字节没动，逃生门是环境变量 `FAST_ANYTHING_DISABLE=1`（运行时切回纯 Python），彻底退出用 `fast-anything disable` 整块移除标记块。我实测 disable 后源码完全复原，这个「可逆性」做得比很多同类工具干净。
+
+enable 后直接跑应用：
+
+```text
+names: 1400
+duplicate pairs: 3090
+elapsed: 0.101s
+```
+
+4.030 秒对 0.101 秒，**40 倍**，3090 个重复对和前五行的输出逐字节一致。
+
+`fast-anything bench` 做 5 轮交错计时（Python 与 Rust 各跑、交替执行避免热态偏差）：
+
+```text
+  Python       ████████████████████████ 4.32s
+  Rust         █                        188ms
+✓ ... is 23× faster end to end (median of 5)
+```
+
+端到端 23 倍（含名单生成、启动等未移植部分），函数级 42 倍。两个数字的差值本身就是教育材料：优化收益永远要看你在哪一层量。
+
+bench 还给了一条警告：应用输出的第三行（elapsed 计时）在 Rust 模式下变了。它贴心地补了一句「输出每次运行都不同就没事」——我的脚本本来就打印动态耗时，属于误报，但这说明它会**比对 stdout**，连打印差异都管。验证的边界意识相当好。
+
+## 七、工程判断：什么时候值得上这套流程
+
+跑完全程，我的结论分三段。
+
+**值得用的场景**：热点是确定性的纯计算（解析、匹配、编码、压缩、几何、密码学原语之外的数学），输入输出是普通数据，且你已经用 profiler 确认了热点位置。名单去重、日志聚类、全文模糊搜索这类 O(n²) 字符串工作是最甜的点——我的 42 倍还是没做算法优化（ bitpar 等加速、SIMD、并行都没上）的朴素 DP 成绩，真要压还能再快。
+
+**不值得用的场景**：热点在 I/O、网络或锁上（移植了也不快）；热点函数依赖复杂对象图或第三方对象（不可移植）；运行时间本来就百毫秒级且不是用户可感知路径（工程成本大于收益）。scan 的 verdict 字段基本已经替你做了这个判断，我建议把 scan 当成**免费的性能体检**，即使最后不移植，画像报告也值回票价。
+
+**它真正的护城河**不是「帮你写 Rust」——Claude Code 本来就能写——而是**验证层**：录制真实调用、派生边界用例、逐调用对拍、浮点 1e-9 容差、异常行为对齐、bench 交叉计时、一键回滚。这七个环节串成一条链，把「手写扩展」从依赖个人经验的手艺活变成了可复核的流程。我在 round4 上踩的银行家舍入坑，恰好证明了这条链的存在价值：没有对拍，这类 bug 会安静地在线上产出错误的数字。
+
+对比另一个极端方案「把整个服务重写成 Rust」：那要面对数月的重写、分钟级编译、整个生态迁移。fast-anything 的单函数 crate 编译只要几秒（实测 20 秒出头，release 加 fat LTO），所有移植共享一个 `.fast/target` 缓存，风险被隔离在「一个函数 + 一段标记块」的粒度上。这个取舍在我的实测里是成立的。
+
+工具是 v0.7.0，迭代很活跃（我写稿时昨天刚有提交）。如果你维护着一个跑得慢但不敢动的 Python 服务，它值得一个下午的试用——最坏情况无非是 verify 不过、enable 不上，你的代码毫发无伤。
