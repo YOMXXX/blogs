@@ -1,0 +1,106 @@
+---
+title: "Minipg 实测：一个 26MB 可执行文件装下整个 PostgreSQL 18"
+description: "下载 Minipg v0.3 macOS arm64 实测：init 3.8 秒、热查询 26 毫秒、pgbench 237 tps，附 Docker 与 PGlite 横向对比、pgvector 缺失与内存开销等工程判断。"
+column: "tools"
+tags: ["PostgreSQL", "Minipg", "开发者工具", "本地开发", "数据库"]
+pubDate: 2026-11-27
+template: "terminal"
+featured: false
+tldr: "实测 Jeff Lindsay 新作 Minipg：单二进制内嵌 postgres:18-alpine，用 hyper9 用户态内核直接跑 Alpine 官方 Postgres，.pgdb 文件夹即整个数据库。实测冷启动 0.43 秒、热查询 26 毫秒，TPC-B 吞吐约为原生的六分之一到十二分之一；适合本地开发、CI 与演示，不适合生产环境与依赖三方扩展的场景。"
+author: "YOMXXX"
+faq:
+  - q: "minipg 和 PGlite 有什么区别？"
+    a: "PGlite 是把 Postgres 编译成 WebAssembly 后在进程内嵌入使用，没有独立的网络服务，适合浏览器和嵌入式测试场景。minipg 跑的是 Alpine 镜像里官方 Postgres 二进制，是真服务器：有独立的 postmaster 进程、SCRAM 密码认证、标准 postgres 协议，你的应用用普通驱动连 127.0.0.1 就行。简单说：要网络协议和完整服务器行为选 minipg，要进程内嵌入选 PGlite。"
+  - q: "minipg 能用在生产环境吗？"
+    a: "目前不建议。官方文档给的对比数据是单查询延迟约为原生两倍，吞吐约为原生的六分之一到十二分之一，每个新连接约 27 毫秒；默认配置下 guest 内存上限约 5GB，连接数超过约 790 会直接报错。更关键的是作者自己标注 h9 是研究原型，KVM 与 Hypervisor.framework 后端还没做过崩溃测试。它明确瞄准的是本地开发、CI 和演示场景。"
+  - q: "为什么 minipg 里装不了 pgvector？"
+    a: "minipg 裁剪了 postgres:18-alpine 镜像里服务器用不到的部分（LLVM、头文件、文档），只保留官方镜像自带的扩展。pgvector 属于第三方扩展，不在 alpine 官方镜像里，所以 CREATE EXTENSION vector 会直接报错。实测 pgcrypto、pg_trgm 这类官方自带扩展可用。自定义镜像支持已经在 Roadmap 里，方案是 init --image REF，但 v0.3 还没实现。"
+  - q: "minipg 的 .pgdb 怎么备份和迁移？"
+    a: "服务器停止后，.pgdb 就是一个普通文件夹，直接 cp -R 复制即可，实测复制后打开数据完整。运行中的服务器不能裸拷贝目录（不保证一致性），要用 minipg dump 生成 SQL 转储，再到目标 .pgdb 用 minipg restore 恢复，实测往返后数据无损。注意 .pgdb 里的 minipg.toml 记录了默认库名和端口偏好，拷贝副本的默认库名沿用原库。"
+  - q: "minipg 支持多少并发连接？"
+    a: "这是它最需要留心的限制。h9 fork 进程时不做写时复制，每个连接的后端进程要完整复制一份 Postgres 可执行文件和库，约 33MB。默认配置（100 连接、128MB shared_buffers）下服务器 guest 内存上限约 5GB，h9 上限 32GB，折算约 790 个连接，超了会报 could not fork 而不是常见的 too many clients。文档特别强调应用必须用连接池。"
+---
+
+HN 上 288 分的那条帖子我点进去看了一眼，然后就把 v0.3 的 macOS arm64 二进制拉下来真跑了一遍。结论先说：**Minipg 是我今年见过的最聪明的"把 PostgreSQL 变简单"的方案**，但它聪明的地方不在 Postgres 本身，而在它绕开问题的方式——这也直接决定了它适合什么、不适合什么。
+
+## 它到底是什么
+
+Minipg 是 Jeff Lindsay（progrium，webhooks 概念的提出者、Dokku 的作者）2026 年 10 月底开源的工具，Zig 写的，MIT 协议，v0.3 于 11 月 17 日发布。用法是这样的：
+
+```sh
+minipg app.pgdb                    # 打开 psql shell（不存在就自动创建）
+minipg app.pgdb "select 1"         # 单条语句
+minipg url app.pgdb                # 输出带密码的 postgres:// 连接串
+minipg run app.pgdb -- npm start   # 带着DATABASE_URL启动你的应用
+minipg dump app.pgdb > dump.sql    # 备份
+```
+
+关键描述是：一个 `.pgdb` 文件夹装下整个数据库——`pgdata/` 是 Postgres 原生数据目录，`minipg.toml` 记录版本、端口、密码，像 SQLite 那样"整个数据库就是一堆文件"。
+
+但它跑的**不是** SQLite 式的重写实现，而是 Docker Hub 上原封不动的 `postgres:18-alpine` 镜像里的官方 Postgres 二进制。玄机在它内嵌的 hyper9（h9）：一个当 Zig 库用的用户态内核，按 Plan 9 的思路直接应答 Alpine Postgres 二进制发出的每一个系统调用。没有 Linux 内核要启动，没有 VM 磁盘镜像，没有 Docker 守护进程。psql、pg_dump 这些工具则在各自短生命周期的 h9 机器里跑（官方说约 90 毫秒），通过 loopback 连回服务器。
+
+## 本机实测数据
+
+环境：macOS（Apple Silicon），Hypervisor.framework 后端。要强调的是 README 里 macOS 一栏标注的还是「Not run」——也就是说我测的这个平台官方自己都没跑过，下面的数字全是第一次有人测出来的。
+
+```sh
+curl -LO https://github.com/progrium/minipg/releases/download/v0.3/minipg_0.3_macos_arm64.zip
+unzip minipg_0.3_macos_arm64.zip   # minipg 单文件 26MB
+./minipg version                   # minipg 0.3
+```
+
+实测计时结果（time 计时，数据都在）：
+
+| 指标 | 本机实测（macOS HVF） | 文档参考值（Linux native 后端） |
+|------|----------------------|------------------------------|
+| init 建库（含解压 90MB 根文件系统） | 3.77s | 4-8s |
+| 冷启动到首条 SQL 返回 | 0.43s | 服务器启动约 2s |
+| 热状态单条语句 one-shot | 26ms | 工具机启动约 90ms |
+| pgbench TPC-B 类，4 客户端 | 237.5 tps / 延迟 16.8ms | 640 tps |
+| 新建连接 | 35.6ms | 27ms |
+| 停止服务器 | 0.33s | — |
+| 停机后拷贝目录、重新打开验证 | 0.43s | — |
+| server 进程 RSS | 约 680-690MB | 空闲约 375MB |
+| 全新 .pgdb 磁盘占用 | 约 46MB | — |
+
+几个值得展开的点。
+
+**冷启动快得反直觉。** 0.43 秒内完成"拉起一台跑着 Alpine 的用户态机器 + initdb 已就绪 + Postgres 监听 + 完成 SCRAM 认证 + 执行查询"，这是因为它不需要引导内核——h9 从第一个系统调用开始就是"已经在跑"的状态。对照一下 Docker：我在同一台机器上 `docker info` 直接失败（守护进程没起），而启动 Docker Desktop 本身就要几十秒，再拉起 postgres 容器又是一轮。`select version()` 返回的是 `PostgreSQL 18.6 on aarch64-unknown-linux-musl`，如假包换的 Alpine 官方编译版本。
+
+**吞吐损耗是真实的。** 我测出 237.5 tps，甚至低于文档在 Linux native 后端（无 KVM）上给出的 640 tps。官方对照原生 Postgres 的数字更残酷：select-only 吞吐 3800 对 44900，差 12 倍；TPC-B 类差 6 倍；单条查询延迟 0.24ms 对 0.11ms。原因也写得很坦诚：每个新连接要 fork 一个后端进程，而 h9 的 fork 不做写时复制，每个后端要扛一份完整的 Postgres 可执行文件加库，约 33MB——这是我实测 RSS 逼近 700MB 的直接原因。文档由此给出的使用纪律非常明确：**必须用连接池**。
+
+## 横向对比：和谁比、赢在哪
+
+| 方案 | 启动到可用 | 依赖 | 协议真实性 | 本机干扰 |
+|------|-----------|------|-----------|---------|
+| Minipg 0.3 | 0.43s（实测） | 无（单二进制） | 完整服务器 + SCRAM | 无守护进程 |
+| Docker postgres | 数十秒（含守护进程启动） | Docker Desktop + VM | 完整 | 占常驻内存 |
+| PGlite | 进程内即时 | 无（WASM） | 无网络协议，进程内 | 无 |
+| Homebrew 原生 | 秒级 | brew 管理、版本切换麻烦 | 完整 | 全局单实例 |
+
+PGlite 值得多说一句，HN 评论区也在讨论它。PGlite 同样是"真 Postgres"（编译到 WASM），但它没有服务器、没有网络协议，是嵌进你进程里的。Minipg 相反，刻意做一个**真服务器**：独立 postmaster、SCRAM 认证、标准 5432 协议，`minipg run app.pgdb -- npm start` 直接把 `DATABASE_URL` 注入你的应用进程。两个工具其实不冲突——浏览器/进程内选 PGlite，要"一台真数据库服务器但零安装"选 Minipg。
+
+## 踩坑实录
+
+三个我实际撞上的坑，都能复现：
+
+1. **拷贝 .pgdb 后默认库名不变。** 我 `cp -R demo.pgdb demo3.pgdb` 后直接 `pgbench -i demo3`，报 `database "demo3" does not exist`。原因是 minipg.toml 里记录的默认库沿用建库时的名字 `demo`，拷贝副本不会改名。`select current_database()` 一查便知。
+2. **pgvector 装不上。** `CREATE EXTENSION vector` 直接报 `extension "vector" is not available`。镜像裁掉了 LLVM（所以 jit=off），只保留 alpine 官方镜像自带的扩展——pgcrypto、pg_trgm 实测可用，第三方扩展一律没有。要做向量检索的人现在只能绕道。
+3. **内存比文档更肥。** 文档给的 375MB 是 Linux native 后端的空闲值，我实测 Hypervisor.framework 后端 server 进程 RSS 约 690MB。guest 内存按"最大连接数 x 40MB + shared_buffers"向上取整、且不低于 2GB 预留，实际占用按需增长，但 macOS 上显然更慷慨。
+
+## 工程判断：能不能用，用在哪
+
+**放心用的场景**：本地开发、CI、演示、单人项目。CI 场景尤其漂亮——Linux 二进制是静态 musl 编译的，GitHub Actions 的原生 runner 上不需要特权、不需要设备挂载，官方 e2e 就是这么跑的；缓存一下缓存目录，后续运行连解压都省了。它甚至比 Docker 更适合做"每个项目一个库"：`.pgdb` 就在项目目录里，`git ignore` 掉即可，停机后整个目录拷走就是备份。
+
+**谨慎的场景**：吞吐敏感负载（6-12 倍损耗摆在那）、连接数大的服务（默认配置上限约 790 连接，超限报 fork 内存错误）、依赖三方扩展的项目（pgvector 现阶段无解）。
+
+**别用的场景**：生产环境。这个判断不是性能问题，是信任问题——作者自己把 h9 标为研究原型，README 用加粗的「Early」开头；崩溃韧性上官方做得很扎实（e2e 有 kill -9 中断写事务后验证 WAL 恢复 + amcheck 无索引损坏的压力测试，六种杀法都测了），但明确承认断电、内核崩溃、KVM/HVF/arm64 平台的崩溃测试还没做。把唯一的数据副本交给它，现在还不行。
+
+一句话总结：Minipg 用 26MB 单文件、零守护进程的代价，换来了"真 Postgres + SQLite 式文件管理"的开发体验，性能损耗对开发场景无感、对生产致命。**它是给开发流程用的，不是给线上用的**——想清楚这一点，它就是同类里最好的选择。
+
+## 参考资料
+
+- [Minipg 官网与文档](https://progrium.github.io/minipg/)
+- [GitHub 仓库 progrium/minipg](https://github.com/progrium/minipg)
+- [hyper9：用户态 Plan 9 风格内核](https://github.com/progrium/hyper9)
+- [Hacker News 讨论（288 分）](https://news.ycombinator.com/item?id=50650892)
